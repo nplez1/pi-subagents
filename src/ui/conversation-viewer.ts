@@ -28,24 +28,25 @@ import {
   createReadToolDefinition,
   createWriteToolDefinition,
   getMarkdownTheme,
+  getSelectListTheme,
   ToolExecutionComponent,
   type TruncationResult,
   UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, type MarkdownTheme, matchesKey, Spacer, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, Editor, type EditorTheme, type MarkdownTheme, matchesKey, type SelectListTheme, Spacer, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatContextAnnotation, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
-/** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
-const CHROME_LINES_BASE = 6;
+/** Base lines consumed by chrome: top border + header + header sep + footer sep + hints + status + bottom border. */
+const CHROME_LINES_BASE = 7;
 const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
-export const VIEWPORT_HEIGHT_PCT = 70;
+export const VIEWPORT_HEIGHT_PCT = 90;
 
 /**
  * Cap on a single tool result or bash output before the *raw fallback* elides
@@ -62,6 +63,59 @@ type ViewerMessage = AgentSession["messages"][number];
 interface Expandable {
   setExpanded(expanded: boolean): void;
 }
+
+/**
+ * Structural subset of pi-tui's `TuiMouseEvent`. The pi-tui version this package
+ * typechecks against (0.84) predates mouse support; at runtime the loader aliases
+ * pi-tui to pi's own copy (0.87+), so these fields are present even though the
+ * typings are not.
+ */
+export interface ViewerMouseEvent {
+  type: string;
+  button: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** One transcript component's slice of the rendered content lines. */
+export interface ViewerContentEntry {
+  component: Component;
+  /** First content line index this component produced. */
+  start: number;
+  /** How many lines it produced (its rendered height). */
+  height: number;
+}
+
+/**
+ * The content line under an overlay-local click row, resolved to the component
+ * that produced it. Pure, so the geometry is testable without a TUI.
+ *
+ * `y` is relative to the overlay box (row 0 is the top border), `contentTop` is
+ * the first content row, `visibleStart` the scroll offset, and rows outside the
+ * viewport miss.
+ */
+export function hitTestContent(
+  layout: readonly ViewerContentEntry[],
+  y: number,
+  contentTop: number,
+  viewportHeight: number,
+  visibleStart: number,
+): { component: Component; localY: number; height: number } | undefined {
+  const rel = y - contentTop;
+  if (rel < 0 || rel >= viewportHeight) return undefined;
+  const line = visibleStart + rel;
+  for (const entry of layout) {
+    if (line >= entry.start && line < entry.start + entry.height) {
+      return { component: entry.component, localY: line - entry.start, height: entry.height };
+    }
+  }
+  return undefined;
+}
+
+/** Column where a content component's own x=0 sits inside a bordered row (`│ `). */
+const CONTENT_X = 2;
 
 /** Cheap content weight for one message; only the last message needs re-checking as it streams. */
 function textLength(content: unknown): number {
@@ -133,6 +187,37 @@ function fallbackMarkdownTheme(th: Theme): MarkdownTheme {
 }
 
 /**
+ * pi's select-list theme when this process initialized one, else `undefined`.
+ *
+ * Probed the same way as the markdown theme, and for the same reason: the
+ * functions read pi's global theme lazily, so an uninitialized theme throws at
+ * render time rather than at this call.
+ */
+function probeSelectListTheme(): SelectListTheme | undefined {
+  try {
+    const theme = getSelectListTheme();
+    theme.selectedText("probe");
+    return theme;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The editor's select list is only reached by autocomplete, which the viewer
+ * never wires — so this fallback costs no feature, only a colour choice.
+ */
+function fallbackSelectListTheme(th: Theme): SelectListTheme {
+  return {
+    selectedPrefix: text => th.fg("accent", text),
+    selectedText: text => th.bold(text),
+    description: text => th.fg("muted", text),
+    scrollInfo: text => th.fg("dim", text),
+    noMatch: text => th.fg("dim", text),
+  };
+}
+
+/**
  * Cap `text` at `RESULT_MAX_CHARS`, reporting the elision separately rather than
  * appending it — the notice is the viewer's chrome, not the tool's output.
  */
@@ -167,8 +252,10 @@ export class ConversationViewer implements Component {
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
   private keys: ViewerKeys;
-  /** Steering composer — present while the user is typing a message to the agent. */
-  private composer: Input | undefined;
+  /** The steering editor — pi's own, built on first render for a steerable agent. */
+  private editor: Editor | undefined;
+  /** Its height last frame, so the viewport can reserve the rows before it renders. */
+  private editorRows = 0;
   /** Resolved once: pi's Markdown theme is fixed for the life of the process. */
   private readonly markdownTheme: MarkdownTheme;
   /** The child session's working directory, for path renderers. */
@@ -192,6 +279,10 @@ export class ConversationViewer implements Component {
   private cachedWidth = -1;
   private cachedLines: string[] = [];
   private dirty = true;
+  /** Per-component content-line ranges, for routing mouse clicks to a tool block. */
+  private contentLayout: ViewerContentEntry[] = [];
+  /** First content row in the overlay box, captured each render for the same routing. */
+  private lastContentTop = 0;
 
   constructor(
     private tui: TUI,
@@ -223,32 +314,32 @@ export class ConversationViewer implements Component {
   }
 
   handleInput(data: string): void {
-    // While composing a steer message, the input owns all keys (Enter sends,
-    // Esc cancels — both wired in openComposer()). Editing keys flow through.
-    if (this.composer) {
-      this.composer.handleInput(data);
-      this.tui.requestRender();
+    // The wheel is read first: it is the one input that arrives as a raw escape
+    // sequence, and the editor would otherwise take it as typing.
+    const wheelLines = this.keys.wheelLines(data);
+    if (wheelLines !== undefined) {
+      const { maxScroll } = this.scrollBounds();
+      this.scrollOffset = Math.max(0, Math.min(maxScroll, this.scrollOffset + wheelLines));
+      this.autoScroll = this.scrollOffset >= maxScroll;
       return;
     }
 
-    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) {
+    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
       this.closed = true;
       this.done(undefined);
       return;
     }
 
-    // Enter opens the steering composer (only while the agent can still be
-    // steered) — then type + Enter sends, Esc or an empty submit returns. When
-    // not steerable, fall through so the key still disarms a pending stop.
-    if (matchesKey(data, "enter") && this.canSteer()) {
-      this.stopArmed = false;
-      this.openComposer();
+    // Actions keep their wording but leave the printable keys alone: with the
+    // editor always focused, "x" and "t" are characters now.
+    if (matchesKey(data, "ctrl+t")) {
+      this.toggleTools();
       return;
     }
 
     // Stop/abort the agent (only while it can still be stopped). Two-press:
-    // first "x" arms, second confirms — any other key disarms.
-    if (matchesKey(data, "x")) {
+    // first Ctrl+X arms, second confirms — any other key disarms.
+    if (matchesKey(data, "ctrl+x")) {
       if (this.isStoppable()) {
         if (this.stopArmed) {
           this.stopArmed = false;
@@ -260,34 +351,35 @@ export class ConversationViewer implements Component {
       }
       return;
     }
+    if (this.stopArmed) this.stopArmed = false;
 
-    // Expand/collapse tool and bash output. Collapsed by default (each renderer
-    // already previews a screenful), which is the main-UI behaviour.
-    if (matchesKey(data, "t")) {
-      this.stopArmed = false;
-      this.toolsExpanded = !this.toolsExpanded;
-      for (const c of this.expandables) c.setExpanded(this.toolsExpanded);
-      this.dirty = true;
+    // Paging outlives the editor because the arrows do not: they belong to the
+    // message being typed, exactly as they do in the main chat.
+    const { maxScroll, viewportHeight } = this.scrollBounds();
+    if (this.keys.pageUp(data)) {
+      this.scrollOffset = Math.max(0, this.scrollOffset - viewportHeight);
+      this.autoScroll = false;
+      return;
+    }
+    if (this.keys.pageDown(data)) {
+      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
+      this.autoScroll = this.scrollOffset >= maxScroll;
+      return;
+    }
+
+    // Everything else is the message, for as long as the agent can take one.
+    if (this.canSteer()) {
+      this.ensureEditor().handleInput(data);
       this.tui.requestRender();
       return;
     }
-    if (this.stopArmed) this.stopArmed = false;
 
-    const totalLines = this.renderContent(this.lastInnerW).length;
-    const viewportHeight = this.viewportHeight();
-    const maxScroll = Math.max(0, totalLines - viewportHeight);
-
+    // A finished agent has no editor, so the transcript takes the arrows back.
     if (this.keys.scrollUp(data)) {
       this.scrollOffset = Math.max(0, this.scrollOffset - 1);
       this.autoScroll = this.scrollOffset >= maxScroll;
     } else if (this.keys.scrollDown(data)) {
       this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (this.keys.pageUp(data)) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - viewportHeight);
-      this.autoScroll = false;
-    } else if (this.keys.pageDown(data)) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
       this.autoScroll = this.scrollOffset >= maxScroll;
     } else if (matchesKey(data, "home")) {
       this.scrollOffset = 0;
@@ -296,6 +388,46 @@ export class ConversationViewer implements Component {
       this.scrollOffset = maxScroll;
       this.autoScroll = true;
     }
+  }
+
+  /**
+   * Route a left click inside the overlay to the transcript component under the
+   * pointer, so tool/bash blocks expand and collapse exactly as they do in the
+   * main chat. pi's `ToolExecutionComponent` exposes its toggle through a
+   * `MouseRegion`; the main chat reaches it by hit-testing its chat `Container`,
+   * and this overlay — which is not a container — does the same hit-test here.
+   *
+   * Only clicks are routed. Everything else returns `undefined` so pi's own
+   * text-selection and wheel handling stay in charge (the wheel still arrives as
+   * raw bytes through `handleInput`).
+   */
+  handleMouse(event: ViewerMouseEvent): { handled: true } | undefined {
+    if (event.type !== "click" || (event.button & 3) !== 0) return undefined;
+    const innerW = this.lastInnerW;
+    if (innerW <= 0) return undefined;
+
+    const { maxScroll, viewportHeight } = this.scrollBounds();
+    const visibleStart = Math.min(this.scrollOffset, maxScroll);
+    const target = hitTestContent(this.contentLayout, event.y, this.lastContentTop, viewportHeight, visibleStart);
+    if (!target) return undefined;
+
+    const child = target.component as Component & { handleMouse?: (e: ViewerMouseEvent) => unknown };
+    if (typeof child.handleMouse !== "function") return undefined;
+    const hit = child.handleMouse({
+      ...event,
+      x: event.x - CONTENT_X,
+      y: target.localY,
+      width: innerW,
+      height: target.height,
+    });
+    if (!hit) return undefined;
+
+    // Expanding a tool changes its rendered height, which the cached-line
+    // signature does not track (it only knows the global Ctrl+T state), so the
+    // cache has to be invalidated explicitly or the toggle would not show.
+    this.dirty = true;
+    this.tui.requestRender();
+    return { handled: true };
   }
 
   render(width: number): string[] {
@@ -333,14 +465,11 @@ export class ConversationViewer implements Component {
     if (toolUses > 0) headerParts.unshift(`${toolUses} tool${toolUses === 1 ? "" : "s"}`);
     // Spend from the record, context from the live session: the record is the
     // only total that survives the agent finishing and the only one carrying a
-    // nested child's spend.
+    // nested child's spend. Context and cost sit in the footer instead.
     const tokens = getLifetimeTotal(this.record.lifetimeUsage);
     if (tokens > 0) {
-      const percent = getSessionContextPercent(this.activity?.session);
-      headerParts.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
+      headerParts.push(formatSessionTokens(tokens, null, th, this.record.compactionCount));
     }
-    const cost = this.showCost ? formatCost(getLifetimeCost(this.record.lifetimeUsage)) : "";
-    if (cost) headerParts.push(cost);
 
     lines.push(row(
       `${statusIcon} ${renderAgentName(this.record.type, th, { bold: true })}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`,
@@ -348,6 +477,14 @@ export class ConversationViewer implements Component {
     const invocationLine = this.invocationLine();
     if (invocationLine) lines.push(row(invocationLine));
     lines.push(hrMid);
+    // Content starts on the next row; recorded so a mouse click can be mapped
+    // back to the transcript line and component it landed on.
+    this.lastContentTop = lines.length;
+
+    // The editor's rows are reserved before the viewport is computed, so a
+    // growing message shrinks the transcript rather than pushing the frame past
+    // the overlay's maxHeight.
+    const editorLines = this.editorLines(innerW);
 
     // Content area — rendered from the cached line list; rebuilt only when the
     // transcript actually changes (not on every scroll key).
@@ -366,42 +503,12 @@ export class ConversationViewer implements Component {
       lines.push(row(visible[i] ?? ""));
     }
 
-    // Footer
+    // Footer — the editor, its hints, then the stats line the main chat keeps
+    // at the bottom. `row()` frames each so the box sits inside the overlay.
     lines.push(hrMid);
-    if (this.composer) {
-      // Composer row: the Input renders its own `> ` prompt and cursor.
-      lines.push(row(this.composer.render(innerW)[0] ?? ""));
-      const composeHint = th.fg("dim", "Enter send · Esc cancel");
-      const composeLeft = th.fg("accent", "✎ steer");
-      const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
-      lines.push(row(composeLeft + " ".repeat(composeGap) + composeHint));
-    } else {
-      // Actions on the left, navigation on the right. The scroll hint keeps its
-      // full key list so the less-obvious bindings stay discoverable; it leads
-      // the right group so "Esc close" is the only part that truncates first.
-      const sep = th.fg("dim", " · ");
-      const actions: string[] = [];
-      if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
-      if (this.isStoppable()) {
-        actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
-      }
-      actions.push(th.fg("dim", this.toolsExpanded ? "t collapse" : "t tools"));
-      const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
-
-      // Prepend the line-count/scroll-% readout only when there's spare width —
-      // it's the first thing dropped so it never crowds out the hints.
-      const scrollPct = contentLines.length <= viewportHeight
-        ? "100%"
-        : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
-      const count = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
-      const withCount = [count, ...actions].join(sep);
-      const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW
-        ? withCount
-        : actions.join(sep);
-
-      const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
-      lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
-    }
+    for (const editorLine of editorLines) lines.push(row(editorLine));
+    lines.push(row(this.hintRow(innerW)));
+    lines.push(row(this.statusRow(innerW, contentLines.length, visibleStart, viewportHeight)));
     lines.push(hrBot);
 
     return lines;
@@ -417,25 +524,46 @@ export class ConversationViewer implements Component {
     return !!this.onSteer && (this.record.status === "running" || this.record.status === "queued");
   }
 
-  /** Open the inline steering composer and route subsequent input to it. */
-  private openComposer(): void {
-    const input = new Input();
-    input.focused = true;
-    input.onSubmit = (value: string) => {
-      const message = value.trim();
-      this.composer = undefined;
-      if (message) this.onSteer?.(message);
-      this.tui.requestRender();
-    };
-    input.onEscape = () => {
-      this.composer = undefined;
-      this.tui.requestRender();
-    };
-    this.composer = input;
+  /**
+   * The steering editor, built on first use. It is pi's own `Editor` — the main
+   * chat's input — so steering looks and edits like typing there.
+   */
+  private ensureEditor(): Editor {
+    if (this.editor) return this.editor;
+    const editor = new Editor(
+      this.tui,
+      {
+        borderColor: text => this.theme.fg("border", text),
+        selectList: probeSelectListTheme() ?? fallbackSelectListTheme(this.theme),
+      },
+      { paddingX: 1 },
+    );
+    editor.focused = true;
+    editor.onSubmit = (text: string) => this.submitSteer(text);
+    this.editor = editor;
+    return editor;
+  }
+
+  /** Send the editor's text as a steer message and clear the box. */
+  private submitSteer(text: string): void {
+    const message = text.trim();
+    this.editor?.setText("");
+    if (message) this.onSteer?.(message);
     this.tui.requestRender();
   }
 
-  invalidate(): void { /* nothing cached at the component-contract level */ }
+  /** Expand/collapse every tool and bash block (`Ctrl+T`). */
+  private toggleTools(): void {
+    this.stopArmed = false;
+    this.toolsExpanded = !this.toolsExpanded;
+    for (const c of this.expandables) c.setExpanded(this.toolsExpanded);
+    this.dirty = true;
+    this.tui.requestRender();
+  }
+
+  invalidate(): void {
+    this.editor?.invalidate();
+  }
 
   dispose(): void {
     this.closed = true;
@@ -445,6 +573,7 @@ export class ConversationViewer implements Component {
     }
     for (const c of this.transcript) (c as { dispose?: () => void }).dispose?.();
     this.transcript = [];
+    this.contentLayout = [];
     this.toolComponents.clear();
     this.toolArgSigs.clear();
     this.expandables.clear();
@@ -460,19 +589,81 @@ export class ConversationViewer implements Component {
   }
 
   private chromeLines(): number {
-    // The composer adds one row above the footer hint while it's open.
-    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
+    // The hint and status rows are in the base; only the editor's box grows.
+    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.canSteer() ? this.editorRows : 0);
   }
 
+  /** Bounds every scroll path needs; the editor can change the viewport mid-frame. */
+  private scrollBounds(): { totalLines: number; viewportHeight: number; maxScroll: number } {
+    const totalLines = this.renderContent(this.lastInnerW).length;
+    const viewportHeight = this.viewportHeight();
+    return { totalLines, viewportHeight, maxScroll: Math.max(0, totalLines - viewportHeight) };
+  }
+
+  /** The steering editor's box, or `[]` when the agent can no longer be steered. */
+  private editorLines(width: number): string[] {
+    if (!this.canSteer()) {
+      this.editorRows = 0;
+      return [];
+    }
+    const lines = this.ensureEditor().render(width);
+    this.editorRows = lines.length;
+    return lines;
+  }
+
+  /** Spawn parameters other than the model, which the footer carries. */
   private invocationLine(): string | undefined {
-    // Canonical id here, short label everywhere else: this overlay is opened to
-    // inspect one agent and has the width for it, and two providers can serve
-    // models whose short names read alike.
-    const { modelName, modelId, tags } = buildInvocationTags(this.record.invocation);
-    const model = modelId ?? modelName;
-    const parts = model ? [model, ...tags] : tags;
-    if (parts.length === 0) return undefined;
-    return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
+    const { tags } = buildInvocationTags(this.record.invocation);
+    if (tags.length === 0) return undefined;
+    return this.theme.fg("dim", `  ↳ ${tags.join(" · ")}`);
+  }
+
+  /** Actions on the left, navigation on the right — the keys the editor leaves free. */
+  private hintRow(innerW: number): string {
+    const th = this.theme;
+    const actions: string[] = [];
+    if (this.canSteer()) actions.push(th.fg("accent", "✎ Enter send"));
+    if (this.isStoppable()) {
+      actions.push(this.stopArmed ? th.fg("error", "⌃x again to STOP") : th.fg("dim", "⌃x stop"));
+    }
+    actions.push(th.fg("dim", this.toolsExpanded ? "⌃t collapse" : "⌃t tools"));
+    const nav = this.canSteer()
+      ? "PgUp/PgDn scroll · Esc close"
+      : "↑↓ or j/k scroll · PgUp/PgDn · Esc close";
+    const left = actions.join(th.fg("dim", " · "));
+    const right = th.fg("dim", nav);
+    const gap = Math.max(1, innerW - visibleWidth(left) - visibleWidth(right));
+    return left + " ".repeat(gap) + right;
+  }
+
+  /** Model, cost and context under the editor, where the main chat keeps its stats. */
+  private statusRow(innerW: number, totalLines: number, visibleStart: number, viewportHeight: number): string {
+    const th = this.theme;
+    const parts: string[] = [];
+    const model = this.modelLabel();
+    if (model) parts.push(th.fg("accent", model));
+    if (this.showCost) {
+      const cost = formatCost(getLifetimeCost(this.record.lifetimeUsage));
+      if (cost) parts.push(th.fg("dim", cost));
+    }
+    const percent = getSessionContextPercent(this.activity?.session);
+    if (percent !== null) parts.push(formatContextAnnotation(percent, th));
+
+    const scrollPct = totalLines <= viewportHeight
+      ? "100%"
+      : `${Math.round(((visibleStart + viewportHeight) / totalLines) * 100)}%`;
+    const left = parts.join(th.fg("dim", " · "));
+    const right = th.fg("dim", `${totalLines} lines · ${scrollPct}`);
+    const gap = Math.max(1, innerW - visibleWidth(left) - visibleWidth(right));
+    return left + " ".repeat(gap) + right;
+  }
+
+  /** The session's live model, falling back to the one the spawn asked for. */
+  private modelLabel(): string | undefined {
+    const live = this.session.model;
+    if (live) return live.name || live.id;
+    const { modelName, modelId } = buildInvocationTags(this.record.invocation);
+    return modelName ?? modelId;
   }
 
   // ---- Content rendering ----
@@ -548,7 +739,13 @@ export class ConversationViewer implements Component {
     try {
       this.rebuildTranscript();
       const out: string[] = [];
-      for (const component of this.transcript) out.push(...component.render(width));
+      const layout: ViewerContentEntry[] = [];
+      for (const component of this.transcript) {
+        const childLines = component.render(width);
+        layout.push({ component, start: out.length, height: childLines.length });
+        out.push(...childLines);
+      }
+      this.contentLayout = layout;
 
       if (this.record.status === "running" && this.activity) {
         const act = describeActivity(this.activity.activeTools, this.activity.responseText);
@@ -562,6 +759,7 @@ export class ConversationViewer implements Component {
       // text renderer rather than taking the overlay down. The component path is
       // not retried, since the throw would otherwise repeat every frame.
       this.transcript = [];
+      this.contentLayout = [];
       this.toolComponents.clear();
       this.toolArgSigs.clear();
       this.expandables.clear();
@@ -750,6 +948,8 @@ export class ConversationViewer implements Component {
    */
   private buildRawLines(width: number): string[] {
     if (width <= 0) return [];
+    // Verbatim text has no components, so nothing is clickable in this path.
+    this.contentLayout = [];
     const th = this.theme;
     const messages = this.session.messages;
     const lines: string[] = [];

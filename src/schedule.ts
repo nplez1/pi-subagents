@@ -21,7 +21,7 @@ import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolvePinnedModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -230,16 +230,16 @@ export class SubagentScheduler {
     store.update(id, { lastStatus: "running" });
 
     // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
+    // job was created (auth added/removed). A stored explicit pin that no longer
+    // resolves is a failed job, never a reason to silently change models.
     let resolvedModel: any | undefined;
-    if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
-    }
-
     let agentId: string;
     try {
+      if (job.model) {
+        const resolved = resolvePinnedModel(job.model, ctx.modelRegistry);
+        if (typeof resolved === "string") throw new Error(resolved);
+        resolvedModel = resolved;
+      }
       // Re-resolve at fire time against the registry as it stands. This does not
       // reload from disk (the scheduler has no reason to rebuild process-global
       // state from a timer), so it catches changes that went through /agents or

@@ -119,9 +119,10 @@ export interface SubagentsSettings {
    */
   toolDescriptionMode?: ToolDescriptionMode;
   /**
-   * Whether the Claude Code-style FleetView (the navigable main+subagents list
-   * rendered below the editor) is shown. Defaults to `true`. Pure-UI: when off,
-   * the list never registers and the global key handler never captures input.
+   * Whether the below-editor live view is navigable: ↓/← turns the live agent
+   * tree into a selectable list (Enter opens the conversation overlay).
+   * Defaults to `true`. Pure-UI: when off, the tree keeps rendering — governed by
+   * `widgetMode` — but the global key handler never captures input.
    */
   fleetView?: boolean;
   /**
@@ -153,14 +154,14 @@ export interface SubagentsSettings {
    */
   rememberAgents?: boolean;
   /**
-   * Display mode for the persistent above-editor agent widget:
+   * Display mode for the persistent below-editor fleet view:
    *   - `all`: show every agent (foreground + background).
    *   - `background`: hide foreground agents — they already render inline as the
-   *     Agent tool result, so the widget would otherwise double-render them
+   *     Agent tool result, so the view would otherwise double-render them
    *     (#118); everything else (background, queued, scheduled, RPC) stays.
-   *   - `off`: hide the widget entirely.
+   *   - `off`: show no agents.
    * Defaults to `background`. Pure-UI and applied live (toggling refreshes the
-   * widget).
+   * view).
    */
   widgetMode?: WidgetMode;
   /**
@@ -265,8 +266,8 @@ export interface SubagentsSettings {
    */
   reportUsage?: boolean;
   /**
-   * Whether the subagent surfaces show an estimated dollar cost next to their
-   * token counts (widget, FleetView, conversation viewer, foreground results,
+   * Whether the subagent surfaces show an estimated dollar cost beside their
+   * stats (widget, FleetView, conversation viewer, foreground results,
    * completion notifications). Defaults to `false`. Applied live.
    *
    * Rendered as `~$0.0042` — the tilde marks it as pi's reported estimate
@@ -279,14 +280,15 @@ export interface SubagentsSettings {
   showCost?: boolean;
 
   /**
-   * Whether the widget's running rows name the model driving each agent and the
-   * thinking level it is running at.
+   * Whether the widget tags each row's name with the model driving the agent and
+   * the thinking level it is running at, e.g. `Agent (DSv4Pro/H)` — `H` for high,
+   * with `L`/`M`/`XH`/`MX` for the other levels and the model name squeezed per
+   * `shortModelLabel`.
    *
-   * Off by default, unlike the tool result and the conversation viewer, which
-   * show the pair unconditionally: those have a line to themselves, while the
-   * widget row already carries the description, turns, tool uses, tokens and
-   * elapsed time, and every character it gains is one the description loses on a
-   * narrow terminal.
+   * Off by default: the tag takes the place of the prompt-mode label, so an
+   * append-mode agent reads `Agent (DSv4Pro/H)` rather than `Agent (twin)`, and a
+   * user who does not care which model ran loses the mode marker. Turn it off and
+   * the mode label comes back. Applies to running *and* finished rows.
    */
   showModel?: boolean;
 }

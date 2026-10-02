@@ -57,7 +57,6 @@ export function isolationParam(enabled: boolean): Partial<typeof isolationParamS
 interface AgentInvocationParams {
   model?: string;
   thinking?: string;
-  max_turns?: number;
   run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
@@ -112,8 +111,9 @@ export function resolveAgentInvocationConfig(
    * one (#182). Populated only where both sides named something and they
    * disagree — a caller who asked for what they got was still honored.
    *
-   * `max_turns` is deliberately absent: no surface renders a requested-vs-
-   * effective turn limit, so recording one would be dead data.
+   * Turn limits come from agent frontmatter or project defaults, not caller
+   * parameters, and are deliberately absent here: no surface renders a
+   * requested-vs-effective turn limit.
    */
   overridden?: { thinking?: ThinkingLevel; model?: string };
 } {
@@ -136,7 +136,7 @@ export function resolveAgentInvocationConfig(
     modelInput: agentConfig?.model ?? params.model,
     modelFromParams: agentConfig?.model == null && params.model != null,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
-    maxTurns: agentConfig?.maxTurns ?? params.max_turns,
+    maxTurns: agentConfig?.maxTurns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,

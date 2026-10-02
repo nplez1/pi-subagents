@@ -36,7 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
-import { resolveModel } from "../model-resolver.js";
+import { resolvePinnedModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
@@ -198,19 +198,23 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
       // Same precedence as the Agent tool: the caller's model wins, the agent
-      // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
+      // definition's is next, and the parent's model is inherited only when
+      // neither supplied a pin. Unavailable or mismatched pins refuse this
+      // spawn instead of silently switching to another model.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
       const modelInput = request.model ?? config?.model;
       if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry);
+        const resolved = resolvePinnedModel(modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
-        } else {
-          model = resolved;
+          return {
+            ok: false,
+            error: request.model !== undefined
+              ? resolved
+              : `Configured model for ${config?.displayName ?? dispatch.type} could not be used. ${resolved}`,
+          };
         }
+        model = resolved;
       }
 
       // Same scopeModels policy as the Agent tool and the nested delegation

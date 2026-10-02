@@ -93,11 +93,11 @@ export interface AgentConfig {
 export type JoinMode = 'async' | 'group' | 'smart';
 
 /**
- * Display mode for the persistent above-editor agent widget.
+ * Display mode for the persistent below-editor fleet view.
  * - `all`: show every agent (foreground + background).
  * - `background`: hide foreground agents (they already render inline as the
  *   Agent tool result, #118); show background/queued/scheduled/RPC.
- * - `off`: hide the widget entirely.
+ * - `off`: show no agents (the view still renders workflow rows).
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
@@ -268,6 +268,8 @@ export type EffectiveThinkingLevel = ThinkingLevel | "off";
 export interface AgentInvocation {
   /** Short display name for tight rows, e.g. "haiku 4.5". Always set once known. */
   modelName?: string;
+  /** Squeezed form for the widget's name tag, e.g. "DSv4Pro". See `shortModelLabel`. */
+  modelShort?: string;
   /** Canonical `provider/id`, for surfaces with room to disambiguate providers. */
   modelId?: string;
   /** The level actually in effect, once a session exists to report one. */

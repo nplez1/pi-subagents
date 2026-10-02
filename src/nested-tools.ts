@@ -17,7 +17,7 @@ import {
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolvePinnedModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
   createOutputFilePath,
@@ -169,7 +169,6 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
-      max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
@@ -230,12 +229,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       });
       let model = ctx.model;
       if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
-        } else {
-          model = resolvedModel;
-        }
+        const resolvedModel = resolvePinnedModel(invocation.modelInput, ctx.modelRegistry);
+        if (typeof resolvedModel === "string") return textResult(resolvedModel, true);
+        model = resolvedModel;
       }
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn

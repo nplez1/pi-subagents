@@ -15,9 +15,40 @@ export interface ModelRegistry {
 }
 
 /**
- * Both display forms of a model. The short one goes on tight rows (the widget,
- * the Agent tool result), the canonical one where there is room to disambiguate
- * two providers serving a similarly-named model (the conversation viewer).
+ * Vendor prefixes collapsed on tight rows, longest-first. An empty target drops
+ * the vendor entirely — "Kimi K3" and "MiniMax-M3" keep their identity in the
+ * version, and only a handful of model names are unmistakable without a vendor.
+ * DeepSeek keeps two letters because "v4Pro" alone names no one.
+ */
+const VENDOR_ABBREVIATIONS: ReadonlyArray<readonly [string, string]> = [
+  ["deepseek", "DS"],
+  ["minimax", ""],
+  ["moonshot", ""],
+  ["kimi", ""],
+  ["claude", ""],
+];
+
+/**
+ * A model name squeezed onto a widget row: "DeepSeek V4 Pro" → "DSv4Pro",
+ * "GLM-5.3-Flash" → "GLM5.3Flash", "Kimi K3" → "K3".
+ *
+ * Separators go, and a version marker is lowercased ("V4" → "v4") so the letter
+ * reads as part of the number. An unknown vendor only loses its separators: a
+ * short label that is merely long beats one that is wrong.
+ */
+export function shortModelLabel(name: string): string {
+  const trimmed = name.trim();
+  const lower = trimmed.toLowerCase();
+  const vendor = VENDOR_ABBREVIATIONS.find(([prefix]) => lower.startsWith(prefix));
+  const body = vendor ? trimmed.slice(vendor[0].length) : trimmed;
+  return ((vendor?.[1] ?? "") + body).replace(/[\s_-]+/g, "").replace(/V(?=\d)/g, "v");
+}
+
+/**
+ * Three display forms of a model. `modelShort` goes on tight rows (the widget),
+ * `modelName` on roomier ones (the Agent tool result), and `modelId` — the
+ * canonical `provider/id` — where two providers serving similarly-named models
+ * must be told apart (the conversation viewer).
  *
  * One function, because `index.ts` labels the model it resolved before the run
  * and `agent-manager.ts` relabels it from the live session afterwards — the two
@@ -25,10 +56,12 @@ export interface ModelRegistry {
  */
 export function describeModel(
   model: { provider: string; id: string; name?: string },
-): { modelName: string; modelId: string } {
+): { modelName: string; modelId: string; modelShort: string } {
+  const display = model.name ?? model.id;
   return {
-    modelName: (model.name ?? model.id).replace(/^Claude\s+/i, "").toLowerCase(),
+    modelName: display.replace(/^Claude\s+/i, "").toLowerCase(),
     modelId: `${model.provider}/${model.id}`,
+    modelShort: shortModelLabel(display),
   };
 }
 
@@ -115,4 +148,39 @@ export function resolveModel(
     .sort()
     .join("\n");
   return `Model not found: "${input}".\n\nAvailable models:\n${modelList}`;
+}
+
+/**
+ * Resolve an explicit model request without silently substituting another
+ * provider/model for a provider-qualified pin. Unqualified aliases such as
+ * "haiku" remain fuzzy by design; provider-qualified requests must resolve to
+ * that provider and the same model identity (dot/dash and trailing-date
+ * variations are cosmetic).
+ */
+type ModelResolution = ReturnType<typeof resolveModel>;
+
+export function resolvePinnedModel(
+  input: string,
+  registry: ModelRegistry,
+): ModelResolution {
+  const resolved = resolveModel(input, registry);
+  if (typeof resolved === "string") {
+    return `${resolved}\n\nNo fallback was started. Ask the user before selecting another model.`;
+  }
+
+  const slash = input.indexOf("/");
+  if (slash === -1) return resolved;
+
+  const requestedProvider = input.slice(0, slash).toLowerCase();
+  const requestedId = input.slice(slash + 1);
+  const normalizeId = (id: string) => id.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
+  if (
+    resolved.provider.toLowerCase() !== requestedProvider
+    || normalizeId(resolved.id) !== normalizeId(requestedId)
+  ) {
+    return `Requested model "${input}" resolved to "${resolved.provider}/${resolved.id}" instead. `
+      + "Refusing to substitute a different pinned model or provider. "
+      + "No fallback was started. Ask the user before selecting another model.";
+  }
+  return resolved;
 }

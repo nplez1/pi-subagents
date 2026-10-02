@@ -1,12 +1,45 @@
 /**
- * viewer-keys.ts — Scroll key matchers for the conversation viewer.
+ * viewer-keys.ts — Scroll input matchers for the conversation viewer.
  *
  * Resolves `tui.select.*` through the user's keybindings when pi provides a
  * manager, falling back to the previous hardcoded keys otherwise. The viewer's
  * k/j and shift+arrow aliases always work alongside whatever is bound.
+ *
+ * Mouse wheel arrives here too: the alt screen hands a wheel event no overlay
+ * claimed to the focused component as raw bytes, so the viewer parses them
+ * rather than implementing pi-tui's `handleMouse`, which does not exist in the
+ * version this package typechecks against.
  */
 
 import { type KeyId, matchesKey } from "@earendil-works/pi-tui";
+
+/** Lines per wheel notch. pi never overrides pi-tui's default, so the main transcript scrolls one. */
+const WHEEL_LINES = 1;
+/** pi-tui's `ALT_WHEEL_SCROLL_MULTIPLIER` — Alt multiplies a notch. */
+const ALT_WHEEL_SCROLL_MULTIPLIER = 5;
+const SGR_WHEEL = /^\[<(\d+);(\d+);(\d+)[Mm]$/;
+
+/** Button code from an SGR (`\x1b[<64;x;yM`) or legacy (`\x1b[M` + 3 bytes) mouse report. */
+function wheelButton(data: string): number | undefined {
+  if (!data.startsWith("\x1b")) return undefined;
+  // Split off the ESC so no control character sits inside a regex (biome's noControlCharactersInRegex).
+  const body = data.slice(1);
+  if (body.length === 5 && body.startsWith("[M")) return body.charCodeAt(2) - 32;
+  const sgr = SGR_WHEEL.exec(body);
+  if (!sgr) return undefined;
+  const code = Number.parseInt(sgr[1] ?? "", 10);
+  return Number.isNaN(code) ? undefined : code;
+}
+
+/** Signed line delta for a vertical wheel event, or `undefined` for anything else. */
+function parseWheel(data: string): number | undefined {
+  const button = wheelButton(data);
+  if (button === undefined || (button & 64) === 0) return undefined; // 64 = wheel
+  const direction = button & 3;
+  if (direction > 1) return undefined; // 2/3 = wheel left/right
+  const lines = WHEEL_LINES * ((button & 8) !== 0 ? ALT_WHEEL_SCROLL_MULTIPLIER : 1);
+  return direction === 0 ? -lines : lines;
+}
 
 /** The `tui.select.*` keybinding ids the viewer resolves. */
 export type ViewerScrollKeybinding =
@@ -25,6 +58,8 @@ export interface ViewerKeys {
   scrollDown(data: string): boolean;
   pageUp(data: string): boolean;
   pageDown(data: string): boolean;
+  /** Signed line delta for a wheel event, or `undefined` when `data` is not one. */
+  wheelLines(data: string): number | undefined;
 }
 
 export function createViewerKeys(keybindings?: ViewerKeybindings): ViewerKeys {
@@ -35,5 +70,6 @@ export function createViewerKeys(keybindings?: ViewerKeybindings): ViewerKeys {
     scrollDown: (data) => matches(data, "tui.select.down", "down") || matchesKey(data, "j"),
     pageUp: (data) => matches(data, "tui.select.pageUp", "pageUp") || matchesKey(data, "shift+up"),
     pageDown: (data) => matches(data, "tui.select.pageDown", "pageDown") || matchesKey(data, "shift+down"),
+    wheelLines: parseWheel,
   };
 }

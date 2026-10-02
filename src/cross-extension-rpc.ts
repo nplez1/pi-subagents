@@ -14,7 +14,7 @@
  */
 
 import { isTopLevelAgent } from "./agent-manager.js";
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { type ModelRegistry, resolvePinnedModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
 
@@ -127,7 +127,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         }
         let model = override;
         if (typeof override === "string") {
-          const resolved = resolveModel(override, modelRegistry);
+          const resolved = resolvePinnedModel(override, modelRegistry);
           if (typeof resolved === "string") {
             // resolveModel returns a human-readable error string when the
             // input doesn't match any available model. Surface it instead of
