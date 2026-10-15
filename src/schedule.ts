@@ -21,6 +21,7 @@ import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
+import { applyAgentDefaults } from "./agent-defaults.js";
 import { resolvePinnedModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
@@ -248,6 +249,17 @@ export class SubagentScheduler {
       // fire-time failure.
       const dispatch = resolveSpawnType(job.subagent_type);
       if (!dispatch.ok) throw new Error(dispatch.message);
+      // The job's own model/thinking (captured from the Agent call) win; where it
+      // has neither, the agent's configured default applies — the same precedence
+      // the Agent tool uses, so a scheduled run matches an on-demand one.
+      const defaults = applyAgentDefaults(
+        dispatch.type,
+        { model: resolvedModel, thinkingLevel: job.thinking },
+        ctx,
+      );
+      if (defaults.error) throw new Error(defaults.error);
+      resolvedModel = defaults.model;
+      const effectiveThinking = defaults.thinkingLevel;
       agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
         description: job.description,
         isBackground: true,
@@ -255,7 +267,7 @@ export class SubagentScheduler {
         model: resolvedModel,
         maxTurns: job.max_turns,
         isolated: job.isolated,
-        thinkingLevel: job.thinking,
+        thinkingLevel: effectiveThinking,
         isolation: job.isolation,
         // A scheduled run has no tool call to build this, so without it the
         // conversation viewer shows nothing about how the job was configured.
@@ -263,7 +275,7 @@ export class SubagentScheduler {
         // one when the session reports it, and naming the pre-session pick here
         // would only be right until then.
         invocation: {
-          thinking: job.thinking,
+          thinking: effectiveThinking,
           // Normalized like the Agent tool's own snapshot: `0` means unlimited,
           // and rendering it as "max turns: 0" would read as a limit of none.
           maxTurns: normalizeMaxTurns(job.max_turns),

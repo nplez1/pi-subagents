@@ -36,7 +36,7 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
       skills: true,
       // Explicitly pinned to the user's preferred exploration model. A missing
       // provider/model must fail rather than silently running on the parent.
-      model: "github-copilot/gpt-6-luna",
+      model: "xiaomi/mimo-v2.6-flash",
       thinking: "medium",
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a file search specialist. You excel at thoroughly navigating and exploring codebases.

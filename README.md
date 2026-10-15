@@ -243,12 +243,12 @@ Group completions render each agent as a separate block. The LLM receives struct
 | Type | Tools | Model | Prompt Mode | Description |
 |------|-------|-------|-------------|-------------|
 | `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
-| `Explore` | read, bash, grep, find, ls | `github-copilot/gpt-6-luna` · medium | `replace` (standalone) | Fast codebase exploration (read-only) |
+| `Explore` | read, bash, grep, find, ls | `xiaomi/mimo-v2.6-flash` · medium | `replace` (standalone) | Fast codebase exploration (read-only) |
 | `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
 
-Default agents can be **ejected** (`/agents` → select agent → Eject) to export them as `.md` files for customization, **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** per-project with `enabled: false` frontmatter.
+Default agents can be **ejected** (`/agents` → select agent → Eject) to export them as `.md` files for customization, **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** with an `enabled: false` frontmatter line or an `enabled: false` override in `subagents.json` (via Disable in `/agents` or `/subagents`).
 
 ## Custom Agents
 
@@ -323,9 +323,9 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Agent frontmatter and project settings control `max_turns`; the driving agent cannot choose a turn limit in an `Agent` call. For the other configurable fields, frontmatter is authoritative: if an agent file sets `model`, `thinking`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent, and `Agent` tool parameters only fill fields the agent config leaves unspecified.
+Agent frontmatter and project settings control `max_turns`; the driving agent cannot choose a turn limit in an `Agent` call. For the other configurable fields, frontmatter is authoritative: if an agent file sets `model`, `thinking`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent, and `Agent` tool parameters only fill fields the agent config leaves unspecified. A `model`/`thinking` written by `/subagents` is a *default*, not a pin — see [Subagent Defaults](#subagent-defaults) for the full precedence.
 
-**Model resolution.** A `model:` pin is matched against pi's registry tolerantly for cosmetic id variations: `.` and `-` are equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), and a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa). Unqualified aliases such as `"haiku"` remain fuzzy. A provider-qualified `provider/modelId` pin must resolve to that provider and model; if it is unavailable or resolves elsewhere, the spawn is refused rather than silently switching providers or inheriting the parent's model. `/agents → Agent types` flags an unavailable pin as `(unavailable, spawn refused)`. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
+**Model resolution.** A `model:` pin is matched against pi's registry tolerantly for cosmetic id variations: `.` and `-` are equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), and a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa). Unqualified aliases such as `"haiku"` remain fuzzy. A provider-qualified `provider/modelId` pin must resolve to that provider and model; if it is unavailable or resolves elsewhere, the spawn is refused rather than silently switching providers or inheriting the parent's model. `/agents → Agent types` flags an unavailable pin as `(unavailable, spawn refused)`, and a `/subagents` default as `(default)`. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
 ### Nested subagents
 
@@ -483,6 +483,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 |---------|-------------|
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
+| `/subagents` | Configure per-agent defaults — enable/disable, default model, default thinking level |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
 
@@ -537,9 +538,46 @@ Settings                                    ← max concurrency (background + fo
   - **Custom agents**: Edit, Disable, Delete
   - **Disabled agents**: Enable, Edit, Delete
 - **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
-- **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list (marked `✕`) and can be re-enabled
+- **Disable/Enable** — toggle agent availability. Stored as an `enabled` override in `~/.pi/agent/subagents.json`, so no agent file is edited (plugin-provided agents are often symlinks into another repo); a hand-authored `enabled: false` frontmatter is still honoured, and Enable removes it. Disabled agents stay visible in the list (marked `✕`) and can be re-enabled. `/subagents` exposes the same toggle with a choice of scope.
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
 - **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, and join mode at runtime
+
+## Subagent Defaults
+
+`/subagents` configures what each agent *runs as*, without touching its `.md` file. The list is a fixed-height, scrolling window (ten rows at a time) with the highlighted agent's description on a single line below it — the same shape as pi's own `/model` picker, so it never grows or jumps as you move:
+
+```
+Subagent defaults  scope: global | project
+↑↓ select · ⏎ configure · space toggle · tab scope · esc close
+
+→ ✕◦ rpiv-advisor    inherit · inherit
+    • Explore         gpt-6-luna* · medium*
+      general-purpose  inherit · inherit
+      rpiv-compressor  inherit · inherit
+    (4/12)
+
+Read-only design specialist for turning an explicit design request into an architecture…
+```
+
+Keys: `↑↓` move (with `(n/total)` once the list scrolls), `⏎` opens the agent's menu, `space` toggles it enabled/disabled, `tab` switches the storage scope, `esc` closes. The agent's menu:
+
+- **Set default model…** — a scrolling registry picker, a custom `provider/modelId`, or `inherit` to clear it
+- **Set default thinking…** — `inherit` or any pi thinking level
+- **Clear \<scope\> defaults** — remove this agent's configured overrides
+- **Enable / Disable** — toggle availability, stored in settings rather than the agent file
+- **Clear model pin / thinking pin in file** — shown only when the `.md` carries an authoritative `model:` / `thinking:`; removes that line so the default can take over
+
+A `*` marks a value that came from a `/subagents` default; source indicators match `/agents` (`•` project, `◦` global, `✕` disabled). **Scope** (toggled with `tab`) decides where edits are saved: `global` (`~/.pi/agent/subagents.json`, applies everywhere) or `project` (`<cwd>/.pi/subagents.json`, overrides global per agent and per field). Changes apply to the next spawn — no restart.
+
+**Precedence.** A default is not a pin. For both `model` and `thinking`:
+
+1. `model:` / `thinking:` in the agent's `.md` — authoritative, refuses to be overridden
+2. the caller's `Agent({ model })` (or an RPC caller's option)
+3. the `/subagents` default (in `subagents.json` → `agentOverrides`)
+4. the shipped default of a built-in agent (the bare `Explore` is pinned to the exploration model by the extension itself)
+5. inherit the parent session's model / thinking level
+
+So the driving model can always override a configured default, while an authored file pin still cannot be overridden — clear it from `/subagents` if you want a default to take effect. Plugin-provided agents (for example an advisor plugin's `rpiv-advisor.md`) appear in the same list; their files are never edited by a Disable or a default change.
 
 ## Graceful Max Turns
 
@@ -608,14 +646,65 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 **No-op safety:** if `enabledModels` is missing or empty in pi's settings, scope check skips entirely — no false positives, no spurious errors.
 
+## Claude Code backend
+
+A subagent whose model starts with `claude/` is executed by the **Claude Code CLI** (`claude -p`) instead of a pi session:
+
+```yaml
+---
+name: reviewer
+description: Reviews a diff in depth
+model: claude/sonnet      # anything after "claude/" is passed to `claude --model`
+thinking: high            # → `--effort high`
+---
+```
+
+Or per call: `Agent({ subagent_type: "general-purpose", model: "claude/opus", ... })`.
+
+Backend selection rides on the model string, not a new frontmatter key — so every spawn path works unchanged: the `Agent` tool, nested delegation, workflow `agent()`, the scheduler, and cross-extension RPC. Which model wins is decided exactly as for any other model (frontmatter pin > caller param > `/subagents` default > shipped default > inherit), so an agent with no `model:` still inherits the parent and runs on pi.
+
+**What's identical.** Only the backend changes. The widget, conversation viewer, `.output` transcript, token/cost accounting, `steer_subagent`, stop/abort, `resume`, structured output (`agent({ schema })`), worktree isolation, compaction reporting, nested delegation and `max_turns` all behave the same, because the CLI's `stream-json` output is translated into the same pi messages and the same runner callbacks the pi path produces.
+
+| pi concept | Claude Code flag |
+|---|---|
+| `model: claude/opus` | `--model opus` (alias or full id) |
+| `thinking: high` | `--effort high` (`minimal` folds to `low`; omitted when unset) |
+| `prompt_mode: replace` (default) | `--system-prompt` |
+| `prompt_mode: append` | `--append-system-prompt` |
+| `agent({ schema })` | `--json-schema` |
+| `tools:` / `disallowed_tools:` | `--tools` / `--disallowedTools` |
+| `max_turns` | enforced client-side (Claude Code 2.1 has no turn flag), soft-limit steer then hard abort |
+| `persist_session` | a sidecar recording the Claude Code session id; `--no-session-persistence` when off |
+| `isolation: worktree` | the child runs with `cwd` in the worktree copy |
+
+**Permissions.** Runs use `--dangerously-skip-permissions`. In `-p` mode there is no human to answer a permission prompt, so the alternative is not "safer", it is "the agent stalls" — and this matches how a pi subagent already runs. Because permissions are bypassed wholesale, `tools:` is what actually keeps a restricted agent restricted here: it is translated to `--tools` (`Explore`'s `read, bash, grep, find, ls` becomes `Read,Bash,Grep,Glob,LS,Task`), and `disallowed_tools:` to `--disallowedTools`. Names are mapped from pi's vocabulary, an already-Claude Code name (`WebFetch`, `Glob`, `TodoWrite`, …) passes through, and an entry with no equivalent still warns, as on the pi path. (`Task` rides along with any non-empty allowlist because pi gates further delegation by `max_subagent_depth`, not by `tools:`; `tools: none` really does mean no tools.) A declaration that names *every* pi built-in is treated as unrestricted rather than as an allowlist — that is what an omitted `tools:` parses to, and narrowing it would strip Claude Code's own tools from an agent that never asked to be narrowed. The policy is re-sent on a resume, since both flags are per-invocation.
+
+`--tools` selects from Claude Code's **built-in** set, so it cannot restrict tools contributed by MCP servers; `tools:` is a built-in-tool allowlist, not a capability sandbox.
+
+**Tool rendering.** Claude Code's tool calls are mapped to their pi equivalents before they become messages (`Read`→`read`, `Edit`→`edit`, `Glob`→`find`, `Bash`→`bash`, …), so tool rows render through pi's own components and a Claude Code subagent looks like any other. Arguments are rebuilt into pi's shapes rather than renamed blindly: `file_path`→`path`, `old_string`/`new_string`→`edits: [{ oldText, newText }]`, and Claude Code's millisecond `Bash` timeout is converted to pi's seconds. Tools with no pi counterpart (`TodoWrite`, `WebFetch`, `Task`, …) keep their own name and render as generic cards.
+
+**Nested subagents.** Claude Code's own `Task`-tool subagents are forwarded (`--forward-subagent-text`) and appear as indented, gutter-marked rows rather than being credited to the parent.
+
+**Resume** continues the conversation by Claude Code's own session id, so the CLI keeps the real context (including anything it compacted). It requires the original run to have been persisted — a run started with `persist_session: false` reports that plainly instead of relaying the CLI's error.
+
+**Model scope.** `claude/*` cannot resolve through `enabledModels` — that list holds `provider/modelId` pairs pi can reach — so the allowlist gates the backend differently: when [`scopeModels`](#model-scope) is on, a `claude/…` entry in the same list is how you opt the backend in (`"claude/sonnet"` for one model, `"claude/*"` for all of them). Without one, a caller-supplied `claude/*` model is refused like any other out-of-scope model. Scope enforcement off means no gate, exactly as for every other model.
+
+**Cost** is whatever the CLI reports (`total_cost_usd`, list-price equivalent — $0 for a run the CLI doesn't price, which the UI shows as "no cost reported"). **Context-window percentage is not shown** for these runs: Claude Code reports tokens but no context utilisation, and inventing one from a guessed window would put a confident wrong number on screen.
+
+**Requirements.** `claude` on `PATH` and authenticated (Claude Code 2.1+; `claude setup-token` for a long-lived token). Override the binary with `PI_SUBAGENTS_CLAUDE_BIN`.
+
+**Testing.** `PI_SUBAGENTS_CLAUDE_LIVE=1 npx vitest run src/claude-code/claude-code.live.test.ts` exercises the real CLI; the default run uses a fake binary and needs no auth.
+
 ## Persistent Settings
 
 Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off) persist across pi restarts. Two files, merged on load:
 
-- **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
-- **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
+- **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here (`/subagents` does, for per-agent defaults).
+- **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings and by `/subagents`.
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+
+The `agentOverrides` map — `{ "Explore": { model, thinking, enabled } }` — is written by `/subagents`, merged per agent and per field rather than replaced wholesale, and preserved when the `/agents` → Settings menu rewrites the file. See [Subagent Defaults](#subagent-defaults).
 
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
 
@@ -939,6 +1028,15 @@ src/
   # Execution
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
+
+  # Claude Code backend (a `claude/*` model runs via the `claude` CLI)
+  claude-code/
+    model.ts          # `claude/*` spec recognition + the synthetic pi Model that selects it
+    runner.ts         # CLI spawn, stdin control channel, args, run assembly
+    protocol.ts       # `stream-json` wire types and line parser
+    translate.ts      # Claude Code events -> pi messages (+ usage, turns, nesting)
+    tools.ts          # Claude Code tool names/args -> their pi equivalents
+    session.ts        # AgentSession-shaped façade read by the widget/viewer/usage
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child

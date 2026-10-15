@@ -12,14 +12,23 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Key, matchesKey, SelectList, type SelectItem, type SettingItem, SettingsList, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
+import { applyAgentDefaults } from "./agent-defaults.js";
 import { buildAgentDetails } from "./agent-details.js";
-import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
+import { buildNewAgentFile, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, removeFrontmatterKeys, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import {
+  type AgentOverride,
+  agentOverridesEqual,
+  isFilePin,
+  type OverrideScope,
+  resolveOverrideMapKey,
+  setOverrideField,
+} from "./agent-overrides.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -35,9 +44,9 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, readAgentOverridesForScope, type SubagentsSettings, saveAgentOverridesForScope, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -370,7 +379,9 @@ export default function (pi: ExtensionAPI) {
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
     const userAgents = loadCustomAgents(process.cwd(), strict);
-    registerAgents(userAgents);
+    // Re-read settings each reload so a `/subagents` default takes effect on the
+    // next spawn without restarting pi, the same contract agent files have.
+    registerAgents(userAgents, loadSettings(process.cwd()).agentOverrides);
   };
 
   // Initial load — the only strict one. A bad edit mid-session must not kill the
@@ -641,9 +652,21 @@ export default function (pi: ExtensionAPI) {
     // Like the tool's own, it is a prediction — editing the agent file mid-run
     // leaves the displayed ceiling stale.
     const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
+    // This funnel bypasses the Agent tool's `resolveAgentInvocationConfig`, so an
+    // agent's configured default model/thinking (subagents.json
+    // `agentOverrides`) is folded in here. A caller that passed a model keeps
+    // it; a caller that passed nothing (the advisor's RPC spawn, a mention)
+    // gets the default instead of inheriting the parent's model.
+    const defaults = applyAgentDefaults(dispatch.type, options ?? {}, ctxRef as ExtensionContext);
+    if (defaults.error) throw new Error(defaults.error);
     // Repaints are left to the manager's `onStart` callback, which already starts
     // the widget/fleet timers for agents that enter this way.
-    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
+    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, {
+      ...options,
+      ...callbacks,
+      model: defaults.model,
+      thinkingLevel: defaults.thinkingLevel,
+    });
     agentActivity.set(id, state);
     return id;
   };
@@ -2820,13 +2843,42 @@ Terse command-style prompts produce shallow, generic work.
   // so they are reachable from tests — this command handler is only registered
   // through `registerCommand`, which every test mocks.
 
+  /**
+   * Which value actually drives an agent's model, and where it came from.
+   * Mirrors `resolveAgentInvocationConfig`'s precedence minus the caller slot
+   * (there is no caller when configuring): an authored file pin wins, then the
+   * `/subagents` default, then a shipped embedded default, else inherit.
+   */
+  function effectiveModelDescriptor(
+    cfg: AgentConfig | undefined,
+  ): { input?: string; source?: "pin" | "default" | "shipped" } {
+    if (!cfg) return {};
+    if (cfg.model != null && isFilePin(cfg)) return { input: cfg.model, source: "pin" };
+    if (cfg.defaultModel) return { input: cfg.defaultModel, source: "default" };
+    if (cfg.model != null) return { input: cfg.model, source: "shipped" };
+    return {};
+  }
+
+  /** The thinking-level counterpart of `effectiveModelDescriptor`. */
+  function effectiveThinkingDescriptor(
+    cfg: AgentConfig | undefined,
+  ): { level?: ThinkingLevel; source?: "pin" | "default" | "shipped" } {
+    if (!cfg) return {};
+    if (cfg.thinking != null && isFilePin(cfg)) return { level: cfg.thinking, source: "pin" };
+    if (cfg.defaultThinking) return { level: cfg.defaultThinking, source: "default" };
+    if (cfg.thinking != null) return { level: cfg.thinking, source: "shipped" };
+    return {};
+  }
+
   function getModelLabel(type: string, registry?: ModelRegistry): string {
     const cfg = getAgentConfig(type);
-    if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
-    const label = getModelLabelFromConfig(cfg.model);
-    if (!registry) return label;
-    const resolved = resolvePinnedModel(cfg.model, registry);
-    // Configured but unresolvable/mismatched pins refuse to spawn rather than
+    const { input, source } = effectiveModelDescriptor(cfg);
+    if (!input) return "inherit"; // nothing configured → really inherits parent
+    const label = getModelLabelFromConfig(input);
+    const suffix = source === "default" ? " (default)" : "";
+    if (!registry) return `${label}${suffix}`;
+    const resolved = resolvePinnedModel(input, registry);
+    // Configured but unresolvable/mismatched values refuse the spawn rather than
     // falling back to the parent model; keep that visible in the type list.
     if (typeof resolved === "string") return `${label} (unavailable, spawn refused)`;
     // Surface what it actually resolved to when that differs from the config.
@@ -2834,7 +2886,7 @@ Terse command-style prompts produce shallow, generic work.
     // effectively-identical match stays quiet.
     const resolvedFull = `${resolved.provider}/${resolved.id}`;
     const norm = (s: string) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
-    if (norm(cfg.model) === norm(resolvedFull)) return label;
+    if (norm(input) === norm(resolvedFull)) return `${label}${suffix}`;
     return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
   }
 
@@ -2975,6 +3027,389 @@ Terse command-style prompts produce shallow, generic work.
     }
   }
 
+  // ---- /subagents — per-agent defaults and enable/disable --------------------
+  //
+  // A dedicated command rather than another /agents submenu: this configures the
+  // agent DEFINITIONS themselves (including plugin-provided ones), stores them in
+  // subagents.json rather than editing the .md files, and is the one surface
+  // whose changes apply to the next spawn without restarting pi.
+
+  /** Rows visible at once in every `/subagents` list. pi's own pickers use 10. */
+  const SUBAGENT_LIST_WINDOW = 10;
+
+  /**
+   * A component that renders exactly one truncated line at any width.
+   *
+   * `Text` word-wraps, so a long agent description would grow the dialog — and,
+   * because the description changes with the selection, make the list jump as
+   * the cursor moves. Clamping to one line keeps the dialog a fixed height.
+   */
+  function oneLineView(theme: { fg(color: string, text: string): string }) {
+    let text = "";
+    return {
+      setText(next: string) {
+        text = next;
+      },
+      render: (width: number): string[] => [
+        theme.fg(
+          "dim",
+          truncateToWidth(text.replace(/\s+/g, " ").trim(), Math.max(1, width - 2), "…"),
+        ),
+      ],
+      invalidate() {},
+    };
+  }
+
+  /**
+   * A bounded, scrolling picker built on pi's own `SelectList`.
+   *
+   * Deliberately not `ctx.ui.select`: that renders one row per option with no
+   * window and no scroll, so a model list of a few dozen entries runs off the
+   * bottom of the screen and the highlight disappears past the end. `SelectList`
+   * shows a fixed window with a `(n/total)` marker and keeps the selection in
+   * view — the pattern pi's own `/model` picker uses.
+   */
+  async function pickFromList(
+    ctx: ExtensionCommandContext,
+    title: string,
+    items: SelectItem[],
+    currentValue?: string,
+  ): Promise<string | undefined> {
+    const selectedIndex = currentValue === undefined ? -1 : items.findIndex(i => i.value === currentValue);
+    return ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+      const list = new SelectList(items, SUBAGENT_LIST_WINDOW, getSelectListTheme(), {
+        minPrimaryColumnWidth: 24,
+        maxPrimaryColumnWidth: 40,
+      });
+      if (selectedIndex >= 0) list.setSelectedIndex(selectedIndex);
+      list.onSelect = item => done(item.value);
+      list.onCancel = () => done(undefined);
+      const container = new Container();
+      container.addChild(new Text(title, 0, 0));
+      container.addChild(new Spacer(1));
+      container.addChild(list);
+      return {
+        render: (w: number) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => list.handleInput(data),
+      };
+    });
+  }
+
+  /**
+   * Persist one agent's override into the chosen scope, then reload the registry
+   * so the change is live. A no-op patch skips the write entirely — the menu is
+   * easy to re-enter and rewriting the file for nothing would churn it.
+   */
+  function persistAgentOverride(
+    ctx: ExtensionCommandContext,
+    name: string,
+    scope: OverrideScope,
+    patch: AgentOverride,
+    toast: string,
+  ): void {
+    const cwd = process.cwd();
+    const current = readAgentOverridesForScope(scope, cwd);
+    // Edit an existing key even if its case differs, rather than adding a
+    // second entry beside it.
+    const key = resolveOverrideMapKey(current, name) ?? name;
+    const next = setOverrideField(current, key, patch);
+    if (agentOverridesEqual(current, next)) return;
+    const ok = saveAgentOverridesForScope(next, scope, cwd);
+    reloadCustomAgents();
+    ctx.ui.notify(
+      ok ? toast : `${toast} (session only; failed to persist)`,
+      ok ? "info" : "warning",
+    );
+  }
+
+  /** `*` marks a value that came from a `/subagents` default rather than inherit. */
+  function overrideMarker(source: "pin" | "default" | "shipped" | undefined): string {
+    return source === "default" ? "*" : "";
+  }
+
+  /** Effective `model · thinking` for a `/subagents` row, with provenance markers. */
+  function describeAgentDefaults(cfg: AgentConfig | undefined): string {
+    const model = effectiveModelDescriptor(cfg);
+    const thinking = effectiveThinkingDescriptor(cfg);
+    const modelText = model.input
+      ? `${getModelLabelFromConfig(model.input)}${overrideMarker(model.source)}`
+      : "inherit";
+    const thinkingText = thinking.level ? `${thinking.level}${overrideMarker(thinking.source)}` : "inherit";
+    return `${modelText} · ${thinkingText}`;
+  }
+
+  function agentRow(name: string): { label: string; value: string; description: string } {
+    const cfg = getAgentConfig(name);
+    const disabled = cfg?.enabled === false;
+    const source = cfg?.source === "project" ? "•" : cfg?.source === "global" ? "◦" : " ";
+    return {
+      label: `${disabled ? "✕" : " "}${source} ${name}`,
+      value: disabled ? "disabled" : describeAgentDefaults(cfg),
+      description: cfg?.description ?? name,
+    };
+  }
+
+  /**
+   * Set (or clear) an agent's default model. The chosen value is resolved before
+   * it is persisted, so a typo cannot wedge every future spawn of that agent
+   * behind the fail-loud resolution error the default is subject to.
+   */
+  async function pickAgentDefaultModel(
+    ctx: ExtensionCommandContext,
+    name: string,
+    scope: OverrideScope,
+  ): Promise<void> {
+    const cfg = getAgentConfig(name);
+    const override = readAgentOverridesForScope(scope, process.cwd())[name];
+    const current = override?.model ?? cfg?.defaultModel ?? "";
+    const available = (ctx.modelRegistry.getAvailable?.() ?? ctx.modelRegistry.getAll()) as {
+      provider: string;
+      id: string;
+    }[];
+    // Sentinel values, so a provider/id can never collide with the two actions.
+    const inheritChoice = "\u0000inherit";
+    const customChoice = "\u0000custom";
+    const items: SelectItem[] = [
+      { value: inheritChoice, label: "inherit", description: "no default — use the parent model" },
+      ...available.map(m => ({ value: `${m.provider}/${m.id}`, label: m.id, description: m.provider })),
+      { value: customChoice, label: "custom…", description: "type a provider/modelId" },
+    ];
+    const choice = await pickFromList(ctx, `Default model for ${name}`, items, current || undefined);
+    if (choice === undefined) return;
+    if (choice === inheritChoice) {
+      persistAgentOverride(ctx, name, scope, { model: undefined }, `${name}: default model cleared (${scope})`);
+      return;
+    }
+    let model: string;
+    if (choice === customChoice) {
+      const typed = await ctx.ui.input("Model (provider/modelId)", current || undefined);
+      if (!typed?.trim()) return;
+      model = typed.trim();
+    } else {
+      model = choice;
+    }
+    const resolved = resolvePinnedModel(model, ctx.modelRegistry);
+    if (typeof resolved === "string") {
+      ctx.ui.notify(resolved, "warning");
+      return;
+    }
+    persistAgentOverride(ctx, name, scope, { model }, `${name}: default model ${model} (${scope})`);
+  }
+
+  /** Set (or clear) an agent's default thinking level. */
+  async function pickAgentDefaultThinking(
+    ctx: ExtensionCommandContext,
+    name: string,
+    scope: OverrideScope,
+  ): Promise<void> {
+    const inheritChoice = "\u0000inherit";
+    const current = readAgentOverridesForScope(scope, process.cwd())[name]?.thinking;
+    const items: SelectItem[] = [
+      { value: inheritChoice, label: "inherit", description: "no default — use the file/parent level" },
+      ...THINKING_LEVELS.map(level => ({ value: level, label: level })),
+    ];
+    const choice = await pickFromList(ctx, `Default thinking for ${name}`, items, current);
+    if (choice === undefined) return;
+    if (choice === inheritChoice) {
+      persistAgentOverride(ctx, name, scope, { thinking: undefined }, `${name}: default thinking cleared (${scope})`);
+      return;
+    }
+    persistAgentOverride(
+      ctx,
+      name,
+      scope,
+      { thinking: choice as ThinkingLevel },
+      `${name}: default thinking ${choice} (${scope})`,
+    );
+  }
+
+  /**
+   * Drop an authoritative `model:`/`thinking:` line from an agent `.md` so the
+   * configured default can take over. Confirmed with the path, because for a
+   * plugin-provided agent that file often lives in another repo.
+   */
+  async function clearAgentFilePin(
+    ctx: ExtensionCommandContext,
+    name: string,
+    field: "model" | "thinking",
+  ): Promise<void> {
+    const cfg = getAgentConfig(name);
+    const file = locateAgentFile(name, cfg?.sourcePath);
+    if (!file) {
+      ctx.ui.notify(`No editable file for ${name}; nothing to clear.`, "info");
+      return;
+    }
+    const confirmed = await ctx.ui.confirm(
+      `Clear ${field} pin`,
+      `Remove "${field}:" from ${file.path}?\n\n`
+        + `A ${field} pin outranks any /subagents default and any Agent({ ${field} }) override. `
+        + "Clearing it lets the configured default (or the caller) decide.",
+    );
+    if (!confirmed) return;
+    const content = readFileSync(file.path, "utf-8");
+    const { content: updated, changed } = removeFrontmatterKeys(content, [field]);
+    if (!changed) {
+      ctx.ui.notify(`No ${field} pin found in ${file.path}.`, "info");
+      return;
+    }
+    writeFileSync(file.path, updated, "utf-8");
+    reloadCustomAgents();
+    ctx.ui.notify(`Cleared ${field} pin in ${file.path}`, "info");
+  }
+
+  /** Per-agent actions reached from a `/subagents` row. */
+  async function showAgentDefaultDetail(
+    ctx: ExtensionCommandContext,
+    name: string,
+    scope: OverrideScope,
+  ): Promise<void> {
+    const cfg = getAgentConfig(name);
+    if (!cfg) return;
+    const file = locateAgentFile(name, cfg.sourcePath);
+    const override = readAgentOverridesForScope(scope, process.cwd())[name];
+    const model = effectiveModelDescriptor(cfg);
+    const thinking = effectiveThinkingDescriptor(cfg);
+    const disabled = cfg.enabled === false;
+
+    const options: string[] = ["Set default model…", "Set default thinking…"];
+    if (override?.model || override?.thinking) options.push(`Clear ${scope} defaults`);
+    options.push(disabled ? "Enable" : "Disable");
+    if (model.source === "pin" && file) options.push("Clear model pin in file");
+    if (thinking.source === "pin" && file) options.push("Clear thinking pin in file");
+    options.push("Back");
+
+    const choice = await pickFromList(ctx, `${name} — ${scope} scope`, options.map(o => ({ value: o, label: o })));
+    if (!choice || choice === "Back") return;
+
+    if (choice === "Set default model…") {
+      await pickAgentDefaultModel(ctx, name, scope);
+    } else if (choice === "Set default thinking…") {
+      await pickAgentDefaultThinking(ctx, name, scope);
+    } else if (choice.startsWith("Clear ") && choice.endsWith("defaults")) {
+      persistAgentOverride(
+        ctx,
+        name,
+        scope,
+        { model: undefined, thinking: undefined },
+        `${name}: defaults cleared (${scope})`,
+      );
+    } else if (choice === "Enable") {
+      persistAgentOverride(ctx, name, scope, { enabled: true }, `${name} enabled (${scope})`);
+    } else if (choice === "Disable") {
+      persistAgentOverride(ctx, name, scope, { enabled: false }, `${name} disabled (${scope})`);
+    } else if (choice === "Clear model pin in file") {
+      await clearAgentFilePin(ctx, name, "model");
+    } else if (choice === "Clear thinking pin in file") {
+      await clearAgentFilePin(ctx, name, "thinking");
+    }
+  }
+
+  /**
+   * `/subagents` — scroll the agent definitions, toggle each, and set its
+   * default model/effort. Scope switches between global and project storage.
+   *
+   * Built on `SelectList` with a fixed window and a one-line info pane below it,
+   * so the dialog is a constant height: the previous `SettingsList` version
+   * rendered each selected agent's full multi-line description, which changed the
+   * height on every cursor move and made the list jump.
+   */
+  async function showSubagentsMenu(ctx: ExtensionCommandContext): Promise<void> {
+    reloadCustomAgents();
+    let scope: OverrideScope = "global";
+
+    for (;;) {
+      const names = getAllTypes();
+      if (names.length === 0) {
+        ctx.ui.notify("No agent definitions found.", "info");
+        return;
+      }
+
+      const items: SelectItem[] = names.map(name => {
+        const row = agentRow(name);
+        return { value: name, label: row.label, description: row.value };
+      });
+      const descriptions = new Map(names.map(n => [n, getAgentConfig(n)?.description ?? n]));
+
+      const selected = await ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+        const list = new SelectList(items, SUBAGENT_LIST_WINDOW, getSelectListTheme(), {
+          minPrimaryColumnWidth: 24,
+          maxPrimaryColumnWidth: 40,
+        });
+        const header = new Text("", 0, 0);
+        const info = oneLineView(theme);
+        const paintHeader = () => {
+          const active = (name: string) => (scope === name ? theme.fg("accent", name) : theme.fg("dim", name));
+          header.setText(
+            `${theme.fg("accent", theme.bold("Subagent defaults"))}  `
+              + `${theme.fg("dim", "scope:")} ${active("global")}${theme.fg("dim", " | ")}${active("project")}`
+              + theme.fg("dim", "   * configured default"),
+          );
+        };
+        const setInfo = (name: string) => info.setText(descriptions.get(name) ?? "");
+        list.onSelect = item => done(item.value);
+        list.onCancel = () => done(undefined);
+        list.onSelectionChange = item => {
+          setInfo(item.value);
+          tui.requestRender();
+        };
+        const first = list.getSelectedItem();
+        if (first) setInfo(first.value);
+        paintHeader();
+
+        const container = new Container();
+        container.addChild(header);
+        container.addChild(
+          new Text(theme.fg("dim", "↑↓ select · ⏎ configure · space toggle · tab scope · esc close"), 0, 0),
+        );
+        container.addChild(new Spacer(1));
+        container.addChild(list);
+        container.addChild(new Spacer(1));
+        container.addChild(info);
+        return {
+          render: (w: number) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            if (matchesKey(data, Key.tab)) {
+              scope = scope === "global" ? "project" : "global";
+              paintHeader();
+              tui.requestRender();
+              return;
+            }
+            // Space toggles the highlighted agent without opening its submenu.
+            if (matchesKey(data, Key.space)) {
+              const item = list.getSelectedItem();
+              if (item) {
+                const enable = getAgentConfig(item.value)?.enabled === false;
+                persistAgentOverride(
+                  ctx,
+                  item.value,
+                  scope,
+                  { enabled: enable },
+                  `${item.value} ${enable ? "enabled" : "disabled"} (${scope})`,
+                );
+                // Mutate the item in place: SelectList renders from these same
+                // objects, so the row updates without rebuilding the list (which
+                // would reset the cursor).
+                const refreshed = agentRow(item.value);
+                item.label = refreshed.label;
+                item.description = refreshed.value;
+                setInfo(item.value);
+                container.invalidate();
+                tui.requestRender();
+              }
+              return;
+            }
+            list.handleInput(data);
+          },
+        };
+      });
+
+      if (selected === undefined || !getAgentConfig(selected)) return;
+      await showAgentDefaultDetail(ctx, selected, scope);
+    }
+  }
+
   async function showRunningAgents(ctx: ExtensionCommandContext) {
     const agents = manager.listAgents().filter(isTopLevelAgent);
     if (agents.length === 0) {
@@ -3039,6 +3474,11 @@ Terse command-style prompts produce shallow, generic work.
       menuOptions = isDefault
         ? ["Enable", "Edit", "Reset to default", "Delete", "Back"]
         : ["Enable", "Edit", "Delete", "Back"];
+    } else if (disabled) {
+      // Disabled by the settings override with no .md of its own (typically a
+      // built-in). Eject stays available so the override can be turned into an
+      // authored file, but Enable is the primary action.
+      menuOptions = ["Enable", "Eject (export as .md)", "Back"];
     } else if (isDefault && !file) {
       // Default agent with no .md override
       menuOptions = ["Eject (export as .md)", "Disable", "Back"];
@@ -3113,71 +3553,77 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
-  async function disableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
-    if (file) {
-      // Existing file — set enabled: false in frontmatter (idempotent)
-      const content = readFileSync(file.path, "utf-8");
-      const { content: updated, outcome } = disableInContent(content);
-      if (outcome === "already-disabled") {
-        ctx.ui.notify(`${name} is already disabled.`, "info");
-        return;
-      }
-      if (outcome === "no-frontmatter") {
-        // Nothing to edit — say so rather than rewriting the file unchanged and
-        // reporting success for a change that never happened.
-        ctx.ui.notify(`Cannot disable ${name}: ${file.path} has no frontmatter block.`, "error");
-        return;
-      }
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(file.path, updated, "utf-8");
-      reloadCustomAgents();
-      ctx.ui.notify(`Disabled ${name} (${file.path})`, "info");
-      return;
-    }
-
-    // No file (built-in default) — create a stub
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
-    ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Disabled ${name} (${targetPath})`, "info");
+  /**
+   * Write this agent's `enabled` override into the global settings file — the
+   * same store `/subagents` uses. No agent file is touched, so disabling a
+   * plugin-provided agent never edits a file in another repo.
+   */
+  function writeAgentEnabledOverride(name: string, enabled: boolean): boolean {
+    const cwd = process.cwd();
+    const current = readAgentOverridesForScope("global", cwd);
+    const key = resolveOverrideMapKey(current, name) ?? name;
+    const next = setOverrideField(current, key, { enabled });
+    if (agentOverridesEqual(current, next)) return true;
+    return saveAgentOverridesForScope(next, "global", cwd);
   }
 
-  /** Enable a disabled agent by removing enabled: false from its frontmatter. */
-  async function enableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
-    if (!file) return;
+  /** Remove an `enabled` override for this agent from every scope that has one. */
+  function clearAgentEnabledOverride(name: string): boolean {
+    const cwd = process.cwd();
+    let changed = false;
+    for (const scope of ["global", "project"] as const) {
+      const current = readAgentOverridesForScope(scope, cwd);
+      const key = resolveOverrideMapKey(current, name);
+      if (key === undefined) continue;
+      const next = setOverrideField(current, key, { enabled: undefined });
+      if (agentOverridesEqual(current, next)) continue;
+      if (saveAgentOverridesForScope(next, scope, cwd)) changed = true;
+    }
+    return changed;
+  }
 
-    const content = readFileSync(file.path, "utf-8");
-    const { content: updated, changed } = enableInContent(content);
-    if (!changed && !isEmptyStub(updated)) {
-      // The file carries no `enabled: false` to remove, so it was never disabled
-      // by us — reporting success here would hide a no-op.
-      ctx.ui.notify(`${name} is not disabled in ${file.path}.`, "info");
+  /**
+   * Disable an agent by writing `enabled: false` into the settings file.
+   * Agent files are deliberately left alone: plugin-provided agents are often
+   * symlinks into another checkout, and the loader honours the settings flag on
+   * every path. `/subagents` is the richer version of this same store.
+   */
+  async function disableAgent(ctx: ExtensionCommandContext, name: string) {
+    const persisted = writeAgentEnabledOverride(name, false);
+    reloadCustomAgents();
+    ctx.ui.notify(
+      persisted ? `Disabled ${name}` : `Disabled ${name} (session only; failed to persist)`,
+      persisted ? "info" : "warning",
+    );
+  }
+
+  /**
+   * Enable a disabled agent: clear any settings override, and remove a
+   * hand-authored `enabled: false` from its file so the file does not re-disable
+   * the agent if the override is later cleared. An empty stub file is deleted to
+   * restore the built-in default.
+   */
+  async function enableAgent(ctx: ExtensionCommandContext, name: string) {
+    const clearedOverride = clearAgentEnabledOverride(name);
+    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
+    let fileChanged = false;
+    if (file) {
+      const content = readFileSync(file.path, "utf-8");
+      const { content: updated } = enableInContent(content);
+      if (isEmptyStub(updated)) {
+        unlinkSync(file.path);
+        fileChanged = true;
+      } else if (updated !== content) {
+        writeFileSync(file.path, updated, "utf-8");
+        fileChanged = true;
+      }
+    }
+    reloadCustomAgents();
+    if (!clearedOverride && !fileChanged) {
+      ctx.ui.notify(`${name} is not disabled.`, "info");
       return;
     }
-    const { writeFileSync } = await import("node:fs");
-
-    // If the file was just a stub ("---\n---\n"), delete it to restore the built-in default
-    if (isEmptyStub(updated)) {
-      unlinkSync(file.path);
-      reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (removed ${file.path})`, "info");
-    } else {
-      writeFileSync(file.path, updated, "utf-8");
-      reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (${file.path})`, "info");
-    }
+    ctx.ui.notify(`Enabled ${name}`, "info");
   }
 
   async function showCreateWizard(ctx: ExtensionCommandContext) {
@@ -3422,8 +3868,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // to SubagentsSettings and not mirrored above, this Exclude is non-empty and
   // fails to satisfy `never` — turning a silent settings-erasure bug into a
   // typecheck error. `npm run typecheck` runs in CI.
+  //
+  // `agentOverrides` is the one deliberate exception: `/subagents` owns it and
+  // writes it through `saveAgentOverridesForScope`, which touches only that key.
+  // Folding it into this snapshot would copy global overrides into every project
+  // file. `saveSettings` re-attaches the project file's existing map, so a
+  // settings toggle still cannot erase it.
   type _NoMissingSettingsKeys =
-    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings>> extends never
+    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings> | "agentOverrides"> extends never
       ? true
       : ["snapshotSettings() is missing a SubagentsSettings key"];
   const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;
@@ -3876,6 +4328,16 @@ Write the file using the write tool. Only write the file, nothing else.`;
   pi.registerCommand("agents", {
     description: "Manage agents",
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+  });
+
+  // The configuration counterpart to /agents: /agents creates, edits and inspects
+  // agent files; /subagents configures what they run as (default model/effort,
+  // enabled) without touching those files, so plugin-provided agents are covered
+  // too. Kept as its own command rather than another /agents entry because it is
+  // the natural place to look for "change my subagent models".
+  pi.registerCommand("subagents", {
+    description: "Configure subagent defaults (model, thinking, enable/disable)",
+    handler: async (_args, ctx) => { await showSubagentsMenu(ctx); },
   });
 
   /**

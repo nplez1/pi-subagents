@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { isFilePin } from "./agent-overrides.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
@@ -123,19 +124,46 @@ export function resolveAgentInvocationConfig(
   const requested = agentConfig?.isolation ?? params.isolation;
   const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
 
-  const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
-    && agentConfig.thinking !== params.thinking
+  // Model/thinking precedence, highest first:
+  //
+  //   1. A pin authored in an agent .md — the file is authoritative, by design.
+  //   2. The caller's Agent({ model })/RPC option.
+  //   3. The default configured via `/subagents` (subagents.json).
+  //   4. The shipped default of an EMBEDDED agent (the bare `Explore` is pinned
+  //      to the exploration model by the extension itself).
+  //   5. Inherit the parent's model / thinking.
+  //
+  // Slot 4 sits below 3 so a user can re-point the extension's own shipped
+  // default without ejecting the agent; slot 2 above both means the caller can
+  // too. Only a pin authored in a FILE (slot 1) still outranks the caller — the
+  // shipped default is itself a default, not authored configuration.
+  // Slot 3 below 2 is what keeps the driving model able to override a configured
+  // default, which is the whole point of a default rather than a pin.
+  const filePin = agentConfig?.model != null && isFilePin(agentConfig);
+  const fileThinkingPin = agentConfig?.thinking != null && isFilePin(agentConfig);
+  const modelInput = (filePin ? agentConfig?.model : undefined)
+    ?? params.model
+    ?? agentConfig?.defaultModel
+    ?? (!isFilePin(agentConfig) ? agentConfig?.model : undefined);
+  const thinking = (fileThinkingPin ? agentConfig?.thinking : undefined)
+    ?? params.thinking
+    ?? agentConfig?.defaultThinking
+    ?? (!isFilePin(agentConfig) ? agentConfig?.thinking : undefined);
+
+  // Only a PIN the caller tried to outrank is worth disclosing. A configured
+  // default is not a pin, so a caller beating it is not an override to report.
+  const overriddenThinking = fileThinkingPin && params.thinking != null
+    && agentConfig?.thinking !== params.thinking
     ? params.thinking as ThinkingLevel
     : undefined;
-  const overriddenModel = agentConfig?.model != null && params.model != null
-    && agentConfig.model !== params.model
+  const overriddenModel = filePin && params.model != null && agentConfig?.model !== params.model
     ? params.model
     : undefined;
 
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
-    thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
+    modelInput,
+    modelFromParams: !filePin && params.model != null,
+    thinking: thinking as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,

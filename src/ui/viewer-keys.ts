@@ -5,15 +5,17 @@
  * manager, falling back to the previous hardcoded keys otherwise. The viewer's
  * k/j and shift+arrow aliases always work alongside whatever is bound.
  *
- * Mouse wheel arrives here too: the alt screen hands a wheel event no overlay
- * claimed to the focused component as raw bytes, so the viewer parses them
- * rather than implementing pi-tui's `handleMouse`, which does not exist in the
- * version this package typechecks against.
+ * Mouse wheel arrives here only as a fallback. A host whose alt screen
+ * normalizes mouse events dispatches the wheel to the viewer's `handleMouse`
+ * first, and that is the path that scrolls; these byte matchers cover a host that
+ * does not — including the pi-tui version this package typechecks against, which
+ * has no `handleMouse` at all — where the unclaimed sequence reaches the focused
+ * component as raw bytes.
  */
 
 import { type KeyId, matchesKey } from "@earendil-works/pi-tui";
 
-/** Lines per wheel notch. pi never overrides pi-tui's default, so the main transcript scrolls one. */
+/** Lines per wheel notch on the raw-byte path, which cannot see pi's acceleration. */
 const WHEEL_LINES = 1;
 /** pi-tui's `ALT_WHEEL_SCROLL_MULTIPLIER` — Alt multiplies a notch. */
 const ALT_WHEEL_SCROLL_MULTIPLIER = 5;

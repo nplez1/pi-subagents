@@ -2,6 +2,23 @@
  * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
  */
 
+import { createClaudeCodeModel, isClaudeCodeModelSpec } from "./claude-code/model.js";
+
+/**
+ * Whether the registry knows a provider literally named `claude`.
+ *
+ * A user-defined provider with that name owns `claude/*` specs; the Claude Code
+ * backend only claims them when nothing else answers to the prefix.
+ */
+function registryHasClaudeProvider(registry: ModelRegistry): boolean {
+  try {
+    const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+    return all.some(m => m?.provider?.toLowerCase() === "claude");
+  } catch {
+    return false;
+  }
+}
+
 export interface ModelEntry {
   id: string;
   name: string;
@@ -74,6 +91,20 @@ export function resolveModel(
   input: string,
   registry: ModelRegistry,
 ): any | string {
+  // A `claude/*` spec names an execution BACKEND, not a model pi serves. It is
+  // answered before the registry is consulted — and before the availability and
+  // provider-fallback logic below — because no registry entry will ever exist
+  // for it: the run is executed by the external `claude` CLI. See
+  // claude-code/model.ts for why this rides on the model rather than a new
+  // config field. Every resolution call site therefore routes to Claude Code
+  // without knowing it exists; `runAgent` branches on the resulting provider.
+  //
+  // The one exception is a registry that actually has a provider named `claude`:
+  // the user defined it, so `claude/x` is an ordinary model spec and must resolve
+  // through the registry rather than being stolen by the backend.
+  if (isClaudeCodeModelSpec(input) && !registryHasClaudeProvider(registry))
+    return createClaudeCodeModel(input);
+
   // Available models (those with auth configured)
   const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
   const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));

@@ -51,8 +51,25 @@ export interface AgentConfig {
   excludeExtensions?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
+  /**
+   * Authoritative model PIN from the agent file. Outranks the caller's
+   * `Agent({ model })`; spawns are refused rather than silently substituted if
+   * it no longer resolves. Configured with `/subagents` only for file-backed
+   * agents that already carry one ("clear pin").
+   */
   model?: string;
+  /** Authoritative thinking PIN from the agent file, same precedence as `model`. */
   thinking?: ThinkingLevel;
+  /**
+   * Overridable model DEFAULT, configured with `/subagents` and persisted in
+   * `subagents.json` (never in the `.md`). Applied only where neither the file
+   * pin nor the caller's `Agent({ model })` said anything — so the driving model
+   * can still override it. Also outranks a shipped embedded default (`Explore`),
+   * which is itself a default rather than an authored pin.
+   */
+  defaultModel?: string;
+  /** Overridable thinking DEFAULT, same slot as `defaultModel`. */
+  defaultThinking?: ThinkingLevel;
   maxTurns?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
   persistSession?: boolean;

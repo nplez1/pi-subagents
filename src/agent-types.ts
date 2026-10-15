@@ -6,6 +6,7 @@
  */
 
 import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
+import { applyAgentOverrides, type AgentOverrideMap } from "./agent-overrides.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import type { AgentConfig } from "./types.js";
 
@@ -55,27 +56,41 @@ export function setFallbackSubagent(v: string | undefined): void { fallbackSubag
 
 /**
  * Build a registry map: DEFAULT_AGENTS first (unless disabled via settings),
- * then user agents overlaid on top (same name overrides the default).
+ * then user agents overlaid on top (same name overrides the default), then the
+ * project/global per-agent overrides from `subagents.json` folded in.
+ *
+ * Overrides are applied last so they can reach embedded defaults too (a bare
+ * `Explore` has no file to configure), and `applyAgentOverrides` clones the
+ * configs it touches rather than mutating the shared `DEFAULT_AGENTS` objects.
+ *
  * Pure — callers that must not disturb the process-wide registry (nested
  * delegation resolving agents from its own config root) build their own map.
  */
-export function buildAgentRegistry(userAgents: Map<string, AgentConfig>): Map<string, AgentConfig> {
+export function buildAgentRegistry(
+  userAgents: Map<string, AgentConfig>,
+  overrides?: AgentOverrideMap,
+): Map<string, AgentConfig> {
   const registry = new Map<string, AgentConfig>();
   if (!disableDefaults) {
     for (const [name, config] of DEFAULT_AGENTS) registry.set(name, config);
   }
   for (const [name, config] of userAgents) registry.set(name, config);
+  applyAgentOverrides(registry, overrides);
   return registry;
 }
 
 /**
  * Register agents into the unified registry.
- * Starts with DEFAULT_AGENTS, then overlays user agents (overrides defaults with same name).
+ * Starts with DEFAULT_AGENTS, then overlays user agents (overrides defaults with same name),
+ * then folds in the per-agent overrides from `subagents.json`.
  * Disabled agents (enabled === false) are kept in the registry but excluded from spawning.
  */
-export function registerAgents(userAgents: Map<string, AgentConfig>): void {
+export function registerAgents(
+  userAgents: Map<string, AgentConfig>,
+  overrides?: AgentOverrideMap,
+): void {
   agents.clear();
-  for (const [name, config] of buildAgentRegistry(userAgents)) {
+  for (const [name, config] of buildAgentRegistry(userAgents, overrides)) {
     agents.set(name, config);
   }
 }

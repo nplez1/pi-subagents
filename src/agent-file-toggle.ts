@@ -178,6 +178,34 @@ export function enableInContent(content: string): { content: string; changed: bo
   return { content: kept.join(""), changed: true };
 }
 
+/**
+ * Remove whole `key: value` lines from a file's frontmatter block, wherever they
+ * appear. Used to drop an authoritative `model:`/`thinking:` pin so a configured
+ * default can take over — the pin is the only thing that outranks it.
+ *
+ * Matches on the key only, so every spelling of the value is removed
+ * (`model: x`, `model: "x"`, a trailing comment). `changed` is false when
+ * nothing matched, so the caller never reports a write that did nothing.
+ */
+export function removeFrontmatterKeys(
+  content: string,
+  keys: readonly string[],
+): { content: string; changed: boolean } {
+  const block = splitFrontmatter(content);
+  if (!block) return { content, changed: false };
+  const wanted = new Set(keys.map(k => k.toLowerCase()));
+  const kept = block.lines.filter(
+    (l, i) =>
+      !(
+        i > 0
+        && i < block.closeIdx
+        && wanted.has((l.replace(/\r?\n$/, "").match(/^([A-Za-z0-9_-]+)\s*:/)?.[1] ?? "").toLowerCase())
+      ),
+  );
+  if (kept.length === block.lines.length) return { content, changed: false };
+  return { content: kept.join(""), changed: true };
+}
+
 /** Is this the empty stub `/agents` writes when disabling a built-in default? */
 export function isEmptyStub(content: string): boolean {
   return content.replace(/\r\n/g, "\n").trim() === "---\n---";

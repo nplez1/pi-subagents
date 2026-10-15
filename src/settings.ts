@@ -5,6 +5,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  type AgentOverrideMap,
+  mergeAgentOverrides,
+  type OverrideScope,
+  sanitizeAgentOverrides,
+} from "./agent-overrides.js";
 import { NO_FALLBACK } from "./agent-types.js";
 import type { AgentMentionMode, JoinMode, WidgetMode } from "./types.js";
 
@@ -291,6 +297,23 @@ export interface SubagentsSettings {
    * the mode label comes back. Applies to running *and* finished rows.
    */
   showModel?: boolean;
+
+  /**
+   * Per-agent defaults and enable/disable state configured through
+   * `/subagents`: `{ "Explore": { model, thinking, enabled } }`.
+   *
+   * Deliberately NOT part of the `/agents → Settings` snapshot. That menu
+   * writes the whole `subagents.json`, so folding this map into it would copy
+   * global overrides into every project file (stale duplicates shadowing later
+   * global edits). It has its own read-modify-write path
+   * (`saveAgentOverridesForScope`) that touches only this key, and `saveSettings`
+   * re-attaches whatever the project file already held so a settings toggle
+   * three menus away cannot erase it.
+   *
+   * Scope: global (`<agentDir>/subagents.json`) provides defaults, project
+   * (`<cwd>/.pi/subagents.json`) overrides per agent and per field.
+   */
+  agentOverrides?: AgentOverrideMap;
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -445,6 +468,8 @@ function sanitize(raw: unknown): SubagentsSettings {
   } else if (typeof r.fallbackSubagent === "string" && r.fallbackSubagent.trim()) {
     out.fallbackSubagent = r.fallbackSubagent.trim();
   }
+  const agentOverrides = sanitizeAgentOverrides(r.agentOverrides);
+  if (Object.keys(agentOverrides).length > 0) out.agentOverrides = agentOverrides;
   return out;
 }
 
@@ -472,21 +497,94 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
-/** Load merged settings: global provides defaults, project overrides. */
+/**
+ * Load merged settings: global provides defaults, project overrides.
+ *
+ * `agentOverrides` is merged per AGENT and per FIELD rather than by the shallow
+ * spread the other keys use: a project that configures one agent's model must
+ * not erase every global default, and a project that sets only a thinking level
+ * must keep global's model for that agent.
+ */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  const globalSettings = readSettingsFile(globalPath());
+  const projectSettings = readSettingsFile(projectPath(cwd));
+  const merged: SubagentsSettings = { ...globalSettings, ...projectSettings };
+  const overrides = mergeAgentOverrides(globalSettings.agentOverrides, projectSettings.agentOverrides);
+  if (Object.keys(overrides).length > 0) merged.agentOverrides = overrides;
+  else delete merged.agentOverrides;
+  return merged;
 }
 
 /**
- * Write project-local settings. Global is never touched from code.
- * Returns `true` on success, `false` if the write (or mkdir) failed so the
- * caller can surface a warning — persistence isn't fatal but isn't silent.
+ * Read one scope's raw override map, unmerged. `/subagents` uses this to show
+ * what is configured where, and to diff before writing so an edit that changes
+ * nothing does not rewrite the file.
+ */
+export function readAgentOverridesForScope(
+  scope: OverrideScope,
+  cwd: string = process.cwd(),
+): AgentOverrideMap {
+  const path = scope === "global" ? globalPath() : projectPath(cwd);
+  return readSettingsFile(path).agentOverrides ?? {};
+}
+
+/**
+ * Write one scope's override map, preserving every other key in that file —
+ * including keys this extension does not know about. A read-modify-write of the
+ * raw JSON rather than a re-serialization of the sanitized settings, because
+ * `/subagents` editing one agent must not drop a hand-authored field.
+ *
+ * An empty map removes the key entirely rather than leaving `"agentOverrides": {}`.
+ */
+export function saveAgentOverridesForScope(
+  overrides: AgentOverrideMap,
+  scope: OverrideScope,
+  cwd: string = process.cwd(),
+): boolean {
+  const path = scope === "global" ? globalPath() : projectPath(cwd);
+  let raw: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        raw = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Corrupt file: `readSettingsFile` already warned when the settings menu
+      // loaded it. Writing over it with just the overrides would drop the
+      // unparseable content, so refuse instead — the caller surfaces a warning.
+      return false;
+    }
+  }
+  const sanitized = sanitizeAgentOverrides(overrides);
+  if (Object.keys(sanitized).length > 0) raw.agentOverrides = sanitized;
+  else delete raw.agentOverrides;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(raw, null, 2), "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Persist the settings-menu snapshot to the project file.
+ *
+ * The snapshot deliberately omits `agentOverrides`, which `/subagents` owns and
+ * writes through its own path. Re-attach whatever the project file already held
+ * so a toggle here cannot erase it. Global overrides live in the global file
+ * and are never read into this write.
  */
 export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()): boolean {
   const path = projectPath(cwd);
+  const existing = readSettingsFile(path);
+  const toWrite: SubagentsSettings = { ...s };
+  if (existing.agentOverrides !== undefined) toWrite.agentOverrides = existing.agentOverrides;
+  else delete toWrite.agentOverrides;
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");
+    writeFileSync(path, JSON.stringify(toWrite, null, 2), "utf-8");
     return true;
   } catch {
     return false;

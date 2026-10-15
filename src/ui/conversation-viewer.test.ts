@@ -89,7 +89,7 @@ describe("ConversationViewer mouse routing", () => {
 		);
 	});
 
-	it("ignores non-left-click events so selection and wheel keep working", () => {
+	it("ignores non-left-click events so pi's text selection stays in charge", () => {
 		const child = { handleMouse: vi.fn(() => ({ handled: true })) };
 		const { viewer } = makeViewer([{ component: child as never, start: 0, height: 2 }]);
 
@@ -110,5 +110,123 @@ describe("ConversationViewer mouse routing", () => {
 	it("does nothing when the component does not handle the click", () => {
 		const { viewer } = makeViewer([{ component: {} as never, start: 0, height: 2 }]);
 		expect(viewer.handleMouse({ type: "click", button: 0, x: 5, y: 4, width: 60, height: 20 })).toBeUndefined();
+	});
+
+	it("claims the wheel and scrolls the viewer rather than the transcript behind it", () => {
+		const lines = Array.from({ length: 200 }, (_, i) => `line ${i}`);
+		const { viewer, tui } = makeViewer([{ component: {} as never, start: 0, height: 200 }], lines);
+		const offset = () => (viewer as unknown as { scrollOffset: number }).scrollOffset;
+		const autoScroll = () => (viewer as unknown as { autoScroll: boolean }).autoScroll;
+
+		// A notch down, then two lines back up: pi's own delta is applied as given.
+		expect(viewer.handleMouse({ type: "wheel", button: 64, x: 5, y: 4, width: 60, height: 20, wheelDelta: 5 })).toEqual({
+			handled: true,
+		});
+		expect(offset()).toBe(5);
+		expect(autoScroll()).toBe(false);
+
+		expect(viewer.handleMouse({ type: "wheel", button: 64, x: 5, y: 4, width: 60, height: 20, wheelDelta: -2 })).toEqual({
+			handled: true,
+		});
+		expect(offset()).toBe(3);
+		expect(tui.requestRender).toHaveBeenCalled();
+	});
+
+	it("clamps the wheel to the transcript's bounds", () => {
+		const lines = Array.from({ length: 200 }, (_, i) => `line ${i}`);
+		const { viewer } = makeViewer([{ component: {} as never, start: 0, height: 200 }], lines);
+		const offset = () => (viewer as unknown as { scrollOffset: number }).scrollOffset;
+		const autoScroll = () => (viewer as unknown as { autoScroll: boolean }).autoScroll;
+		const maxScroll = () => (viewer as unknown as { scrollBounds(): { maxScroll: number } }).scrollBounds().maxScroll;
+
+		// Up from the top moves nothing (never below zero) and parks auto-follow.
+		viewer.handleMouse({ type: "wheel", button: 64, x: 5, y: 4, width: 60, height: 20, wheelDelta: -5 });
+		expect(offset()).toBe(0);
+		expect(autoScroll()).toBe(false);
+
+		// A notch far past the end stops on the last line and resumes following.
+		viewer.handleMouse({ type: "wheel", button: 64, x: 5, y: 4, width: 60, height: 20, wheelDelta: 100_000 });
+		expect(offset()).toBe(maxScroll());
+		expect(autoScroll()).toBe(true);
+	});
+});
+
+
+describe("ConversationViewer nested subagent gutter", () => {
+	/**
+	 * The Claude Code backend tags a delegated child's messages with
+	 * `parentToolUseId` (Claude Code interleaves its own subagents into one
+	 * stream). Those rows must render with a gutter so the child's work does not
+	 * read as the parent's own.
+	 *
+	 * Drives the render path with injected components rather than real pi
+	 * components: `UserMessageComponent.render` needs a full markdown theme, and
+	 * this test is about the gutter, not about markdown.
+	 */
+	function build(nested: boolean) {
+		const tui = {
+			terminal: { rows: 40, columns: 100 },
+			requestRender: vi.fn(),
+		} as unknown as TUI;
+		const session = {
+			messages: [],
+			subscribe: () => () => {},
+			sessionManager: { getCwd: () => "/tmp" },
+			getToolDefinition: () => undefined,
+		} as unknown as AgentSession;
+		const record = {
+			id: "a1",
+			type: "general-purpose",
+			description: "inspect",
+			status: "completed",
+			startedAt: Date.now(),
+			toolUses: 0,
+			lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+		} as unknown as AgentRecord;
+		const viewer = new ConversationViewer(tui, session, record, undefined, theme, () => {});
+
+		const parent = { render: () => ["PARENT"], invalidate: () => {} };
+		const child = { render: () => ["CHILD"], invalidate: () => {} };
+		const v = viewer as unknown as Record<string, unknown> & {
+			transcript: unknown[];
+			contentLayout: ViewerContentEntry[];
+			nestedComponents: Set<unknown>;
+		};
+		// Replace the transcript source so the render loop sees exactly these.
+		v.rebuildTranscript = () => {
+			v.transcript = [parent, child];
+		};
+		if (nested) v.nestedComponents.add(child);
+
+		const lines = (
+			viewer as unknown as { tryBuildComponentLines(w: number): string[] | undefined }
+		).tryBuildComponentLines(60);
+		return { lines, layout: v.contentLayout, parent, child };
+	}
+
+	it("indents a nested child's rows and leaves the parent's flush", () => {
+		const { lines } = build(true);
+		expect(lines).toBeDefined();
+		// The theme stub is identity, so the gutter arrives verbatim.
+		expect(lines).toContain("PARENT");
+		expect(lines).toContain("  ▏ CHILD");
+	});
+
+	it("leaves a pi transcript (nothing tagged nested) entirely flush", () => {
+		const { lines } = build(false);
+		expect(lines).toContain("PARENT");
+		expect(lines).toContain("CHILD");
+		expect((lines ?? []).some((l) => l.includes("▏"))).toBe(false);
+	});
+
+	it("keeps every row clickable — indentation must not wrap components", () => {
+		// The gutter is applied at render time precisely so `contentLayout` still
+		// maps a rendered line back to the ORIGINAL component; wrapping would break
+		// click-to-expand for tool rows inside a nested block.
+		const { layout, parent, child } = build(true);
+		const entries = layout as unknown as ViewerContentEntry[];
+		expect(entries.map((e) => e.component)).toEqual([parent, child]);
+		// Both rows render exactly one line, so the ranges are contiguous.
+		expect(entries.map((e) => e.height)).toEqual([1, 1]);
 	});
 });

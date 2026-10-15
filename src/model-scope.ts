@@ -7,7 +7,39 @@
  * `disableDefaults` lives in agent-types.ts: both entry points need it.
  */
 
+import { isClaudeCodeModel } from "./claude-code/model.js";
 import { isModelInScope, type ModelRegistryRef, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
+
+/**
+ * Whether `enabledModels` opts a `claude/*` backend in.
+ *
+ * Matching is the same exact, case-insensitive `provider/spec` form the rest of
+ * the allowlist uses, plus a `claude/*` wildcard for "any Claude Code model" —
+ * the spec after the prefix is resolved by the CLI, so there is no registry list
+ * to enumerate and picking one spelling per Claude release would go stale.
+ */
+function isClaudeSpecAllowed(
+  model: { provider: string; id: string },
+  patterns: string[] | undefined,
+): boolean {
+  if (!patterns) return false;
+  const wanted = model.id.toLowerCase();
+  return patterns.some(pattern => {
+    const trimmed = pattern?.trim().toLowerCase();
+    if (!trimmed?.startsWith("claude/")) return false;
+    const spec = trimmed.slice("claude/".length);
+    return spec === "*" || spec === wanted;
+  });
+}
+
+/** Message for a claude spec the allowlist does not carry, naming the fix. */
+function claudeOptInHint(): string {
+  return [
+    "Claude Code models are gated by the same `enabledModels` list. Add the",
+    'backend there to allow it, e.g. "claude/sonnet" — or "claude/*" for any',
+    "Claude Code model.",
+  ].join(" ");
+}
 
 /**
  * When enabled, subagent model choices are validated against `enabledModels`
@@ -50,7 +82,38 @@ export function checkModelScope(args: {
   modelInput?: string;
 }): ModelScopeVerdict {
   const { model, cwd, modelRegistry, callerSupplied, agentLabel, modelInput } = args;
-  if (!scopeModelsEnabled || !model) return { kind: "ok" };
+  if (!model) return { kind: "ok" };
+
+  // `claude/*` selects an execution backend rather than a model pi serves, so it
+  // can never resolve through `enabledModels` — that list holds provider/modelId
+  // pairs pi can actually reach, and `resolveEnabledModels` drops anything it
+  // cannot find in the registry. The allowlist therefore cannot *describe* a
+  // claude spec, and applying it as written would reject every Claude Code spawn.
+  //
+  // What it can still do is gate the backend, which matters because the model can
+  // be chosen by the LLM through the Agent tool's `model` parameter: without a
+  // gate, `model: claude/opus` would be a way around a scope the user switched on
+  // deliberately — and the CLI it spawns runs with permissions bypassed. So a
+  // `claude/…` entry (or `claude/*` for all of them) in the same list is how the
+  // user opts the backend in. Scope enforcement off means no gate at all, exactly
+  // as it does for every other model.
+  if (isClaudeCodeModel(model)) {
+    if (!scopeModelsEnabled) return { kind: "ok" };
+    if (isClaudeSpecAllowed(model, readEnabledModels(cwd))) return { kind: "ok" };
+    const list = claudeOptInHint();
+    if (callerSupplied) {
+      return {
+        kind: "error",
+        message: `Model not in scope: "${modelInput ?? model.id}".\n\n${list}`,
+      };
+    }
+    return {
+      kind: "warn",
+      message: `Agent "${agentLabel}" using out-of-scope model "${modelInput ?? model.id}"`,
+    };
+  }
+
+  if (!scopeModelsEnabled) return { kind: "ok" };
 
   const allowed = resolveEnabledModels(readEnabledModels(cwd), modelRegistry, cwd);
   if (!allowed || isModelInScope(model, allowed)) return { kind: "ok" };

@@ -60,9 +60,9 @@ const registeredAgentTool = (() => {
 })();
 
 describe("pinned agent models", () => {
-	it("pins the built-in Explore agent to Luna with medium thinking", () => {
+	it("pins the built-in Explore agent with medium thinking", () => {
 		expect(DEFAULT_AGENTS.get("Explore")).toMatchObject({
-			model: "github-copilot/gpt-6-luna",
+			model: "xiaomi/mimo-v2.6-flash",
 			thinking: "medium",
 		});
 	});
@@ -128,7 +128,7 @@ describe("pinned agent models", () => {
 				.join("\n");
 
 			expect(getAgentConfig("Explore")).toMatchObject({
-				model: "github-copilot/gpt-6-luna",
+				model: "xiaomi/mimo-v2.6-flash",
 				thinking: "medium",
 			});
 			expect(message).toContain(

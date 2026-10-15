@@ -26,6 +26,7 @@ import {
   writeInitialEntry,
 } from "./output-file.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { loadSettings } from "./settings.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -147,7 +148,10 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
-  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
+  const loadRegistry = () => buildAgentRegistry(
+    loadCustomAgents(context.configCwd),
+    loadSettings(context.configCwd).agentOverrides,
+  );
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
       ? undefined

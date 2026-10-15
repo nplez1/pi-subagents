@@ -18,6 +18,9 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { isClaudeCodeModel, claudeCodeModelFromSpec } from "./claude-code/model.js";
+import { type ClaudeRunnerContext, readSidecar, resumeClaudeCodeAgent, runClaudeCodeAgent } from "./claude-code/runner.js";
+import { type ClaudeCodeSession, isClaudeCodeSession } from "./claude-code/session.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -594,12 +597,85 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+/**
+ * Settings a Claude Code run shares with the pi path, resolved here because they
+ * are owned by this module and the runner is imported by it — reading them over
+ * there would be a runtime import cycle.
+ */
+function resolveClaudeRunnerContext(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  options: RunOptions,
+): ClaudeRunnerContext {
+  const agentConfig = getAgentConfig(type);
+  const effectiveCwd = options.cwd ?? ctx.cwd;
+  const configCwd = options.configCwd ?? effectiveCwd;
+  const settingsManager = SettingsManager.create(configCwd, getAgentDir());
+  const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
+  const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
+  // Same precedence as the pi path: frontmatter wins, otherwise the project
+  // default, which `rememberAgents` supplies for top-level agents only.
+  const persistSession = agentConfig?.persistSession ?? (options.nested ? false : rememberAgents);
+  return {
+    maxTurns: resolveEffectiveMaxTurns(type, options.maxTurns),
+    graceTurns,
+    persistSession,
+    // Neither of the configured sources is set for most installs. The pi path
+    // does not care — `SessionManager.create` falls back to its own default —
+    // but a sidecar needs a real directory, and without one the run would be
+    // non-resumable with `--no-session-persistence` even though persistence was
+    // requested. Asking pi for the directory it would have used keeps the two
+    // backends' sessions side by side, and only when one is actually wanted.
+    sessionDir:
+      configuredSessionDir ??
+      defaultSessionDir ??
+      (persistSession ? SessionManager.create(effectiveCwd).getSessionDir() : undefined),
+    resumeSessionFile: options.resumeSessionFile,
+  };
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  // A `claude/*` model is executed by the external Claude Code CLI instead of a
+  // pi session. The branch sits ahead of every pi resource this function would
+  // otherwise build — loader, session manager, tool scoping, skill preloading —
+  // so a Claude Code run touches none of it, and the synthetic model that
+  // `resolveModel` returns for these specs is never handed to
+  // `createAgentSession`. Everything the two backends share (turn limits,
+  // persistence, the system prompt, the result shape) is resolved either here or
+  // in the runner, so the manager above cannot tell them apart.
+  //
+  // On a RESUME the resolved model is not the authority on the backend — the file
+  // is. The `@agent-<name>` reopen path re-resolves a model from the agent's
+  // current defaults or the parent's rather than remembering what the original
+  // run used, so without this a Claude Code conversation would be reopened
+  // through pi (`SessionManager.open` on a JSON sidecar) and a pi conversation
+  // whose agent now defaults to `claude/*` would be reopened through the CLI.
+  const resumeSidecar = options.resumeSessionFile
+    ? readSidecar(options.resumeSessionFile)
+    : undefined;
+  if (isClaudeCodeModel(options.model) || resumeSidecar) {
+    // The two disagree: the resolved model asks for the CLI but the file it names
+    // is not a sidecar this extension wrote. Refusing is the only safe answer —
+    // opening it through pi would fail on a JSON sidecar, and running the CLI
+    // over a pi conversation would overwrite that transcript with a sidecar.
+    if (isClaudeCodeModel(options.model) && options.resumeSessionFile && !resumeSidecar) {
+      throw new Error(
+        `Cannot resume ${options.resumeSessionFile} as a Claude Code session: it is not a Claude Code sidecar.`,
+      );
+    }
+    // The conversation was created by the CLI, so the backend comes from the
+    // sidecar's recorded model, not from whatever the agent defaults to today.
+    const claudeOptions = resumeSidecar && !isClaudeCodeModel(options.model)
+      ? { ...options, model: claudeCodeModelFromSpec(resumeSidecar.model) }
+      : options;
+    return runClaudeCodeAgent(ctx, type, prompt, claudeOptions, resolveClaudeRunnerContext(ctx, type, claudeOptions));
+  }
+
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
@@ -1148,6 +1224,16 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
+  // A Claude Code session continues against the CLI by its own session id,
+  // rather than through a pi session — there is no pi session behind it.
+  if (isClaudeCodeSession(session)) {
+    return resumeClaudeCodeAgent(session as ClaudeCodeSession, prompt, {
+      onToolActivity: options.onToolActivity,
+      onAssistantUsage: options.onAssistantUsage,
+      signal: options.signal,
+    });
+  }
+
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).

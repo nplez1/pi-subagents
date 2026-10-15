@@ -45,6 +45,14 @@ import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./vie
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + hints + status + bottom border. */
 const CHROME_LINES_BASE = 7;
 const MIN_VIEWPORT = 3;
+
+/**
+ * Gutter drawn to the left of a nested subagent's rows. Text and width live
+ * together so the width a nested component renders at (`width - width`) always
+ * matches what is prepended to its lines.
+ */
+const NESTED_GUTTER = "  \u258F ";
+const NESTED_GUTTER_WIDTH = 4;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 90;
 
@@ -77,6 +85,12 @@ export interface ViewerMouseEvent {
   y: number;
   width: number;
   height: number;
+  /**
+   * Signed lines for a `wheel` event (negative is up), already accelerated and
+   * `Alt`-multiplied by pi. Absent on a host that does not normalize wheels —
+   * there the raw bytes reach `handleInput`, which parses them instead.
+   */
+  wheelDelta?: number;
 }
 
 /** One transcript component's slice of the rendered content lines. */
@@ -271,6 +285,21 @@ export class ConversationViewer implements Component {
   private toolComponents = new Map<string, ToolExecutionComponent>();
   private toolArgSigs = new Map<string, number>();
   private expandables = new Set<Expandable>();
+  /**
+   * Components belonging to a NESTED subagent's turns.
+   *
+   * Claude Code interleaves its own child agents' events into the same stream,
+   * tagged with `parent_tool_use_id`. Those messages are rendered with a gutter
+   * so delegated work reads as nested under the call that spawned it rather than
+   * as the parent's own — which is what it would look like otherwise, since the
+   * events arrive on one stream in order.
+   *
+   * A component SET rather than wrapped components on purpose: `contentLayout`
+   * maps rendered line ranges back to the real components for click routing, so
+   * wrapping would break click-to-expand for tool rows inside a nested block.
+   * Indenting at render time keeps every component identity intact.
+   */
+  private nestedComponents = new Set<Component>();
   /** Set when the component path fails, so `render()` stops retrying it every frame. */
   private componentsFailed = false;
 
@@ -391,17 +420,35 @@ export class ConversationViewer implements Component {
   }
 
   /**
-   * Route a left click inside the overlay to the transcript component under the
-   * pointer, so tool/bash blocks expand and collapse exactly as they do in the
-   * main chat. pi's `ToolExecutionComponent` exposes its toggle through a
-   * `MouseRegion`; the main chat reaches it by hit-testing its chat `Container`,
-   * and this overlay — which is not a container — does the same hit-test here.
+   * Handle the mouse events that belong to the overlay: the wheel, and a left
+   * click.
    *
-   * Only clicks are routed. Everything else returns `undefined` so pi's own
-   * text-selection and wheel handling stay in charge (the wheel still arrives as
-   * raw bytes through `handleInput`).
+   * The wheel is claimed rather than declined. pi's alt screen dispatches a
+   * normalized wheel to the overlay under the pointer first, and only falls back
+   * — when the overlay does not claim it — to scrolling the `ScrollView` under
+   * the pointer, which is the main chat. Declining therefore handed the notch to
+   * the transcript behind the overlay whenever the viewer was not the focused
+   * component, and scrolled it instead. Claiming it keeps the wheel where the
+   * pointer is, focused or not, and takes pi's own per-notch `wheelDelta`
+   * (accelerated, `Alt`-multiplied) rather than re-deriving one from bytes.
+   *
+   * A left click is routed to the transcript component under the pointer, so
+   * tool/bash blocks expand and collapse exactly as they do in the main chat.
+   * pi's `ToolExecutionComponent` exposes its toggle through a `MouseRegion`; the
+   * main chat reaches it by hit-testing its chat `Container`, and this overlay —
+   * which is not a container — does the same hit-test here.
+   *
+   * Everything else returns `undefined` so pi's text selection stays in charge.
    */
   handleMouse(event: ViewerMouseEvent): { handled: true } | undefined {
+    if (event.type === "wheel") {
+      const delta = event.wheelDelta ?? 0;
+      const { maxScroll } = this.scrollBounds();
+      this.scrollOffset = Math.max(0, Math.min(maxScroll, this.scrollOffset + delta));
+      this.autoScroll = this.scrollOffset >= maxScroll;
+      this.tui.requestRender();
+      return { handled: true };
+    }
     if (event.type !== "click" || (event.button & 3) !== 0) return undefined;
     const innerW = this.lastInnerW;
     if (innerW <= 0) return undefined;
@@ -577,6 +624,7 @@ export class ConversationViewer implements Component {
     this.toolComponents.clear();
     this.toolArgSigs.clear();
     this.expandables.clear();
+    this.nestedComponents.clear();
   }
 
   // ---- Private ----
@@ -741,9 +789,16 @@ export class ConversationViewer implements Component {
       const out: string[] = [];
       const layout: ViewerContentEntry[] = [];
       for (const component of this.transcript) {
-        const childLines = component.render(width);
-        layout.push({ component, start: out.length, height: childLines.length });
-        out.push(...childLines);
+        // Nested rows render narrower and are shifted right, so they keep their
+        // own line ranges and stay individually clickable.
+        const nested = this.nestedComponents.has(component);
+        const widthForComponent = nested ? Math.max(1, width - NESTED_GUTTER_WIDTH) : width;
+        const childLines = component.render(widthForComponent);
+        const rendered = nested
+          ? childLines.map((line) => this.theme.fg("dim", NESTED_GUTTER) + line)
+          : childLines;
+        layout.push({ component, start: out.length, height: rendered.length });
+        out.push(...rendered);
       }
       this.contentLayout = layout;
 
@@ -763,6 +818,7 @@ export class ConversationViewer implements Component {
       this.toolComponents.clear();
       this.toolArgSigs.clear();
       this.expandables.clear();
+      this.nestedComponents.clear();
       return undefined;
     }
   }
@@ -799,6 +855,11 @@ export class ConversationViewer implements Component {
 
     const comps = cached ?? [];
     this.updateMessageComponents(msg, comps, cached === undefined);
+    // Tagged by the Claude Code backend on a nested agent's turns; never set on a
+    // pi message, so a pi subagent's transcript is unaffected.
+    if ((msg as { parentToolUseId?: string }).parentToolUseId) {
+      for (const c of comps) this.nestedComponents.add(c);
+    }
     this.messageComponents.set(key, comps);
     this.messageSignatures.set(key, sig);
     return comps;
