@@ -36,11 +36,27 @@ describe("hitTestContent", () => {
 	});
 });
 
+/**
+ * Stand-in for the alt screen's focus bookkeeping. Focus is a flag rather than
+ * derived from the component because the tests need to model a press in the
+ * layout below taking focus, which is what an unfocused overlay looks like.
+ */
+class FakeTui {
+	terminal = { rows: 40, columns: 100 };
+	requestRender = vi.fn();
+	overlayFocused = true;
+	focusedComponent: unknown = undefined;
+	setFocus(component: unknown) {
+		this.focusedComponent = component;
+		this.overlayFocused = true;
+	}
+	isOverlayFocused() {
+		return this.overlayFocused;
+	}
+}
+
 function makeViewer(contentLayout: ViewerContentEntry[], cachedLines: string[] = []) {
-	const tui = {
-		terminal: { rows: 40, columns: 100 },
-		requestRender: vi.fn(),
-	} as unknown as TUI;
+	const tui = new FakeTui() as unknown as TUI;
 	const session = {
 		messages: [],
 		subscribe: () => () => {},
@@ -151,6 +167,50 @@ describe("ConversationViewer mouse routing", () => {
 	});
 });
 
+
+describe("ConversationViewer focus", () => {
+	/**
+	 * pi-tui's `isFocusable` is `"focused" in component`, and only a focusable
+	 * component is ever marked focused — which is what decides whether the alt
+	 * screen defers a wheel to the overlay or scrolls the transcript behind it.
+	 */
+	it("is focusable, and propagates focus to the steering editor", () => {
+		const { viewer } = makeViewer([]);
+		expect("focused" in viewer).toBe(true);
+		expect(viewer.focused).toBe(false);
+
+		const editor = (viewer as unknown as { ensureEditor(): { focused: boolean } }).ensureEditor();
+		// Built before pi grants focus, so it starts out as the viewer does.
+		expect(editor.focused).toBe(false);
+
+		viewer.focused = true;
+		expect(editor.focused).toBe(true);
+
+		viewer.focused = false;
+		expect(editor.focused).toBe(false);
+	});
+
+	it("re-claims focus that a press in the layout below took", () => {
+		const { viewer, tui } = makeViewer([], []);
+		const fake = tui as unknown as FakeTui;
+		fake.overlayFocused = false; // a press in the gutter focused the base editor
+
+		viewer.render(40);
+
+		expect(fake.focusedComponent).toBe(viewer);
+		expect(fake.overlayFocused).toBe(true);
+	});
+
+	it("leaves focus alone while another overlay legitimately owns it", () => {
+		const { viewer, tui } = makeViewer([], []);
+		const fake = tui as unknown as FakeTui;
+		fake.overlayFocused = true; // pi's transcript search sits above the viewer
+
+		viewer.render(40);
+
+		expect(fake.focusedComponent).toBeUndefined();
+	});
+});
 
 describe("ConversationViewer nested subagent gutter", () => {
 	/**

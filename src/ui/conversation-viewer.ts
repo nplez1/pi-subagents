@@ -14,6 +14,10 @@
  * through pi's global theme).
  */
 
+import { appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
   type AgentSession,
   AssistantMessageComponent,
@@ -257,7 +261,53 @@ function truncationNote(elided: number): string {
   return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
 }
 
+/** Whether to write the input trace below. Read once: it is a process-wide switch. */
+const DEBUG = process.env.PI_VIEWER_DEBUG === "1";
+
+/**
+ * Opt-in trace of what the viewer actually receives (`PI_VIEWER_DEBUG=1`).
+ *
+ * An overlay's input reaches it by one of two routes — a normalized mouse event
+ * pi dispatched to it, or raw bytes pi could not consume — and which route fires
+ * depends on where the pointer is and on whether the overlay is the focused
+ * component. When neither fires there is no stack trace to read, so one line per
+ * key and per wheel/click, next to those two facts, is what distinguishes "pi
+ * routed it elsewhere" from "the terminal never sent it". Writes to
+ * `<tmpdir>/pi-viewer-debug.log`; unset costs nothing.
+ */
+function trace(entry: Record<string, unknown>): void {
+  if (!DEBUG) return;
+  try {
+    appendFileSync(join(tmpdir(), "pi-viewer-debug.log"), `${JSON.stringify(entry)}\n`);
+  } catch {}
+}
+
+/** Whether pi's TUI is the alt-screen one (`tuiMode: "fullscreen"`), which is what owns mouse input. */
+function isAltScreen(tui: TUI): boolean {
+  const marker = Symbol.for("@earendil-works/pi-tui/viewport");
+  return (tui as unknown as Record<symbol, unknown>)[marker] === true;
+}
+
 export class ConversationViewer implements Component {
+  /**
+   * Whether pi's TUI treats this overlay as the focused component.
+   *
+   * The property has to exist for that at all — pi-tui's `isFocusable` is
+   * `"focused" in component` — and being focused is what decides the wheel: the
+   * alt screen defers a wheel it cannot use to the focused component and scrolls
+   * the transcript behind the overlay when that is someone else. So this is the
+   * overlay owning the keyboard, and it is propagated to the steering editor
+   * rather than hardcoded there.
+   */
+  private focusedState = false;
+  get focused(): boolean {
+    return this.focusedState;
+  }
+  set focused(value: boolean) {
+    this.focusedState = value;
+    if (this.editor) this.editor.focused = value;
+  }
+
   private scrollOffset = 0;
   private autoScroll = true;
   private unsubscribe: (() => void) | undefined;
@@ -340,9 +390,30 @@ export class ConversationViewer implements Component {
       if (this.closed) return;
       this.tui.requestRender();
     });
+    if (DEBUG) {
+      trace({
+        event: "open",
+        altScreen: isAltScreen(this.tui),
+        // pi-tui's own mouse dispatch (`handleMouse`, `dispatchMouseToOverlay`)
+        // exists only on hosts that route mouse events at all.
+        mouseDispatch: typeof (this.tui as { getFocusedComponent?: unknown }).getFocusedComponent === "function",
+      });
+    }
   }
 
   handleInput(data: string): void {
+    if (DEBUG) {
+      trace({
+        event: "input",
+        data: data.length > 80 ? `${data.slice(0, 80)}…` : data,
+        wheelLines: this.keys.wheelLines(data),
+        focused: this.focused,
+        focusedIsViewer: (this.tui as { getFocusedComponent?: () => unknown }).getFocusedComponent?.() === this,
+        altScreen: isAltScreen(this.tui),
+        scrollOffset: this.scrollOffset,
+        autoScroll: this.autoScroll,
+      });
+    }
     // The wheel is read first: it is the one input that arrives as a raw escape
     // sequence, and the editor would otherwise take it as typing.
     const wheelLines = this.keys.wheelLines(data);
@@ -423,14 +494,19 @@ export class ConversationViewer implements Component {
    * Handle the mouse events that belong to the overlay: the wheel, and a left
    * click.
    *
-   * The wheel is claimed rather than declined. pi's alt screen dispatches a
-   * normalized wheel to the overlay under the pointer first, and only falls back
-   * — when the overlay does not claim it — to scrolling the `ScrollView` under
-   * the pointer, which is the main chat. Declining therefore handed the notch to
-   * the transcript behind the overlay whenever the viewer was not the focused
-   * component, and scrolled it instead. Claiming it keeps the wheel where the
-   * pointer is, focused or not, and takes pi's own per-notch `wheelDelta`
-   * (accelerated, `Alt`-multiplied) rather than re-deriving one from bytes.
+   * A wheel event scrolls the viewer. pi's alt screen dispatches a normalized
+   * wheel to the overlay under the pointer first and only falls back to scrolling
+   * a `ScrollView` when the overlay does not claim it — and the `ScrollView` that
+   * gets that fallback is the main chat's. Declining the wheel therefore scrolled
+   * the transcript behind the overlay. Claiming it with `handled` keeps the wheel
+   * where the pointer is, focused or not, and uses pi's own per-notch delta
+   * (accelerated, `Alt`-multiplied) rather than re-deriving one.
+   *
+   * A wheel *outside* the overlay's box never reaches this method: the alt screen
+   * either defers the raw bytes to the focused component — the viewer, which
+   * parses them in `handleInput` — or scrolls the transcript behind the overlay.
+   * Which of those happens is `focused`, which is why the overlay implements it:
+   * see the property's own comment.
    *
    * A left click is routed to the transcript component under the pointer, so
    * tool/bash blocks expand and collapse exactly as they do in the main chat.
@@ -441,6 +517,20 @@ export class ConversationViewer implements Component {
    * Everything else returns `undefined` so pi's text selection stays in charge.
    */
   handleMouse(event: ViewerMouseEvent): { handled: true } | undefined {
+    // Any event over the overlay's own box means the pointer is on the modal, so
+    // it takes focus back before the event is interpreted.
+    if (event.type !== "move") this.claimFocus();
+    if (DEBUG && (event.type === "wheel" || event.type === "click" || event.type === "press")) {
+      trace({
+        event: "mouse",
+        type: event.type,
+        button: event.button,
+        wheelDelta: event.wheelDelta,
+        y: event.y,
+        focusedIsViewer: (this.tui as { getFocusedComponent?: () => unknown }).getFocusedComponent?.() === this,
+        scrollOffset: this.scrollOffset,
+      });
+    }
     if (event.type === "wheel") {
       const delta = event.wheelDelta ?? 0;
       const { maxScroll } = this.scrollBounds();
@@ -478,6 +568,9 @@ export class ConversationViewer implements Component {
   }
 
   render(width: number): string[] {
+    // Before anything else: while this overlay is on screen it — and not the
+    // layout below it — is what the wheel and the keyboard belong to.
+    this.claimFocus();
     if (width < 6) return []; // too narrow for any meaningful rendering
     const th = this.theme;
     const innerW = width - 4; // border + padding
@@ -561,6 +654,30 @@ export class ConversationViewer implements Component {
     return lines;
   }
 
+  /**
+   * Keep this overlay the focused component, which is what makes the alt screen
+   * defer a wheel it cannot place rather than scrolling the transcript behind the
+   * overlay. A wheel only reaches `handleMouse` when the pointer is over the
+   * viewer's own box, so focus is how a scroll *anywhere* on screen lands here.
+   *
+   * Focus does not stay put on its own: pi routes a press outside the overlay's
+   * box to the component under the pointer in the layout below, and that press
+   * focuses whatever it lands on, leaving the overlay unfocused for as long as it
+   * stays open. Re-claiming is cheap enough to do on every frame — the guard
+   * makes it a no-op in the normal case — and an overlay that owns focus
+   * legitimately (pi's transcript search, which sits above this one) is left
+   * alone, since that too is an overlay.
+   */
+  private claimFocus(): void {
+    if (this.closed) return;
+    const tui = this.tui as { setFocus?: (component: unknown) => void; isOverlayFocused?: () => boolean };
+    // Both halves are host APIs newer than the pi-tui this package typechecks
+    // against; a host with neither has no overlay mouse routing to correct.
+    if (typeof tui.setFocus !== "function" || typeof tui.isOverlayFocused !== "function") return;
+    if (tui.isOverlayFocused()) return;
+    tui.setFocus(this);
+  }
+
   /** Stoppable only when a stop handler exists and the agent is still active. */
   private isStoppable(): boolean {
     return !!this.onStop && (this.record.status === "running" || this.record.status === "queued");
@@ -585,7 +702,7 @@ export class ConversationViewer implements Component {
       },
       { paddingX: 1 },
     );
-    editor.focused = true;
+    editor.focused = this.focused;
     editor.onSubmit = (text: string) => this.submitSteer(text);
     this.editor = editor;
     return editor;
