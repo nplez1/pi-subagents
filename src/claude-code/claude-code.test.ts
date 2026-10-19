@@ -439,6 +439,28 @@ describe("buildClaudeArgs", () => {
 		expect(argv).toEqual(expect.arrayContaining(["--resume", "abc"]));
 	});
 
+	it("pins a fresh conversation with --session-id so its id is known before the first hook", () => {
+		const argv = buildClaudeArgs({
+			modelSpec: "sonnet",
+			sessionId: "11111111-2222-3333-4444-555555555555",
+			persistSession: true,
+		});
+		expect(argv).toEqual(
+			expect.arrayContaining(["--session-id", "11111111-2222-3333-4444-555555555555"]),
+		);
+	});
+
+	it("never pins a resumed conversation, which already has its id", () => {
+		// The CLI refuses `--session-id` beside `--resume`; the id is the resumed one.
+		const argv = buildClaudeArgs({
+			modelSpec: "sonnet",
+			resumeSessionId: "abc",
+			sessionId: "abc",
+			persistSession: true,
+		});
+		expect(argv).not.toContain("--session-id");
+	});
+
 	it("passes --effort only when a thinking level is set", () => {
 		expect(
 			buildClaudeArgs({

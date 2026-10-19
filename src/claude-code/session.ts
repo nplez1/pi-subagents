@@ -264,3 +264,14 @@ export function isClaudeCodeSession(
 ): session is ClaudeCodeSession {
 	return session instanceof ClaudeCodeSession;
 }
+
+/**
+ * Claude Code's own conversation id for a run, when the session is one.
+ *
+ * Absent for a pi-backed run: that session's id names a pi transcript, which means nothing to a
+ * Claude hook stream, so publishing it would invite a host to join two unrelated conversations.
+ */
+export function claudeProviderSessionId(session: unknown): string | undefined {
+	if (!(session instanceof ClaudeCodeSession)) return undefined;
+	return session.sessionId;
+}
