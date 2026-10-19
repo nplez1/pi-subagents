@@ -32,6 +32,7 @@ import {
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { claudeProviderSessionId } from "./claude-code/session.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -608,6 +609,20 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
+  }, (record) => {
+    // A run's conversation ids only exist once its runner built the session,
+    // which is always AFTER `subagents:started` — so this is the one event that
+    // can name a Claude conversation while the run is still live. A host that
+    // watches the child's own hook stream joins the two by this id.
+    if (!isTopLevelAgent(record)) return;
+    const providerSession = claudeProviderSessionId(record.session);
+    if (!providerSession) return;
+    pi.events.emit("subagents:session", {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      providerSession,
+    });
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.

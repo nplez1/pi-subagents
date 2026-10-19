@@ -115,6 +115,14 @@ export function buildClaudeArgs(args: {
 	configCwd?: string;
 	jsonSchema?: string;
 	resumeSessionId?: string;
+	/**
+	 * The conversation id this run is created under, when the caller already
+	 * knows it. Pinning it makes the conversation identifiable BEFORE the first
+	 * hook fires, which is what lets a host that launched us attribute our
+	 * session to the run from its very first event. Ignored on a resume: the CLI
+	 * rejects `--session-id` alongside `--resume`.
+	 */
+	sessionId?: string;
 	persistSession: boolean;
 	/**
 	 * The agent's pi built-in allowlist, already translated to Claude Code tool
@@ -159,10 +167,13 @@ export function buildClaudeArgs(args: {
 	if (args.jsonSchema) argv.push("--json-schema", args.jsonSchema);
 	if (args.resumeSessionId) {
 		argv.push("--resume", args.resumeSessionId);
-	} else if (args.configCwd && args.cwd && args.configCwd !== args.cwd) {
-		// Only when the two actually differ — a worktree copy or a redirected
-		// working directory — so the child can still reach the project config.
-		argv.push("--add-dir", args.configCwd);
+	} else {
+		if (args.sessionId) argv.push("--session-id", args.sessionId);
+		if (args.configCwd && args.cwd && args.configCwd !== args.cwd) {
+			// Only when the two actually differ — a worktree copy or a redirected
+			// working directory — so the child can still reach the project config.
+			argv.push("--add-dir", args.configCwd);
+		}
 	}
 	// Keeps an ephemeral child from leaving resumable Claude Code sessions behind.
 	if (!args.persistSession && !args.resumeSessionId)
@@ -717,6 +728,10 @@ export async function runClaudeCodeAgent(
 		thinkingLevel,
 		allowedTools,
 		disallowedTools,
+		// Pinned here rather than discovered from the CLI's first event: a host
+		// watching this run's hooks needs the conversation identified before the
+		// first of them lands, and a resume keeps the id its conversation already has.
+		sessionId: resumeSidecar?.claudeSessionId ?? randomUUID(),
 		// Having a sidecar path IS being resumable: the sidecar is the record this
 		// extension needs to reopen the conversation later.
 		persisted: Boolean(sidecarPath),
@@ -746,6 +761,7 @@ export async function runClaudeCodeAgent(
 			? JSON.stringify(options.structuredOutput.schema)
 			: undefined,
 		resumeSessionId: resumeSidecar?.claudeSessionId,
+		sessionId: session.sessionId,
 		// The user asked for persistence, not the sidecar's presence: a run that
 		// cannot be recorded here should still behave as configured rather than
 		// quietly turning into an ephemeral one.

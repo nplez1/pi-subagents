@@ -367,6 +367,8 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onUsage?: OnAgentUsage;
+  /** Called once a run's own session object exists, which is always after `onStart`. */
+  private onSessionReady?: (record: AgentRecord) => void;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -418,11 +420,13 @@ export class AgentManager {
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
+    onSessionReady?: (record: AgentRecord) => void,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
     this.onUsage = onUsage;
+    this.onSessionReady = onSessionReady;
     this.maxConcurrent = maxConcurrent;
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
@@ -843,6 +847,9 @@ export class AgentManager {
           }
           record.pendingSteers = undefined;
         }
+        // Reported last, so a listener sees a record whose session is already
+        // recorded — the reader of a provider conversation id needs it set.
+        this.onSessionReady?.(record);
         options.onSessionCreated?.(session);
       },
     })
