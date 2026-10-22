@@ -209,10 +209,12 @@ export function applyAgentOverrides(
  *
  * A user `.md` that overrides a built-in replaces the embedded config wholesale,
  * so `isDefault && no sourcePath` identifies only the shipped entries in
- * `DEFAULT_AGENTS`. That distinction is what lets a bare `Explore` — pinned to
- * the exploration model by the extension itself — still have that pin
- * re-pointed by a configured default, while a pin the user or a plugin wrote in
- * a file keeps its authority.
+ * `DEFAULT_AGENTS`. That distinction is what lets a shipped default — a model an
+ * embedded agent pins in code rather than in a file — still be re-pointed by a
+ * configured default, while a pin the user or a plugin wrote in a file keeps its
+ * authority. No agent in `DEFAULT_AGENTS` pins a model today, because an embedded
+ * provider ID cannot be retargeted on a machine that lacks that provider; the
+ * slot stays for plugin-provided configs.
  */
 export function isFilePin(cfg: AgentConfig | undefined): boolean {
   return cfg?.isDefault !== true || cfg?.sourcePath !== undefined;

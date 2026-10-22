@@ -34,10 +34,12 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
       builtinToolNames: READ_ONLY_TOOLS,
       extensions: true,
       skills: true,
-      // Explicitly pinned to the user's preferred exploration model. A missing
-      // provider/model must fail rather than silently running on the parent.
-      model: "xiaomi/mimo-v2.6-flash",
-      thinking: "medium",
+      // No model/thinking pin. An embedded default must not name a provider ID:
+      // on a machine without that provider every bare Explore spawn would fail,
+      // and the machine could not fix it without editing the extension. The
+      // level and model come from the machine-owned `agentOverrides` in
+      // subagents.json (the `/subagents` menu) or from an agent .md's
+      // frontmatter; with neither, the spawn inherits the parent session model.
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 Your role is EXCLUSIVELY to search and analyze existing code. You do NOT have access to file editing tools.

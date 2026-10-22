@@ -243,7 +243,7 @@ Group completions render each agent as a separate block. The LLM receives struct
 | Type | Tools | Model | Prompt Mode | Description |
 |------|-------|-------|-------------|-------------|
 | `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
-| `Explore` | read, bash, grep, find, ls | `xiaomi/mimo-v2.6-flash` · medium | `replace` (standalone) | Fast codebase exploration (read-only) |
+| `Explore` | read, bash, grep, find, ls | inherit (set one with `/subagents`) | `replace` (standalone) | Fast codebase exploration (read-only) |
 | `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
@@ -574,7 +574,7 @@ A `*` marks a value that came from a `/subagents` default; source indicators mat
 1. `model:` / `thinking:` in the agent's `.md` — authoritative, refuses to be overridden
 2. the caller's `Agent({ model })` (or an RPC caller's option)
 3. the `/subagents` default (in `subagents.json` → `agentOverrides`)
-4. the shipped default of a built-in agent (the bare `Explore` is pinned to the exploration model by the extension itself)
+4. the shipped default of a built-in agent — a model pinned in code rather than in a file (no built-in agent pins one today, so the model comes from slot 3 or 5)
 5. inherit the parent session's model / thinking level
 
 So the driving model can always override a configured default, while an authored file pin still cannot be overridden — clear it from `/subagents` if you want a default to take effect. Plugin-provided agents (for example an advisor plugin's `rpiv-advisor.md`) appear in the same list; their files are never edited by a Disable or a default change.

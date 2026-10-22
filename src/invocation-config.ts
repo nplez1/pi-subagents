@@ -129,8 +129,9 @@ export function resolveAgentInvocationConfig(
   //   1. A pin authored in an agent .md — the file is authoritative, by design.
   //   2. The caller's Agent({ model })/RPC option.
   //   3. The default configured via `/subagents` (subagents.json).
-  //   4. The shipped default of an EMBEDDED agent (the bare `Explore` is pinned
-  //      to the exploration model by the extension itself).
+  //   4. The shipped default of an EMBEDDED agent — a model pinned in code
+  //      rather than in a file. No built-in agent pins one today; the slot keeps
+  //      a configured default able to re-point a shipped pin.
   //   5. Inherit the parent's model / thinking.
   //
   // Slot 4 sits below 3 so a user can re-point the extension's own shipped

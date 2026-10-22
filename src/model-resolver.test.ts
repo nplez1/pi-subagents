@@ -1,3 +1,4 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -59,12 +60,16 @@ const registeredAgentTool = (() => {
 	return agent;
 })();
 
-describe("pinned agent models", () => {
-	it("pins the built-in Explore agent with medium thinking", () => {
-		expect(DEFAULT_AGENTS.get("Explore")).toMatchObject({
-			model: "xiaomi/mimo-v2.6-flash",
-			thinking: "medium",
-		});
+describe("shipped agent models", () => {
+	it("ships no model or thinking pin on the built-in agents", () => {
+		// A shipped pin names a provider ID the host machine may not have, and the
+		// machine cannot retarget it without editing the extension. The model
+		// belongs in the machine-owned `agentOverrides` (subagents.json, the
+		// `/subagents` menu) or in an agent file's frontmatter.
+		for (const name of ["general-purpose", "Explore", "Plan"]) {
+			expect(DEFAULT_AGENTS.get(name)?.model).toBeUndefined();
+			expect(DEFAULT_AGENTS.get(name)?.thinking).toBeUndefined();
+		}
 	});
 
 	it("resolves the exact provider-qualified model", () => {
@@ -99,13 +104,23 @@ describe("pinned agent models", () => {
 		expect(resolveDefaultModel(parent as never, registry([]))).toBe(parent);
 	});
 
-	it("refuses an unavailable Explore pin before spawning on the parent model", async () => {
+	it("refuses an unavailable configured model before spawning on the parent model", async () => {
+		// The model is not shipped in the extension: it comes from the machine-owned
+		// `agentOverrides` in subagents.json. The execute path reloads agents and
+		// settings from disk, so the override has to live in the agent dir this test
+		// points at — otherwise the test would silently depend on the developer's
+		// own ~/.pi/agent and pass or fail with their local model choice.
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-		process.env.PI_CODING_AGENT_DIR = join(
-			tmpdir(),
-			"pi-subagents-empty-agent-config",
-			String(process.pid),
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-subagents-override-"));
+		writeFileSync(
+			join(agentDir, "subagents.json"),
+			JSON.stringify({
+				agentOverrides: {
+					Explore: { model: "xiaomi/mimo-v2.6-flash", thinking: "medium" },
+				},
+			}),
 		);
+		process.env.PI_CODING_AGENT_DIR = agentDir;
 		try {
 			const result = await registeredAgentTool.execute(
 				"model-pin-smoke",
@@ -128,8 +143,8 @@ describe("pinned agent models", () => {
 				.join("\n");
 
 			expect(getAgentConfig("Explore")).toMatchObject({
-				model: "xiaomi/mimo-v2.6-flash",
-				thinking: "medium",
+				defaultModel: "xiaomi/mimo-v2.6-flash",
+				defaultThinking: "medium",
 			});
 			expect(message).toContain(
 				"Configured model for Explore could not be used",
@@ -142,6 +157,7 @@ describe("pinned agent models", () => {
 			if (previousAgentDir === undefined)
 				delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 });
