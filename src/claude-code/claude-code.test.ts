@@ -23,7 +23,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type RunOptions, runAgent } from "../agent-runner.js";
+import { type RunOptions, resumeAgent, runAgent } from "../agent-runner.js";
 import {
 	type ModelRegistry,
 	resolveModel,
@@ -33,6 +33,7 @@ import { checkModelScope, setScopeModelsEnabled } from "../model-scope.js";
 import { BUILTIN_TOOL_NAMES } from "../agent-types.js";
 import {
 	createClaudeCodeModel,
+	setClaudeCodeEnabled,
 	effortForThinkingLevel,
 	isClaudeCodeModel,
 	isClaudeCodeModelSpec,
@@ -384,6 +385,42 @@ describe("claude/* model specs", () => {
 			modelInput: "claude/sonnet",
 		});
 		expect(verdict.kind).toBe("ok");
+	});
+
+	it("refuses a model object that skipped resolution when the switch is off", async () => {
+		// Two paths reach the CLI without a model STRING to resolve: an RPC caller
+		// forwarding a model object, and a resume rebuilding one from the sidecar.
+		// Gating only `resolveModel` would leave both able to start the CLI on a
+		// machine that switched it off.
+		setClaudeCodeEnabled(false);
+		try {
+			await expect(
+				runAgent({} as never, "Explore", "hello", {
+					model: createClaudeCodeModel("claude/opus"),
+				} as RunOptions),
+			).rejects.toThrow(/Claude Code backend is disabled/);
+		} finally {
+			setClaudeCodeEnabled(undefined);
+		}
+	});
+
+	it("refuses to continue a live CLI session when the switch is off", async () => {
+		// `resumeAgent` is the third way into the CLI, next to a resolved spec and a
+		// sidecar reopen: it continues an ALREADY RUNNING Claude Code conversation by
+		// the CLI's own session id.
+		const live = new ClaudeCodeSession({
+			messages: [],
+			model: createClaudeCodeModel("claude/opus"),
+			cwd: workDir,
+		});
+		setClaudeCodeEnabled(false);
+		try {
+			await expect(resumeAgent(live as never, "hello")).rejects.toThrow(
+				/Claude Code backend is disabled/,
+			);
+		} finally {
+			setClaudeCodeEnabled(undefined);
+		}
 	});
 });
 

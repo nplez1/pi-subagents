@@ -26,6 +26,7 @@
  */
 
 import type { Model } from "@earendil-works/pi-ai";
+import { readClaudeCodeSetting, settingsFileSignature } from "../settings.js";
 
 /**
  * Provider id used for the synthetic model. Not a pi provider — no entry in
@@ -36,6 +37,89 @@ export const CLAUDE_CODE_PROVIDER = "claude";
 
 /** `claude/` prefix, as authored in frontmatter and the `Agent` tool's `model`. */
 const CLAUDE_CODE_PREFIX = `${CLAUDE_CODE_PROVIDER}/`;
+
+/**
+ * Whether this install may run the Claude Code backend at all. Defaults to
+ * `true`, so an existing setup is unchanged.
+ *
+ * The switch exists for machines that cannot use the external CLI — no `claude`
+ * binary, or a policy that forbids it — while the same Claude models remain
+ * reachable through a provider pi serves (Copilot, Anthropic, Bedrock). On such a
+ * machine the backend must be neither selectable nor silently substituted: a
+ * `claude/sonnet` that fell through to fuzzy registry matching could land on
+ * whatever else spells "sonnet".
+ *
+ * Module state rather than a parameter, matching `scopeModels` (model-scope.ts):
+ * resolution happens in `resolveModel`, which is called from the Agent tool, the
+ * cross-extension RPC bridge, workflows, the scheduler and the runner's fallback
+ * — threading a settings scope through all of them would mean six ways to forget
+ * it, and one of them being stale is exactly the bug.
+ *
+ * `undefined` means "no file set it", which reads as enabled. Keeping the two
+ * apart matters when writing settings back, and is why this key is NOT part of
+ * the settings-menu snapshot: a snapshot records the EFFECTIVE value, which would
+ * freeze today's default `true` into a project file and silently shadow a `false`
+ * set globally later. `saveClaudeCodeSetting` writes the file that already sets
+ * it instead.
+ *
+ * The value is re-read from disk (mtime-guarded, so an unchanged file costs two
+ * `stat`s and no parse) rather than captured once at extension start. The advisor
+ * plugin reads the same two files on every call, and a machine whose backend was
+ * switched off in `subagents.json` must be seen as off by BOTH the report and the
+ * spawn — a startup-only copy would let a hand edit make the advisor refuse a
+ * stage that runs, or promise one the spawn then refuses.
+ */
+let claudeCodeSetting: boolean | undefined;
+
+/** Cache of the last file read; `signature` changes when either file does. */
+let fileCache: { signature: string; value: boolean | undefined } | undefined;
+
+function fileSetting(cwd: string): boolean | undefined {
+  const signature = settingsFileSignature(cwd);
+  if (fileCache?.signature === signature) return fileCache.value;
+  const value = readClaudeCodeSetting(cwd);
+  fileCache = { signature, value };
+  return value;
+}
+
+/** `cwd` is the project scope; the callers default to the session's, tests to theirs. */
+export function isClaudeCodeEnabled(cwd: string = process.cwd()): boolean {
+  // Disk wins; the module value covers the one case disk cannot — a menu write
+  // that failed to persist, which is reported as "session only" at the time.
+  return (fileSetting(cwd) ?? claudeCodeSetting) !== false;
+}
+
+/**
+ * The session-only value, the one thing a file cannot express: set by a menu
+ * toggle whose write FAILED, and cleared by any write that succeeded. Exported so
+ * the settings events can publish it — a listener must not be handed the effective
+ * value instead, which is usually just the file's, re-published. A listener that
+ * cached that would keep answering from a line the user has since deleted.
+ */
+export function getClaudeCodeSessionSetting(): boolean | undefined {
+  return claudeCodeSetting;
+}
+
+/** `undefined` restores the default (enabled), for a file that stops setting it. */
+export function setClaudeCodeEnabled(value: boolean | undefined): void {
+  claudeCodeSetting = value;
+  // A write may land in the same millisecond as the one the cache recorded.
+  fileCache = undefined;
+}
+
+/**
+ * The refusal for a `claude/*` spec on a machine with the backend switched off.
+ * Names the switch and the way out, because the model string itself looks valid
+ * and nothing else in the system would explain why it will not run.
+ */
+export function claudeCodeDisabledMessage(input: string): string {
+  return [
+    `The Claude Code backend is disabled on this machine, so "${input}" cannot run.`,
+    "It is switched off by `\"claudeCode\": false` in subagents.json — /agents → Settings → Claude Code.",
+    "Pick a model from a provider pi serves instead (for the same Claude models, e.g. the",
+    "Copilot or Anthropic entries in /subagents), or remove that setting to re-enable the backend.",
+  ].join(" ");
+}
 
 /**
  * Cheap shape test for a raw model *string* (`"claude/sonnet"`), before any
@@ -51,6 +135,15 @@ export function isClaudeCodeModelSpec(input: string | undefined): boolean {
 		trimmed.length > CLAUDE_CODE_PREFIX.length
 	);
 }
+
+/**
+ * The alias specs offered by the `/subagents` model picker.
+ *
+ * A convenience list, not a registry: the CLI resolves any alias or full id
+ * itself, and `custom…` in the picker still accepts others. Kept to the stable
+ * aliases rather than enumerating dated ids that go stale with every release.
+ */
+export const CLAUDE_CODE_MODEL_ALIASES: readonly string[] = ["opus", "sonnet", "haiku"];
 
 /**
  * The part after `claude/`, passed to the CLI as `--model`. Claude Code accepts

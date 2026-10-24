@@ -18,7 +18,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
-import { isClaudeCodeModel, claudeCodeModelFromSpec } from "./claude-code/model.js";
+import { claudeCodeDisabledMessage, isClaudeCodeEnabled, isClaudeCodeModel, claudeCodeModelFromSpec } from "./claude-code/model.js";
 import { type ClaudeRunnerContext, readSidecar, resumeClaudeCodeAgent, runClaudeCodeAgent } from "./claude-code/runner.js";
 import { type ClaudeCodeSession, isClaudeCodeSession } from "./claude-code/session.js";
 import { runInChildSessionContext } from "./child-context.js";
@@ -673,6 +673,15 @@ export async function runAgent(
     const claudeOptions = resumeSidecar && !isClaudeCodeModel(options.model)
       ? { ...options, model: claudeCodeModelFromSpec(resumeSidecar.model) }
       : options;
+    // The switch is checked here as well as in `resolveModel`, because two paths
+    // reach this branch without a model string to resolve: an RPC caller that
+    // forwards an already-resolved model OBJECT, and a resume, which rebuilds one
+    // from the sidecar. Gating only resolution would let a disabled machine still
+    // start the CLI by either route.
+    if (!isClaudeCodeEnabled()) {
+      const model = claudeOptions.model;
+      throw new Error(claudeCodeDisabledMessage(model ? `${model.provider}/${model.id}` : "claude/*"));
+    }
     return runClaudeCodeAgent(ctx, type, prompt, claudeOptions, resolveClaudeRunnerContext(ctx, type, claudeOptions));
   }
 
@@ -1227,6 +1236,13 @@ export async function resumeAgent(
   // A Claude Code session continues against the CLI by its own session id,
   // rather than through a pi session — there is no pi session behind it.
   if (isClaudeCodeSession(session)) {
+    // Continuing a live CLI conversation is still starting it, so the switch
+    // applies here too — otherwise a machine that disabled the backend keeps
+    // driving the CLI for every agent already running.
+    if (!isClaudeCodeEnabled()) {
+      const model = (session as { model?: { provider: string; id: string } }).model;
+      throw new Error(claudeCodeDisabledMessage(model ? `${model.provider}/${model.id}` : "claude/*"));
+    }
     return resumeClaudeCodeAgent(session as ClaudeCodeSession, prompt, {
       onToolActivity: options.onToolActivity,
       onAssistantUsage: options.onAssistantUsage,

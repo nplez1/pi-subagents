@@ -6,11 +6,12 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
+import { setClaudeCodeEnabled } from "./claude-code/model.js";
 import { resolveDefaultModel } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import extension from "./index.js";
-import { type ModelRegistry, resolvePinnedModel } from "./model-resolver.js";
+import { type ModelRegistry, resolveModel, resolvePinnedModel } from "./model-resolver.js";
 
 interface TestModel {
 	provider: string;
@@ -59,6 +60,63 @@ const registeredAgentTool = (() => {
 	if (!agent) throw new Error("Agent tool did not register");
 	return agent;
 })();
+
+describe("the claude/* backend switch", () => {
+	it("resolves a claude spec on a machine that may run the CLI", () => {
+		setClaudeCodeEnabled(undefined);
+		expect(resolvePinnedModel("claude/opus", registry([]))).toMatchObject({
+			provider: "claude",
+			id: "opus",
+		});
+	});
+
+	it("refuses the spec when the backend is off, without substituting another model", () => {
+		setClaudeCodeEnabled(false);
+		try {
+			// A lookalike is deliberately in the registry: the refusal must not resolve to
+			// it, which is what fuzzy matching would do if the switch merely hid the
+			// picker rows.
+			const result = resolvePinnedModel("claude/opus", registry([luna]));
+			expect(typeof result).toBe("string");
+			expect(result as string).toMatch(/Claude Code backend is disabled/);
+			expect(result as string).not.toContain("github-copilot");
+		} finally {
+			setClaudeCodeEnabled(undefined);
+		}
+	});
+
+	it("leaves a registry provider named claude alone", () => {
+		// A user-defined pi provider owns the prefix; it is not this backend and the
+		// switch has nothing to say about it.
+		setClaudeCodeEnabled(false);
+		try {
+			const own = { provider: "claude", id: "opus", name: "Own" };
+			expect(resolvePinnedModel("claude/opus", registry([own]))).toBe(own);
+		} finally {
+			setClaudeCodeEnabled(undefined);
+		}
+	});
+
+	it("never reaches the fuzzy fallback, which a differently-provider sonnet would match", () => {
+		// `resolvePinnedModel` refuses provider substitution on its own, so the test
+		// above would pass even if the switch let the spec fall through. This one
+		// calls `resolveModel`, where the fuzzy matching lives: `claude/sonnet`
+		// normalizes onto "claude-sonnet-4-5" from anthropic.
+		setClaudeCodeEnabled(false);
+		try {
+			const otherSonnet: TestModel = {
+				provider: "anthropic",
+				id: "claude-sonnet-4-5",
+				name: "Claude Sonnet 4.5",
+			};
+			const result = resolveModel("claude/sonnet", registry([otherSonnet]));
+			expect(typeof result).toBe("string");
+			expect(result as string).toMatch(/Claude Code backend is disabled/);
+		} finally {
+			setClaudeCodeEnabled(undefined);
+		}
+	});
+});
 
 describe("shipped agent models", () => {
 	it("ships no model or thinking pin on the built-in agents", () => {

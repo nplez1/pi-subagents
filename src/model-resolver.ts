@@ -2,21 +2,18 @@
  * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
  */
 
-import { createClaudeCodeModel, isClaudeCodeModelSpec } from "./claude-code/model.js";
+import { claudeCodeDisabledMessage, createClaudeCodeModel, isClaudeCodeEnabled, isClaudeCodeModelSpec } from "./claude-code/model.js";
 
 /**
  * Whether the registry knows a provider literally named `claude`.
  *
  * A user-defined provider with that name owns `claude/*` specs; the Claude Code
- * backend only claims them when nothing else answers to the prefix.
+ * backend only claims them when nothing else answers to the prefix. Takes the
+ * model list rather than the registry so the `/subagents` picker can apply the
+ * same rule to the list it already has instead of contradicting it.
  */
-function registryHasClaudeProvider(registry: ModelRegistry): boolean {
-  try {
-    const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
-    return all.some(m => m?.provider?.toLowerCase() === "claude");
-  } catch {
-    return false;
-  }
+export function registryHasClaudeProvider(models: { provider?: string }[] | undefined): boolean {
+  return Array.isArray(models) && models.some((m) => m?.provider?.toLowerCase() === "claude");
 }
 
 export interface ModelEntry {
@@ -102,11 +99,17 @@ export function resolveModel(
   // The one exception is a registry that actually has a provider named `claude`:
   // the user defined it, so `claude/x` is an ordinary model spec and must resolve
   // through the registry rather than being stolen by the backend.
-  if (isClaudeCodeModelSpec(input) && !registryHasClaudeProvider(registry))
+  const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+  if (isClaudeCodeModelSpec(input) && !registryHasClaudeProvider(all)) {
+    // Switched off for this machine: refuse rather than fall through. Fuzzy
+    // registry matching below would resolve `claude/sonnet` to whatever else
+    // answers to "sonnet" — silently running a model the user did not pick, from
+    // a provider they did not name.
+    if (!isClaudeCodeEnabled()) return claudeCodeDisabledMessage(input);
     return createClaudeCodeModel(input);
+  }
 
   // Available models (those with auth configured)
-  const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
   const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
 
   // 1. Exact match: "provider/modelId" — only if available (has auth)

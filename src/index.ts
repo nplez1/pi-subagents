@@ -32,6 +32,7 @@ import {
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { CLAUDE_CODE_MODEL_ALIASES, CLAUDE_CODE_PROVIDER, getClaudeCodeSessionSetting, isClaudeCodeEnabled, isClaudeCodeModelSpec, setClaudeCodeEnabled } from "./claude-code/model.js";
 import { claudeProviderSessionId } from "./claude-code/session.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -39,13 +40,13 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel, resolvePinnedModel } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, registryHasClaudeProvider, resolveModel, resolvePinnedModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, readAgentOverridesForScope, type SubagentsSettings, saveAgentOverridesForScope, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, persistToastFor, readAgentOverridesForScope, readClaudeCodeSetting, saveClaudeCodeSetting, type SubagentsSettings, saveAgentOverridesForScope, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -1375,6 +1376,9 @@ export default function (pi: ExtensionAPI) {
 
   /** Derive a short model label from a model string. */
   function getModelLabelFromConfig(model: string): string {
+    // A `claude/*` backend keeps its whole spec: "opus" alone would read as an
+    // Anthropic model pi serves, and `claude/opus` is what the user chose.
+    if (isClaudeCodeModelSpec(model)) return model.trim();
     // Strip provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
     const name = model.includes("/") ? model.split("/").pop()! : model;
     // Strip trailing date suffix (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5")
@@ -3188,6 +3192,17 @@ Terse command-style prompts produce shallow, generic work.
     const items: SelectItem[] = [
       { value: inheritChoice, label: "inherit", description: "no default — use the parent model" },
       ...available.map(m => ({ value: `${m.provider}/${m.id}`, label: m.id, description: m.provider })),
+      // Claude Code backends are not registry models — the run is executed by the
+      // external `claude` CLI — so they are appended rather than resolved. Without
+      // these rows the only way to select one is `custom…`, which is exactly the
+      // kind of thing nobody finds.
+      ...(isClaudeCodeEnabled() && !registryHasClaudeProvider(available)
+        ? CLAUDE_CODE_MODEL_ALIASES.map(spec => ({
+            value: `${CLAUDE_CODE_PROVIDER}/${spec}`,
+            label: `${CLAUDE_CODE_PROVIDER}/${spec}`,
+            description: "Claude Code CLI (not a pi model)",
+          }))
+        : []),
       { value: customChoice, label: "custom…", description: "type a provider/modelId" },
     ];
     const choice = await pickFromList(ctx, `Default model for ${name}`, items, current || undefined);
@@ -3876,6 +3891,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
+      // `claudeCode` is deliberately absent: `saveSettings` persists this
+      // snapshot into the project file, which would freeze a default `true`
+      // there and shadow a `false` set globally afterwards. The switch is
+      // written by `saveClaudeCodeSetting`, which touches one key in one file.
     } satisfies SubagentsSettings;
   }
 
@@ -3889,8 +3908,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // Folding it into this snapshot would copy global overrides into every project
   // file. `saveSettings` re-attaches the project file's existing map, so a
   // settings toggle still cannot erase it.
+  //
+  // `claudeCode` is the second, for the reason spelled out in the snapshot above:
+  // a merged value here would pin the machine-scoped switch into project files.
+  // It is written by `saveClaudeCodeSetting`.
   type _NoMissingSettingsKeys =
-    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings> | "agentOverrides"> extends never
+    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings> | "agentOverrides" | "claudeCode"> extends never
       ? true
       : ["snapshotSettings() is missing a SubagentsSettings key"];
   const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;
@@ -3986,6 +4009,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
           label: "Scope models",
           description: "Validate subagent models against scoped models (/scoped-models)",
           currentValue: isScopeModelsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "claudeCode",
+          label: "Claude Code",
+          description:
+            "Offer the claude/* models in /subagents, which run on the external `claude` CLI (Claude Code). Off hides them and refuses any claude/* model with a message naming this switch — for machines that cannot use the CLI, where the same Claude models come from a provider pi serves instead (e.g. Copilot or Anthropic), so a claude/* pin must not resolve to something else.",
+          currentValue: isClaudeCodeEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -4166,6 +4197,38 @@ Write the file using the write tool. Only write the file, nothing else.`;
             `Workflows ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
           );
         }
+      } else if (id === "claudeCode") {
+        const enabled = value === "on";
+        // Not `notifyApplied`: that persists the whole snapshot into the project
+        // file, which would freeze this machine-scoped switch there. One key, in
+        // whichever file already sets it (see saveClaudeCodeSetting).
+        const persisted = saveClaudeCodeSetting(enabled, process.cwd());
+        const onDisk = readClaudeCodeSetting(process.cwd());
+        // The files decide (see isClaudeCodeEnabled), so a session value is only
+        // meaningful when NO file sets the key — otherwise it could not take
+        // effect, and would resurface later if the key were removed.
+        setClaudeCodeEnabled(!persisted && onDisk === undefined ? enabled : undefined);
+        // The event carries the SESSION value (see saveAndEmitChanged): the file
+        // already tells every listener what the file says.
+        pi.events.emit("subagents:settings_changed", {
+          settings: { ...snapshotSettings(), claudeCodeSession: getClaudeCodeSessionSetting() },
+          persisted,
+        });
+        const what = enabled
+          ? "Claude Code backend enabled — claude/* models run on the external `claude` CLI"
+          : "Claude Code backend disabled — claude/* models are refused; pick a provider model in /subagents";
+        // `persistToastFor` would promise "session only" on any failed write, which
+        // is a lie once a file already sets the key: the file still wins.
+        let message = what;
+        let level: "info" | "warning" = "info";
+        if (!persisted) {
+          level = "warning";
+          message =
+            onDisk === undefined
+              ? `${what} — this session only (could not save subagents.json)`
+              : `Could not save subagents.json: the Claude Code backend stays ${onDisk ? "on" : "off"}`;
+        }
+        ctx.ui.notify(message, level);
       } else if (id === "scopeModels") {
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
@@ -4336,6 +4399,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
       snapshotSettings(),
       successMsg,
       (event, payload) => pi.events.emit(event, payload),
+      process.cwd(),
+      // The SESSION value, not the effective one: a listener needs only what a file
+      // cannot tell it, and re-publishing the file's value would let it outlive the
+      // line it came from.
+      { claudeCodeSession: getClaudeCodeSessionSetting() },
     );
     ctx.ui.notify(message, level);
   }

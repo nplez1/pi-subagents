@@ -693,13 +693,32 @@ Backend selection rides on the model string, not a new frontmatter key — so ev
 
 **Requirements.** `claude` on `PATH` and authenticated (Claude Code 2.1+; `claude setup-token` for a long-lived token). Override the binary with `PI_SUBAGENTS_CLAUDE_BIN`.
 
+### Turning the backend off
+
+On a machine that cannot run the CLI — no `claude` binary, or a policy that forbids it — the same Claude models are usually still reachable through a provider pi serves (Copilot, Anthropic, Bedrock). Switch the backend off there and it stops being offered *and* stops being accepted:
+
+```json
+// ~/.pi/agent/subagents.json — this machine (a project's .pi/subagents.json overrides it)
+{ "claudeCode": false }
+```
+
+Or toggle `/agents` → Settings → Claude Code, which rewrites that key in whichever file already sets it (the global one when neither does) — it never copies the key into a project file, because a machine-scoped switch pinned per project would shadow the global value, and a committed project file would carry it to other machines. Any other settings change leaves the key alone rather than erasing it. Applied live: both the resolution path and the runner read the switch, so a hand-edited file or the menu takes effect on the next spawn. With the backend off:
+
+- `/subagents` no longer lists the `claude/*` rows, so there is nothing to pick by accident.
+- Every remaining `claude/*` spec is **refused by name**, wherever it comes from — an agent file's `model:` pin, a `/subagents` default, `Agent({ model: "claude/opus" })`, an already-resolved model object arriving over the extension RPC bridge, a resumed Claude Code conversation, a workflow `agent()` model, a scheduled job, or the [advisor](../pi-advisor-subagent) pipeline. The message names this switch and the way out.
+- It does **not** fall through to the registry. Skipping the spec would let `claude/sonnet` fuzzy-match whatever else answers to "sonnet" and run a model from a provider you never named; refusing is the only answer that cannot silently switch providers.
+
+A registry that defines a real provider called `claude` is untouched: that is an ordinary pi provider, not this backend, and `claude/opus` keeps resolving through it.
+
+The advisor plugin reads the same switch, from the same file, so a machine with the backend off reports an advisor still pointing at `claude/opus` as unusable (naming the switch) instead of claiming it works.
+
 **Testing.** `PI_SUBAGENTS_CLAUDE_LIVE=1 npx vitest run src/claude-code/claude-code.live.test.ts` exercises the real CLI; the default run uses a fake binary and needs no auth.
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, Claude Code backend on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off) persist across pi restarts. Two files, merged on load:
 
-- **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here (`/subagents` does, for per-agent defaults).
+- **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here, with one exception: the Claude Code switch rewrites its own key in whichever file sets it, so a machine-wide `claudeCode` stays machine-wide (`/subagents` also writes here, for per-agent defaults).
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings and by `/subagents`.
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
@@ -723,6 +742,8 @@ The `agentOverrides` map — `{ "Explore": { model, thinking, enabled } }` — i
 **Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
 
 **Worktree isolation** (`worktreeIsolation`, default `true`): whether `isolation: "worktree"` may create a worktree at all. Toggle via `/agents → Settings → Worktree isolation`, or set `false` in `subagents.json` on a repo where a copy costs too much time or disk. Off, the `Agent` tool's `isolation` parameter is dropped from the schema entirely and the bullet describing it leaves the tool description with it — nothing to pass, and no context spent describing it — and worktrees are refused on every other path too (agent files, scheduled jobs, cross-extension RPC). The `/agents` agent-file generator stops offering the `isolation:` frontmatter field too, so a generated agent can't bake in a request that would be refused. A requested worktree is downgraded to a normal run rather than failing the call, since declining one is the point; there is deliberately no note on the result, which is exactly why the prose has to go when the parameter does. The refusal applies immediately; the parameter and its prose appear or disappear on the next pi session. See [Turning worktrees off](#turning-worktrees-off).
+
+**Claude Code backend** (`claudeCode`, default `true`): whether a `claude/*` model may select the [Claude Code backend](#claude-code-backend). Set `false` on a machine that cannot run the external `claude` CLI — the same Claude models are then reached through a provider pi serves instead (Copilot, Anthropic, Bedrock), chosen per agent in `/subagents`. Off, `/subagents` stops offering the `claude/*` rows, and any surviving spec is refused with a message naming this switch rather than being fuzzy-matched to a lookalike model from another provider. A registry that defines a real provider called `claude` is unaffected — that is an ordinary pi provider, not this backend. Toggle via `/agents → Settings → Claude Code`; applied live. Unlike the settings above it is **not** written with this snapshot — that would copy the merged value into the project file and freeze today's default there — so the toggle rewrites the key in the file that already sets it (global when neither does). The advisor pipeline (`rpiv-advisor` / `rpiv-compressor`) reads the same switch through this extension's settings events, so it reports a `claude/*` stage as unusable on such a machine instead of claiming it works.
 
 **Report usage to session** (`reportUsage`, default `false`): whether subagent spend is added to *this* session's own totals. Subagents run in their own pi sessions, so by default pi's footer, statusline and `/cost` count only what the main model spent — a session that delegated most of its work reads as nearly free. Turn it on and each `Agent` / `get_subagent_result` / `steer_subagent` result carries the spend accumulated since the last one, which pi folds into `getSessionStats()`; `/cost` attributes it to the **Tools/summaries** bucket. Toggle via `/agents → Settings → Report usage to session`; applied live.
 

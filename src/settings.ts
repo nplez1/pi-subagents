@@ -2,7 +2,7 @@
 // - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, never written here
 // - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -299,6 +299,30 @@ export interface SubagentsSettings {
   showModel?: boolean;
 
   /**
+   * Whether `claude/*` model specs may select the Claude Code backend.
+   * Defaults to `true`. Set `false` on a machine where the external `claude`
+   * CLI is unavailable or not wanted — the same Claude models are often reachable
+   * through a provider pi already serves (Copilot, Anthropic, Bedrock), and a
+   * backend that cannot run should not be selectable, nor silently substituted
+   * with a lookalike model from another provider.
+   *
+   * When `false`: `/subagents` stops offering the `claude/*` rows, and any
+   * remaining `claude/*` spec — a frontmatter pin, a `/subagents` default, a
+   * caller-supplied `Agent({ model })`, a workflow `agent()` model, a scheduled
+   * job — is refused with a message naming this switch rather than falling
+   * through to fuzzy registry matching (which could land on a different provider).
+   *
+   * A registry that actually defines a provider named `claude` keeps it: that is
+   * an ordinary pi provider, not this backend, and is unaffected by the switch.
+   *
+   * Applied live, so flipping it takes effect on the next spawn. Persisted by
+   * `saveClaudeCodeSetting` rather than the settings-menu snapshot: the snapshot
+   * writes the merged value into the project file, which would freeze a default
+   * `true` there and shadow a global `false` set later.
+   */
+  claudeCode?: boolean;
+
+  /**
    * Per-agent defaults and enable/disable state configured through
    * `/subagents`: `{ "Explore": { model, thinking, enabled } }`.
    *
@@ -455,6 +479,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.showModel === "boolean") {
     out.showModel = r.showModel;
   }
+  if (typeof r.claudeCode === "boolean") {
+    out.claudeCode = r.claudeCode;
+  }
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
@@ -529,6 +556,38 @@ export function readAgentOverridesForScope(
 }
 
 /**
+ * Read-modify-write one settings file's raw JSON, so keys this extension does
+ * not know about survive. Returns false without writing when the file is
+ * unparseable — replacing a corrupt file with a partial one would drop whatever
+ * the user hand-authored in it — or when the write itself fails.
+ */
+function mutateSettingsFile(
+  path: string,
+  mutate: (raw: Record<string, unknown>) => void,
+): boolean {
+  let raw: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        raw = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // `readSettingsFile` already warned when the settings menu loaded it.
+      return false;
+    }
+  }
+  mutate(raw);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(raw, null, 2), "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Write one scope's override map, preserving every other key in that file —
  * including keys this extension does not know about. A read-modify-write of the
  * raw JSON rather than a re-serialization of the sanitized settings, because
@@ -541,30 +600,72 @@ export function saveAgentOverridesForScope(
   scope: OverrideScope,
   cwd: string = process.cwd(),
 ): boolean {
-  const path = scope === "global" ? globalPath() : projectPath(cwd);
-  let raw: Record<string, unknown> = {};
-  if (existsSync(path)) {
-    try {
-      const parsed = JSON.parse(readFileSync(path, "utf-8"));
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        raw = parsed as Record<string, unknown>;
-      }
-    } catch {
-      // Corrupt file: `readSettingsFile` already warned when the settings menu
-      // loaded it. Writing over it with just the overrides would drop the
-      // unparseable content, so refuse instead — the caller surfaces a warning.
-      return false;
-    }
-  }
   const sanitized = sanitizeAgentOverrides(overrides);
-  if (Object.keys(sanitized).length > 0) raw.agentOverrides = sanitized;
-  else delete raw.agentOverrides;
+  return mutateSettingsFile(scope === "global" ? globalPath() : projectPath(cwd), (raw) => {
+    if (Object.keys(sanitized).length > 0) raw.agentOverrides = sanitized;
+    else delete raw.agentOverrides;
+  });
+}
+
+/**
+ * Write the `claudeCode` switch, touching nothing else in the file.
+ *
+ * Deliberately outside the settings-menu snapshot. That write persists the
+ * MERGED settings, which would freeze today's default `true` into the project
+ * file — silently shadowing a `false` set globally later, which is exactly the
+ * machine-only setup the docs recommend — and copy a machine-local `false` into
+ * a project file that may be committed and shared. `agentOverrides` is excluded
+ * from the snapshot for the same class of reason.
+ *
+ * It writes to whichever file already sets the key: the project if it defines
+ * one, otherwise the global file. A toggle therefore updates the value in force
+ * rather than stacking a new override above it, and the common case (nothing set
+ * anywhere) lands where the docs point — `~/.pi/agent/subagents.json`.
+ */
+export function saveClaudeCodeSetting(
+  enabled: boolean | undefined,
+  cwd: string = process.cwd(),
+): boolean {
+  const project = projectPath(cwd);
+  const path = readSettingsFile(project).claudeCode === undefined ? globalPath() : project;
+  return mutateSettingsFile(path, (raw) => {
+    if (typeof enabled === "boolean") raw.claudeCode = enabled;
+    else delete raw.claudeCode;
+  });
+}
+
+/**
+ * The switch as it can be READ without going through `isClaudeCodeEnabled` —
+ * project over global, `undefined` when neither file sets one.
+ *
+ * Exists so the resolution path can pick up a hand edit without a restart: the
+ * advisor reads the same two files, and the two must agree about a machine the
+ * file says cannot run the CLI.
+ */
+export function readClaudeCodeSetting(cwd: string = process.cwd()): boolean | undefined {
+  const project = readSettingsFile(projectPath(cwd)).claudeCode;
+  if (typeof project === "boolean") return project;
+  const global = readSettingsFile(globalPath()).claudeCode;
+  return typeof global === "boolean" ? global : undefined;
+}
+
+/**
+ * A cheap identity for the two files the switch can live in, so a reader can skip
+ * re-parsing an unchanged file. A missing file contributes a fixed token, so
+ * creating one always changes the signature. The path and inode are in it too: a
+ * file replaced rather than modified can otherwise keep the same mtime and size
+ * (`cp -p`, `rsync -a`), and the signature is per cwd.
+ */
+export function settingsFileSignature(cwd: string = process.cwd()): string {
+  return [globalPath(), projectPath(cwd)].map(statSignature).join("|");
+}
+
+function statSignature(path: string): string {
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(raw, null, 2), "utf-8");
-    return true;
+    const stat = statSync(path);
+    return `${path}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
   } catch {
-    return false;
+    return `${path}:-`;
   }
 }
 
@@ -582,6 +683,11 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
   const toWrite: SubagentsSettings = { ...s };
   if (existing.agentOverrides !== undefined) toWrite.agentOverrides = existing.agentOverrides;
   else delete toWrite.agentOverrides;
+  // Same treatment, same reason: the snapshot omits `claudeCode`, so a write that
+  // did not re-attach the project's copy would DELETE it — silently re-enabling a
+  // backend this project turned off, while memory still says it is off.
+  if (existing.claudeCode !== undefined) toWrite.claudeCode = existing.claudeCode;
+  else delete toWrite.claudeCode;
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(toWrite, null, 2), "utf-8");
@@ -617,6 +723,10 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.reportUsage === "boolean") appliers.setReportUsage(s.reportUsage);
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
+  // `claudeCode` is not applied here. The files ARE its state (see
+  // `isClaudeCodeEnabled`), so copying the loaded value into memory would only
+  // create a stale second copy — one that survives the user deleting the line,
+  // or a hand edit made after startup.
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
 }
 
@@ -655,14 +765,22 @@ export function applyAndEmitLoaded(
  * (regardless of persist outcome so listeners see the in-memory change), and
  * return the toast the UI should display. Event payload carries the `persisted`
  * flag so listeners can react to write failures.
+ *
+ * `eventExtras` adds fields a LISTENER needs but the file must not receive. The
+ * switch is the case that needs it: `claudeCode` is deliberately out of the
+ * persisted snapshot (see `saveClaudeCodeSetting`), so the event carries
+ * `claudeCodeSession` — the SESSION value, never the effective one. Publishing the
+ * effective value would re-publish the file's own content, and a listener that
+ * cached it would keep answering from a line the user has since deleted.
  */
 export function saveAndEmitChanged(
   snapshot: SubagentsSettings,
   successMsg: string,
   emit: SettingsEmit,
   cwd: string = process.cwd(),
+  eventExtras: Record<string, unknown> = {},
 ): { message: string; level: "info" | "warning" } {
   const persisted = saveSettings(snapshot, cwd);
-  emit("subagents:settings_changed", { settings: snapshot, persisted });
+  emit("subagents:settings_changed", { settings: { ...snapshot, ...eventExtras }, persisted });
   return persistToastFor(successMsg, persisted);
 }
