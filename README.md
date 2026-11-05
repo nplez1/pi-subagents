@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
-- **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and smart group join (consolidated notifications)
+- **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and immediate individual completion notifications
 - **Live fleet view** — persistent below-editor view with animated spinners, live tool activity, context utilization, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of the running subagents, drawn by that same below-editor view. Press `↓` (or `←`) at an empty prompt and the live data becomes selectable in place — heading, rows and indentation are unchanged, the cursor just appears on the already-visible rows; `↑`/`↓` move it, `Enter` opens the selected agent's live, auto-updating conversation, and `Esc` returns to the idle live view. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Turn navigation off via `/agents → Settings → Fleet view` (the live tree stays; use `/agents → Settings → Widget` to choose which agents it shows)
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause — with the mouse wheel or `PgUp`/`PgDn`). It fills 90% of the screen and keeps pi's own editor at the bottom, focused from the moment it opens, so steering is typing a message and pressing `Enter` — there is no mode to enter or leave. A second footer row carries the agent's model, cost and context usage, where the header keeps the run's name, duration and tool count. Because the editor owns the keyboard, the overlay's own actions are `Ctrl+T` to expand or collapse all tool/bash output, `Ctrl+X` (then `Ctrl+X` again to confirm) to stop a still-running agent — both work for background agents too — and `Esc` to close; the arrows belong to the message being typed, as they do in the main chat. **Clicking a tool or bash block expands just that one, exactly as it does in the main chat** (tool results, thinking blocks and summaries all carry the main chat's click regions); the wheel scrolls. Assistant text renders as Markdown and tool calls render with pi's own built-in styling (read headers, edit diffs, `$ command` blocks), because the overlay uses the same transcript components as the main chat
@@ -31,10 +31,10 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
-- **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
+- **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Each agent is notified as soon as it finishes
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
-- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
+- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same immediate `subagent-notification` delivery as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
 ## Install
@@ -94,7 +94,7 @@ Schedule formats:
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
 
-When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way.
+When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same immediate `subagent-notification` delivery as a manually-spawned background agent — your parent agent reasons about the result the same way.
 
 Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
 
@@ -236,7 +236,7 @@ By default, foreground and background agents each stream their full conversation
   transcript: /tmp/pi-subagents-501/home-user-project/sess-1/tasks/agent-abc123.output
 ```
 
-Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
+Each background agent completion is delivered independently as soon as it finishes; the LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
 
 ## Default Agent Types
 
@@ -610,18 +610,7 @@ Nested children and a [workflow](#subagentworkflow)'s agents are outside the poo
 
 ## Join Strategies
 
-When background agents complete, they notify the main agent. The **join mode** controls how these notifications are delivered. It applies only to background agents.
-
-| Mode | Behavior |
-|------|----------|
-| `smart` (default) | 2+ background agents spawned in the same turn are auto-grouped into a single consolidated notification. Solo agents notify individually. |
-| `async` | Each agent sends its own notification on completion (original behavior). Best when results need incremental processing. |
-| `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
-
-**Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
-
-**Configuration:**
-- Configure join mode in `/agents` → Settings → Join mode
+All background agents now notify the main agent individually as soon as each one finishes. The previous grouped delivery and its 30-second/15-second waiting periods have been removed. The `defaultJoinMode` setting (`smart`, `async`, or `group`) remains accepted and visible under `/agents` → Settings → Join mode for compatibility, but no longer changes notification delivery.
 
 ## Model Scope
 
@@ -756,7 +745,7 @@ Three things worth knowing about the numbers. Every token component is reported,
 ✓ Explore (haiku4.5/H)  inspect code · ↻8 · ~$0.0181 · 12.3s
 ```
 
-When several background agents finish together, their notification is topped with the batch total (`3 agents · 45.1k token · ~$0.042`) so the figures don't have to be added up by hand.
+Each background agent's completion notification shows that agent's own token and cost figures.
 
 The `~` marks it as pi's estimate rather than a billed figure. **A cost is shown only when there is one to show:** a model pi has no pricing data for reports zero, and `$0.00` beside its tokens would say the run was measured and found free rather than never measured — so nothing is printed at all, on every surface. For the same reason a real cost too small to render reads `<$0.0001`. Figures keep cents at minimum and four decimals at most (`~$0.0042`, `~$0.05`, `~$1.24`) — rounding everything to cents would print the same number for runs that differed fourfold.
 
@@ -1061,7 +1050,7 @@ src/
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
-  group-join.ts       # Group join manager: batched completion notifications with timeout
+  group-join.ts       # Tracks smart-join batches; completion notices are delivered immediately
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
 
