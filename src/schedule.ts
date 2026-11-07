@@ -29,6 +29,15 @@ import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } fr
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
   | { type: "added"; job: ScheduledSubagent }
+  /**
+   * A job read back from the store when the scheduler started — `/resume`
+   * restoring a session's schedules. Emitted per job, before
+   * `subagents:scheduler_ready`, so a consumer that mirrors this state (the
+   * `/loop` footer does) learns about restored jobs it never saw created.
+   * `added` is not reused: a restored job is not new, and a listener that
+   * announces "scheduled X" on `added` must not announce it again on resume.
+   */
+  | { type: "restored"; job: ScheduledSubagent }
   | { type: "removed"; jobId: string }
   | { type: "updated"; job: ScheduledSubagent }
   | { type: "fired"; jobId: string; agentId: string; name: string }
@@ -65,6 +74,10 @@ export class SubagentScheduler {
 
     for (const job of store.list()) {
       if (job.enabled) this.scheduleJob(job);
+      // Announced even when disabled: a consumer mirroring the store needs the
+      // whole set, not just the armed part of it. `enabled: false` is a fact
+      // about the job, and dropping it here would make a paused job look gone.
+      this.emit({ type: "restored", job });
     }
   }
 

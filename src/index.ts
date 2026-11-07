@@ -758,6 +758,10 @@ export default function (pi: ExtensionAPI) {
         events: pi.events,
         pi,
         getCtx: () => currentCtx,
+        // Handed over as an object, not snapshotted: the scheduler is started a
+        // few lines below and each handler re-checks `isActive()` at request
+        // time, so registering before it binds is safe.
+        schedules: isSchedulingEnabled() ? scheduler : undefined,
         manager: {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
@@ -1057,6 +1061,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
+    rpcHandle?.unsubSchedules();
     rpcHandle = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child

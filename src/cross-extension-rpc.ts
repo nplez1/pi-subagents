@@ -16,6 +16,13 @@
 import { isTopLevelAgent } from "./agent-manager.js";
 import { type ModelRegistry, resolvePinnedModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
+import {
+  createSchedule,
+  listSchedules,
+  removeSchedule,
+  type ScheduleCapable,
+  type ScheduleCreateInput,
+} from "./schedule-rpc.js";
 import type { AgentRecord } from "./types.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
@@ -57,6 +64,12 @@ export interface RpcDeps {
   pi: unknown;                    // passed through to manager.spawn
   getCtx: () => unknown | undefined;  // returns current ExtensionContext
   manager: SpawnCapable;
+  /**
+   * The session's scheduler, when scheduling is enabled. Optional: with the
+   * feature switched off the three `schedules:*` channels are never registered,
+   * so a caller's request simply gets no reply rather than a wrong one.
+   */
+  schedules?: ScheduleCapable;
 }
 
 export interface RpcHandle {
@@ -64,13 +77,15 @@ export interface RpcHandle {
   unsubSpawn: () => void;
   unsubStop: () => void;
   unsubConsume: () => void;
+  /** One unsubscribe covering list/create/remove; a no-op when scheduling is off. */
+  unsubSchedules: () => void;
 }
 
 /**
  * Wire a single RPC handler: listen on `channel`, run `fn(params)`,
  * emit the reply envelope on `channel:reply:${requestId}`.
  */
-function handleRpc<P extends { requestId: string }>(
+export function handleRpc<P extends { requestId: string }>(
   events: EventBus,
   channel: string,
   fn: (params: P) => unknown | Promise<unknown>,
@@ -194,5 +209,41 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     },
   );
 
-  return { unsubPing, unsubSpawn, unsubStop, unsubConsume };
+  // ---- Scheduler RPCs ----
+  // Registered only when the caller passed a scheduler: with scheduling disabled
+  // these channels stay unclaimed, and a request gets no reply at all. That is
+  // the honest answer (nothing here can schedule), and it is what the caller's
+  // timeout already reports as unavailable.
+  let unsubSchedules: () => void = () => {};
+  const schedules = deps.schedules;
+  if (schedules) {
+    const unsubList = handleRpc<{ requestId: string }>(events, "subagents:rpc:schedules:list", () =>
+      listSchedules(schedules),
+    );
+    const unsubCreate = handleRpc<{ requestId: string } & ScheduleCreateInput>(
+      events, "subagents:rpc:schedules:create", (params) =>
+        createSchedule(schedules, {
+          name: params.name,
+          description: params.description,
+          schedule: params.schedule,
+          prompt: params.prompt,
+          subagent_type: params.subagent_type,
+          model: params.model,
+          thinking: params.thinking,
+          max_turns: params.max_turns,
+          isolated: params.isolated,
+          isolation: params.isolation,
+        }),
+    );
+    const unsubRemove = handleRpc<{ requestId: string; jobId: string }>(
+      events, "subagents:rpc:schedules:remove", ({ jobId }) => removeSchedule(schedules, jobId),
+    );
+    unsubSchedules = () => {
+      unsubList();
+      unsubCreate();
+      unsubRemove();
+    };
+  }
+
+  return { unsubPing, unsubSpawn, unsubStop, unsubConsume, unsubSchedules };
 }
