@@ -143,7 +143,7 @@ export function isClaudeCodeModelSpec(input: string | undefined): boolean {
  * itself, and `custom…` in the picker still accepts others. Kept to the stable
  * aliases rather than enumerating dated ids that go stale with every release.
  */
-export const CLAUDE_CODE_MODEL_ALIASES: readonly string[] = ["opus", "sonnet", "haiku"];
+export const CLAUDE_CODE_MODEL_ALIASES: readonly string[] = ["opus", "sonnet", "fable", "haiku"];
 
 /**
  * The part after `claude/`, passed to the CLI as `--model`. Claude Code accepts

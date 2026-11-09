@@ -32,6 +32,7 @@ import {
 import { checkModelScope, setScopeModelsEnabled } from "../model-scope.js";
 import { BUILTIN_TOOL_NAMES } from "../agent-types.js";
 import {
+	CLAUDE_CODE_MODEL_ALIASES,
 	createClaudeCodeModel,
 	setClaudeCodeEnabled,
 	effortForThinkingLevel,
@@ -338,11 +339,20 @@ describe("claude/* model specs", () => {
 	it("recognizes only a non-empty claude/ prefix", () => {
 		expect(isClaudeCodeModelSpec("claude/sonnet")).toBe(true);
 		expect(isClaudeCodeModelSpec("claude/opus-4-5")).toBe(true);
+		expect(isClaudeCodeModelSpec("claude/fable")).toBe(true);
+
 		// A bare prefix names no model; falling through to the registry makes it a
 		// loud "model not found" instead of a CLI call with an empty --model.
 		expect(isClaudeCodeModelSpec("claude/")).toBe(false);
 		expect(isClaudeCodeModelSpec("github-copilot/claude-opus-5.5")).toBe(false);
 		expect(isClaudeCodeModelSpec(undefined)).toBe(false);
+	});
+
+	it("offers every stable alias in the /subagents picker, fable included", () => {
+		// These are the `claude/<alias>` rows appended to the model picker. An alias
+		// missing here is still runnable through `custom…`, which is exactly the
+		// discoverability gap the rows exist to close.
+		expect(CLAUDE_CODE_MODEL_ALIASES).toEqual(["opus", "sonnet", "fable", "haiku"]);
 	});
 
 	it("resolves without consulting the registry, and survives the pinned path", () => {
