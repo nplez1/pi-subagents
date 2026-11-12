@@ -320,17 +320,22 @@ export function buildPhaseGroups(
  * `agentCount` is the number the runtime has *scheduled*, which can exceed the
  * number that has emitted an entry — a fan-out reports its size before its
  * agents start, so the total does not visibly climb as they trickle in.
+ *
+ * Collapsed first, because the log is append-only and last-write-wins: one
+ * agent writes a queued row, a started row and a settle row under the same
+ * index, so counting raw entries reports four or five "agents" for every real
+ * one. That is where an eighteen-agent run came to read `16/85 agents`, and
+ * because each emit adds another line the denominator kept climbing while the
+ * run worked, which reads as the run gaining tasks.
  */
 export function stats(progress: readonly WorkflowEntry[], agentCount = 0): WorkflowStats {
-  let seen = 0;
+  const { agents } = collapse(progress);
   let done = 0;
   let failed = 0;
   let started = 0;
   let anyLive = false;
 
-  for (const entry of progress) {
-    if (entry.type !== "workflow_agent") continue;
-    seen++;
+  for (const entry of agents) {
     if (entry.state === "done") {
       done++;
       started++;
@@ -344,18 +349,19 @@ export function stats(progress: readonly WorkflowEntry[], agentCount = 0): Workf
     }
   }
 
-  const total = Math.max(agentCount, seen);
+  const total = Math.max(agentCount, agents.length);
   return {
     done,
     failedCount: failed,
     running: anyLive,
     total,
     started,
-    // `!anyLive` is implied by the count test — `total >= seen`, and `seen` also
-    // counts live entries, so `done + failed >= total` can only hold when none
-    // are live. Kept for parity with Claude Code and as a guard should `total`
-    // ever stop deriving from `seen`; no test can reach it as written.
-    complete: !anyLive && seen > 0 && done + failed >= total,
+    // `!anyLive` is implied by the count test — `total >= agents.length`, and
+    // the agents array holds live rows too, so `done + failed >= total` can only
+    // hold when none are live. Kept for parity with Claude Code and as a guard
+    // should `total` ever stop deriving from the agent count; no test can reach
+    // it as written.
+    complete: !anyLive && agents.length > 0 && done + failed >= total,
   };
 }
 
