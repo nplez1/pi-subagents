@@ -802,7 +802,7 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
     const promptSuffix: string[] = [];
     if (prompt.length > 0) promptSuffix.push(`${prompt.length} ${prompt.length === 1 ? "line" : "lines"}`);
     if (prompt.length > PROMPT_COLLAPSED_LINES) {
-      promptSuffix.push(`${glyphs.enter} ${state.promptExpanded ? "collapse" : "expand"}`);
+      promptSuffix.push(`e ${state.promptExpanded ? "collapse" : "expand"}`);
     }
     detailRows.push([]);
     detailRows.push(detailHeading("Prompt", promptSuffix, rightWidth));
@@ -879,8 +879,9 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
     hints.push("f filter");
   } else {
     hints.push(`${glyphs.upDown} agent`);
+    if (entry?.recordId !== undefined && can("onOpenAgent")) hints.push(`${glyphs.enter} convo`);
     if (previewLines(entry?.promptPreview).length > PROMPT_COLLAPSED_LINES) {
-      hints.push(`${glyphs.enter} prompt`);
+      hints.push("e prompt");
     }
     const actions = agentActions(entry, view.workflowActive);
     if (actions.skip && can("onSkipAgent")) hints.push("s skip");
@@ -890,17 +891,9 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   else if (view.workflowActive && can("onPause")) hints.push("p pause");
   if (view.workflowActive && can("onKill")) hints.push("x stop");
   hints.push(inPhases ? "esc close" : "esc back");
-  // Advertised at BOTH levels, because the key works at both: the selected row
-  // is the one marked in the agents pane either way. Gated on the entry having
-  // a record id, so a row whose child has not been issued one — a queued agent,
-  // a replayed one — does not promise a conversation that does not exist.
-  //
-  // Last, and abbreviated, for one reason: the footer is clamped rather than
-  // wrapped, so whatever sits at the end is what an 80-column terminal drops.
-  // This is the only hint here that can be dropped without stranding the
-  // reader — every other key either moves the cursor, changes the run, or is
-  // the way out — so it is the one that goes over the edge first.
-  if (view.selectedEntry?.recordId !== undefined && can("onOpenAgent")) {
+  // `c` remains available at both levels; the detail view advertises Enter
+  // instead, placing the primary conversation action before secondary hints.
+  if (inPhases && view.selectedEntry?.recordId !== undefined && can("onOpenAgent")) {
     hints.push("c convo");
   }
   lines.push(clampLine([{ text: ` ${hints.join(" · ")}`, color: "dim" }], width));
@@ -958,26 +951,20 @@ export function handleWorkflowDialogKey(
     return { state: { ...state, selectedAgent: clampIndex(view.clampedAgent + delta, view.visibleAgents.length) } };
   }
 
-  // One key, two jobs, because the two levels are what it means at each: open
-  // the selected phase's agents, then expand the prompt of the one you opened.
-  if (matchesKey(data, "enter") || matchesKey(data, "right")) {
-    if (state.level === "phases") {
-      // Nothing to open, so nothing happens — entering an empty pane would
-      // strand the reader in a subview with no rows and no detail.
-      if (view.visibleAgents.length === 0) return { state };
-      return { state: { ...state, level: "agent", promptExpanded: false } };
-    }
-    return { state: { ...state, promptExpanded: !state.promptExpanded } };
+  const descend = matchesKey(data, "enter") || matchesKey(data, "right");
+  if (descend && state.level === "phases") {
+    // Do not enter an empty pane with no agent detail to show.
+    if (view.visibleAgents.length === 0) return { state };
+    return { state: { ...state, level: "agent", promptExpanded: false } };
   }
-  if (matchesKey(data, "e")) {
+  if (matchesKey(data, "e") && state.level === "agent") {
     return { state: { ...state, promptExpanded: !state.promptExpanded } };
   }
 
-  // The one key that opens something instead of changing the run, so unlike
-  // skip/retry it works at both levels and on a settled agent: reading what a
-  // finished child did is most of why anyone opens this dialog. A row with no
-  // record id has no conversation to open, and falls through as unbound.
-  if (matchesKey(data, "c")) {
+  // Enter descends from the agent detail into the same conversation viewer as
+  // a fleet row. `c` remains a shortcut at either level. Queued and replayed
+  // entries without a record have no conversation to open.
+  if ((descend && state.level === "agent") || matchesKey(data, "c")) {
     const recordId = view.selectedEntry?.recordId;
     return recordId === undefined ? undefined : { state, action: { kind: "open", recordId } };
   }
