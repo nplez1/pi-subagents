@@ -81,7 +81,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId, workflowSettledEvent, workflowStartedEvent } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -2289,12 +2289,34 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   /**
+   * Announce a run on the bus, never at the cost of the run.
+   *
+   * This is the only place a workflow touches another extension, and by the
+   * time an event fires a listener's captured ctx can already be stale —
+   * `pi -p` replaces the session underneath a `--subagents-workflow-file` run,
+   * and pi asserts against that synchronously inside `emit`. Uncaught, the throw
+   * lands in a detached promise and takes the process with it, killing a run
+   * that had already spawned its agents; a status line nobody heard is the far
+   * cheaper failure, so it is swallowed here.
+   */
+  function emitWorkflowEvent(channel: string, payload: Record<string, unknown>): void {
+    try {
+      pi.events.emit(channel, payload);
+    } catch {
+      // The run started or settled regardless; there is nothing left to undo.
+    }
+  }
+
+  /**
    * Run a task to completion against the real manager, settling the record
    * either way. Never rejects: a run that cannot start (bad `meta`, oversized
    * source, non-JSON `args`) is a failed workflow, and both callers here are
    * detached — a rejection would surface as an unhandled one.
    */
   async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
+    // Both launch paths come through here, so this is the one place a run's
+    // start and settle reach the bus. See `workflowStartedEvent`.
+    emitWorkflowEvent("subagents:started", workflowStartedEvent(task));
     try {
       const result = await runWorkflow({
         script: task.script,
@@ -2323,6 +2345,8 @@ Terse command-style prompts produce shallow, generic work.
     } catch (err) {
       failWorkflowTask(task, err instanceof Error ? err.message : String(err));
     }
+    const settled = workflowSettledEvent(task);
+    if (settled) emitWorkflowEvent(settled.channel, settled.data);
   }
 
   /**
@@ -2665,12 +2689,26 @@ Terse command-style prompts produce shallow, generic work.
       // No tool call to attach a result card to, so the card becomes a session
       // entry (same layout), and the outcome is handed to the model as context
       // for its next turn rather than forcing one.
-      pi.appendEntry<WorkflowEntryData>(WORKFLOW_ENTRY_TYPE, workflowEntryData(task));
-      pi.sendMessage({
-        customType: "workflow-result",
-        content: formatWorkflowNotification(task),
-        display: false,
-      }, { deliverAs: "nextTurn" });
+      //
+      // Guarded like the bus events, and for the same reason: a harness that
+      // replaces the session while the run is going — `pi -p` does — leaves the
+      // handle captured at session_start stale, and every one of these calls
+      // asserts against it. Losing the card is recoverable; crashing the
+      // process after the run has already been paid for is not.
+      try {
+        pi.appendEntry<WorkflowEntryData>(WORKFLOW_ENTRY_TYPE, workflowEntryData(task));
+        pi.sendMessage({
+          customType: "workflow-result",
+          content: formatWorkflowNotification(task),
+          display: false,
+        }, { deliverAs: "nextTurn" });
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        // `console.warn`, not `report`: reaching here means the ctx is stale, and
+        // `report` asks that ctx whether there is a UI. This is the same line
+        // `report` would print headless.
+        console.warn(`[pi-subagents] workflow ${task.id} finished, but its result could not be recorded: ${why}`);
+      }
       fleet.update();
     });
   }

@@ -220,6 +220,50 @@ export function failWorkflowTask(task: WorkflowTask, error: string): void {
   task.endTime = Date.now();
 }
 
+/**
+ * The bus payload that names a workflow run when it starts.
+ *
+ * A run goes out on the same `subagents:started` channel an agent uses, so every
+ * host that tracks running work (keep-alive, pi-codex-goal's background-work
+ * tracker, Orca's status pane) sees the run as live, not just its agents. `mode`
+ * and `runId` are the fields Orca reads to tell a workflow from an agent. The
+ * run's own agents stay private to it and emit nothing.
+ */
+export function workflowStartedEvent(task: WorkflowTask): Record<string, unknown> {
+  return {
+    id: task.id,
+    runId: task.id,
+    type: "workflow",
+    mode: "workflow",
+    description: task.workflowName ?? task.meta?.name ?? task.id,
+  };
+}
+
+/**
+ * The bus event that settles a workflow run, or undefined while it is still live.
+ *
+ * `paused` is not settled: a held run is still going to resume, so hosts keep
+ * treating it as running. A killed run settles as `subagents:failed`, the same
+ * way a stopped agent does.
+ */
+export function workflowSettledEvent(
+  task: WorkflowTask,
+  now = Date.now(),
+): { channel: "subagents:completed" | "subagents:failed"; data: Record<string, unknown> } | undefined {
+  if (task.status === "running" || task.status === "paused") return undefined;
+  return {
+    channel: task.status === "completed" ? "subagents:completed" : "subagents:failed",
+    data: {
+      ...workflowStartedEvent(task),
+      status: task.status,
+      durationMs: elapsedMs(task, now),
+      tokens: task.totalTokens,
+      toolUses: task.totalToolCalls,
+      ...(task.error !== undefined ? { error: task.error } : {}),
+    },
+  };
+}
+
 /** The run's outcome as text, for the notification and the LLM-facing result. */
 export function workflowResultText(task: WorkflowTask): string {
   if (task.error !== undefined) return task.error;
