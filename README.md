@@ -140,7 +140,7 @@ The live view and the navigable FleetView are the same surface. Idle, it draws t
 
 `↑`/`↓` move the cursor, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `↑` above the top row or `Esc` returns to the idle live view. There is no `main` row: the prompt is always just `Esc` away, so the heading stays `● Agents` throughout. The cursor is anchored to the row's id, not its position, so a row settling or dropping out under it cannot slide the selection onto a different agent. Rows are windowed to a dozen lines with `↑`/`↓ N more` indicators; the selected row stays visible.
 
-Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. `Enter` on one opens the same two-pane inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet view, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. Running agents come first (earliest-launched first), followed by recently-finished ones, which linger for a few seconds before dropping out. Only agents with a session can be opened; selecting a queued agent that has none notifies instead. Typing anything at a non-empty prompt behaves normally — the view only captures arrow keys when the prompt is empty. Inside the conversation overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. `/agents → Settings → Fleet view` turns navigation off without hiding the tree; use `/agents → Settings → Widget` (`all`/`background`/`off`) to choose which agents the tree shows.
+Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. `Enter` on one opens the same inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet view, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. Running agents come first (earliest-launched first), followed by recently-finished ones, which linger for a few seconds before dropping out. Only agents with a session can be opened; selecting a queued agent that has none notifies instead. Typing anything at a non-empty prompt behaves normally — the view only captures arrow keys when the prompt is empty. Inside the conversation overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. `/agents → Settings → Fleet view` turns navigation off without hiding the tree; use `/agents → Settings → Widget` (`all`/`background`/`off`) to choose which agents the tree shows.
 
 ### Agent mentions
 
@@ -485,23 +485,29 @@ Send a steering message to a running agent. The message interrupts after the cur
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
 | `/subagents` | Configure per-agent defaults — enable/disable, default model, default thinking level |
 
-`/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
+`/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed inspector over a run: one column of phases in the order their work began, with the phase you are looking at expanded in place.
 
 ```
- audit-src
- Dynamically discover files under src/ and audit each …                    1/3 agents · 32s
+ ps-drive-loop
+ One QE self-improvement round: E2E, run a batch, triage, consolidate, fix …   27/40 agents
 
- ╭ Phases ──────────┬ Discover · 1 agent ──────────────────────────────────────────────╮
- │ ❯ ✔ Discover 1/1 │ ❯ ✔ discover:src Opus 5 (1M context) · 26.4k tok             25s │
- │   2 Audit    0/2 │                                                                  │
- │   3 Verify       │                                                                  │
- │   4 Synthesize   │                                                                  │
- ╰──────────────────┴──────────────────────────────────────────────────────────────────╯
- ↑↓ select · ⏎ open · f filter · x stop · esc close · c convo
+ ╭ Triage · 16 agents ────────────────────────────────────────────────────────────╮
+ │ ❯ ✔ E2E                                                              1/1 · 41s │
+ │   ⠋ Run ▸ ps-drive-tc                26/32 · ✘ 1 failed · 6 running · 1m50s │
+ │       ✔ Run                                                   16/16 · 1m30s │
+ │       ⠋ Triage                   10/16 · ✘ 1 failed · 6 running · 20s │
+ │         ✔ triage:ps-6110 · 9.0k tok                                    20s │
+ │         ✔ triage:ps-6147 · 9.0k tok                                    20s │
+ │   ◌ Consolidate                                             0/1 · 1 queued │
+ ╰────────────────────────────────────────────────────────────────────────────────╯
+ ↑↓ select · ⏎ agents · f filter · x stop · esc close
 ```
 
-The overview puts the phases on the left (a phase shows its number until it finishes, then `✔`/`✘`) and the selected phase's agents on the right. `⏎` opens one: the agents move to the left pane and the right becomes that agent's **Prompt**, **Activity** and **Outcome**. Press `⏎` again to open its full conversation, `e` to expand or collapse the prompt, or `esc` to go back a level rather than closing. `↑↓` (or `j`/`k`) move and `f` cycles the state filter, naming it in the pane title. The dialog opens as a centered overlay, like the conversation viewer an agent row opens; the frame sizes itself to what it holds, between six rows and twenty-two, so a three-agent run is not twenty rows of nothing and a two-hundred-agent one scrolls inside the pane. Long titles truncate with `…` rather than tearing it. With more than one workflow in the session it asks which, newest first.
+Rows are ordered by when their work started, not by how the script declared them — a `pipeline()` starts stage 2 for one item while another is still in stage 1, and the list follows what actually happened. A nested `workflow()` hangs under the phase that awaited it: the phase reads `Run ▸ ps-drive-tc` and the child run's own phases sit indented beneath it, rather than arriving as siblings whose titles carry a `▸ name › ` prefix. `⏎` on a phase expands its agents in place (`⏎` again, or `←`, collapses it); `⏎` on an agent opens its **Prompt**, **Activity** and **Outcome**, where `⏎` reaches the conversation and `e` expands the prompt. `↑↓` (or `j`/`k`) move and `f` cycles the state filter, naming it in the frame's title.
 
+Two things the counts say that they used to hide. A phase shows **settled over total** — a failed agent ran, it just ran badly, so `2/2 · ✘ 1 failed` rather than `1/2` beside a `✘`, which read as an agent that never got a turn. And a declared phase that has not started gets **no row at all**: it is counted in the header instead (`4 phases to go`), because an empty row looks like work that stalled rather than work that has not begun.
+
+The dialog opens as a centered overlay, like the conversation viewer an agent row opens, and sizes itself to what it holds, between six rows and twenty-two, so a three-agent run is not twenty rows of nothing and a two-hundred-agent one scrolls inside the pane. It opens on the row that is running — or, for a settled run, on whatever ran last. Long titles truncate with `…` rather than tearing the frame. With more than one workflow in the session it asks which, newest first.
 The run itself takes five keys, and the footer offers each only while it can actually do something:
 
 | Key | What it does |
@@ -1096,7 +1102,7 @@ src/
     schedule-menu.ts      # /agents → Scheduled jobs submenu
     select-item.ts        # Collision-safe ctx.ui.select wrapper (numbered rows)
     workflow-card.ts      # Inline workflow card (tool result and session entry)
-    workflow-dialog.ts    # /agents → Workflows two-pane inspector
+    workflow-dialog.ts    # /agents → Workflows tree inspector
 ```
 
 ## License

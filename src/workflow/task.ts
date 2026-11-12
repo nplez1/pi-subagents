@@ -73,6 +73,15 @@ export interface WorkflowTask {
    * tick, which for a thousand-agent run is real work in the render loop.
    */
   doneCount: number;
+  /**
+   * Agents that have produced an outcome, success or failure.
+   *
+   * Distinct from {@link doneCount} on purpose: `doneCount` is successes only,
+   * and a row that shows it as the numerator reports `2/3` under a ✘ — which
+   * reads as an agent that never ran, not one that ran and failed.
+   */
+  settledCount: number;
+  failedCount: number;
   totalTokens: number;
   totalToolCalls: number;
   logs: string[];
@@ -118,6 +127,8 @@ export function createWorkflowTask(init: {
     progressVersion: 0,
     agentCount: 0,
     doneCount: 0,
+    settledCount: 0,
+    failedCount: 0,
     totalTokens: 0,
     totalToolCalls: 0,
     logs: [],
@@ -152,15 +163,22 @@ export function updateWorkflowProgressBatch(
   let totalTokens = 0;
   let totalToolCalls = 0;
   let done = 0;
+  let failed = 0;
   for (const agent of agents) {
     totalTokens += agent.tokens ?? 0;
     totalToolCalls += agent.toolCalls ?? 0;
     // Counted off the collapsed agents, so a re-emitted row counts once.
     if (agent.state === "done") done++;
+    else if (agent.state === "error") failed++;
   }
   task.totalTokens = totalTokens;
   task.totalToolCalls = totalToolCalls;
   task.doneCount = done;
+  // A failure is work that finished. The fleet row and every header read
+  // `settled/total` so a run that hit one error does not look like one that is
+  // still waiting for an agent to start.
+  task.failedCount = failed;
+  task.settledCount = done + failed;
 }
 
 /**
@@ -336,7 +354,9 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     task.toolCallId ? `<tool-use-id>${escapeXml(task.toolCallId)}</tool-use-id>` : null,
     task.scriptPath ? `<script>${escapeXml(task.scriptPath)}</script>` : null,
     `<status>${escapeXml(status)}</status>`,
-    `<summary>Workflow "${escapeXml(task.workflowName ?? task.id)}" ${task.status} — ${totals.done}/${totals.total} agents${
+    `<summary>Workflow "${escapeXml(task.workflowName ?? task.id)}" ${task.status} — ${totals.done + totals.failedCount}/${totals.total} agents${
+      totals.failedCount > 0 ? ` (${totals.failedCount} failed)` : ""
+    }${
       task.replayedCount > 0 ? `, ${task.replayedCount} replayed from ${escapeXml(task.resumedFrom ?? "an earlier run")}` : ""
     }</summary>`,
     `<result>${escapeXml(result.length > 4000 ? `${result.slice(0, 4000)}\n...(truncated)` : result)}</result>`,

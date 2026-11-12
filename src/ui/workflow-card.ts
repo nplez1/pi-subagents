@@ -35,8 +35,10 @@ import { stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@ea
 import type { WorkflowEntryData } from "../workflow/entry.js";
 import type { WorkflowMeta } from "../workflow/meta.js";
 import {
-  buildPhaseGroups,
+  buildPhaseTree,
   collapse,
+  flattenPhaseTree,
+  formatCompactTokens,
   formatDuration,
   header,
   sizeWarning,
@@ -183,12 +185,10 @@ export interface WorkflowCardInput {
  * Formatting
  * ------------------------------------------------------------------------- */
 
-/** `18.4k` / `1.2M` — bare magnitude, since the row already reads as a stat. */
-export function formatCompactTokens(count: number): string {
-  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
-  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
-  return `${count}`;
-}
+// Re-exported for the inspector, which formats the same figures: the helper
+// lives in progress.ts now that the header needs it too, and both renderers
+// already depend on that module for derived data.
+export { formatCompactTokens };
 
 /**
  * One label for the model pair. A fallback that never differed from the primary
@@ -303,10 +303,11 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   const width = Math.max(1, input.width ?? DEFAULT_WIDTH);
   const now = input.now ?? Date.now();
 
-  const groups = buildPhaseGroups(input.progress, input.meta?.phases);
+  const tree = buildPhaseTree(input.progress, input.meta?.phases);
+  const nodes = flattenPhaseTree(tree);
   const { agents, logs } = collapse(input.progress);
   const totals = stats(input.progress, input.agentCount ?? 0);
-  const head = header(input.task, input.meta, groups, input.agentCount ?? 0, now);
+  const head = header(input.task, input.meta, tree, input.agentCount ?? 0, now);
 
   const lines: WorkflowCardLine[] = [];
 
@@ -334,35 +335,51 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   // eye can scan them; a label past the cap just pushes its own stats along.
   const labelColumn = Math.min(
     LABEL_COLUMN_MAX,
-    Math.max(0, ...groups.flatMap(group => group.agents.map(a => visibleWidth(a.label)))),
+    Math.max(0, ...nodes.flatMap(node => node.agents.map(a => visibleWidth(a.label)))),
   );
 
-  groups.forEach((group, groupIndex) => {
-    const lastGroup = groupIndex === groups.length - 1;
+  nodes.forEach((node, nodeIndex) => {
+    const lastGroup = nodeIndex === nodes.length - 1;
+    // A nested run's phases sit one level in, and say so with two columns
+    // rather than a second box: the gutter is already drawing the tree.
+    const indent = "  ".repeat(node.depth);
+    const counts: WorkflowCardLine = [];
+    if (node.total > 0) {
+      // Settled, not succeeded — a failed agent ran, and `2/3` next to a ✘
+      // reads as an agent that never got a turn.
+      counts.push({ text: `${node.settled}/${node.total}`, color: "dim" });
+      if (node.failed > 0) counts.push({ text: ` ${glyphs.cross} ${node.failed}`, color: "error" });
+    }
+    const head_: WorkflowCardLine = [
+      { text: "  " },
+      // One box, not a stack of them: only the first row opens it and only the
+      // last closes it. Everything between branches off the side, or three
+      // phases read as three half-drawn boxes.
+      {
+        text: `${
+          lastGroup ? glyphs.groupBottom
+          : nodeIndex === 0 ? glyphs.groupTop
+          : glyphs.groupMid
+        } `,
+        color: "dim",
+      },
+      { text: indent },
+      { text: node.label },
+    ];
+    // Counts flush right, in one column down the card, so a nested row reads as
+    // part of the same table rather than as a different kind of line.
+    const countsWidth = counts.reduce((sum, s) => sum + visibleWidth(s.text), 0);
+    const gap = countsWidth > 0 ? Math.max(1, width - lineWidth(head_) - countsWidth) : 0;
     lines.push(
       clampLine(
-        [
-          { text: "  " },
-          // One box, not a stack of them: only the first group opens it and
-          // only the last closes it. Everything between branches off the side,
-          // or three phases read as three half-drawn boxes.
-          {
-            text: `${
-              lastGroup ? glyphs.groupBottom
-              : groupIndex === 0 ? glyphs.groupTop
-              : glyphs.groupMid
-            } `,
-            color: "dim",
-          },
-          { text: group.title },
-        ],
+        countsWidth > 0 ? [...head_, { text: " ".repeat(gap) }, ...counts] : head_,
         width,
       ),
     );
 
     const rail = lastGroup ? "  " : `${glyphs.vertical} `;
-    group.agents.forEach((entry, agentIndex) => {
-      const lastAgent = agentIndex === group.agents.length - 1;
+    node.agents.forEach((entry, agentIndex) => {
+      const lastAgent = agentIndex === node.agents.length - 1;
       const segments: WorkflowCardLine = [
         { text: "  " },
         { text: rail, color: "dim" },

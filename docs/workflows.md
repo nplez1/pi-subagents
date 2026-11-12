@@ -72,7 +72,7 @@ A **`workflow` row in FleetView**, above the agents, carrying its agent counts w
 
 Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
 
-The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. Press `⏎` again to open the full conversation; `e` expands or collapses the prompt. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
+The **inspector**, at `/agents → Workflows` — one column of phases in the order their work began, a nested run's phases indented under the phase that awaited it, and `⏎` to expand that phase's agents in place. `⏎` on an agent opens its prompt, activity and outcome; `⏎` again opens the full conversation, `e` expands or collapses the prompt. A phase shows settled-over-total, so a failed agent counts as work done and is named beside the count (`2/2 · ✘ 1 failed`); a declared phase with no agents gets no row, just a place in the header's `N phases to go`. The detail view has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
 | Key | |
 |---|---|

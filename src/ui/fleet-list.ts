@@ -76,8 +76,11 @@ export interface FleetWorkflow {
   /** The `meta.name` of the run, or its id when the script named nothing. */
   name: string;
   status: "running" | "completed" | "failed" | "killed" | "paused";
+  /** Agents that have produced an outcome, success or failure. */
   doneCount: number;
   totalCount: number;
+  /** How many of those failed, so the row can name them. */
+  failedCount?: number;
   startedAt: number;
   /** Set once the run settles, which is what freezes its clock. */
   completedAt?: number;
@@ -624,7 +627,10 @@ export class FleetList {
     // Frozen once the run settles, exactly as an agent's clock is.
     const elapsed = (workflow.completedAt ?? Date.now()) - workflow.startedAt;
     const agents = `${workflow.doneCount}/${workflow.totalCount} agent${workflow.totalCount === 1 ? "" : "s"}`;
-    const stats = `${agents} · ${formatFleetElapsed(elapsed)} · ${formatFleetTokens(workflow.tokens)}`;
+    // A failure is called out rather than left inside the count: `31/31 agents`
+    // on a run that lost two of them is true and useless.
+    const failed = workflow.failedCount ? ` · ${workflow.failedCount} failed` : "";
+    const stats = `${agents}${failed} · ${formatFleetElapsed(elapsed)} · ${formatFleetTokens(workflow.tokens)}`;
     return `${theme.fg("accent", "◆")} ${theme.fg("muted", "workflow")}  ${workflow.name} ${theme.fg("dim", "·")} ${theme.fg("dim", stats)}`;
   }
 }

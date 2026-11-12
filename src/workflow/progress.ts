@@ -42,6 +42,15 @@ export interface WorkflowPhaseEntry {
   type: "workflow_phase";
   index: number;
   title: string;
+  /**
+   * The phase this one renders under, when a nested `workflow()` emitted it.
+   *
+   * Absent for the parent script's own phases. A nested run's *root* entry
+   * (`▸ name`) points at the parent phase that awaited it, and the child's own
+   * phases point at that root — so a whole run hangs off one row rather than
+   * floating beside the parent's phases.
+   */
+  parentIndex?: number;
 }
 
 export interface WorkflowLogEntry {
@@ -121,16 +130,76 @@ export interface CollapsedProgress {
   agents: WorkflowAgentEntry[];
   logs: string[];
   phaseTitles: Map<number, string>;
+  /**
+   * Phase index → the phase it should render under.
+   *
+   * A nested `workflow()` runs in the same worker, so its phases arrive in the
+   * parent's log; this is what says they belong under the phase that awaited
+   * the run rather than beside it. See `makeScope` in `worker-source.ts`.
+   */
+  phaseParents: Map<number, number>;
 }
 
-export interface PhaseGroup {
+/** Row status of one phase in the tree. */
+export type PhaseNodeStatus = "queued" | "running" | "done" | "failed";
+
+/**
+ * One row of the phase tree: a phase, or a phase of a nested run.
+ *
+ * Two things this carries that `PhaseGroup` could not: `depth` (a nested run's
+ * phases sit under the phase that awaited them, not beside it) and `settled`
+ * (a failed agent finished — it just finished badly, and a count that leaves it
+ * out reads as an agent that never ran).
+ */
+export interface PhaseNode {
+  /** Index of the phase entry that named it. Identity for the row. */
+  index: number;
+  /** Its own title, with a nested run's `▸ name › ` prefix stripped. */
   title: string;
-  status: "not-started" | "running" | "done" | "failed";
+  /** What the row prints: `Run ▸ ps-drive-tc` when the phase delegated. */
+  label: string;
+  /** 0 at the top level, 1 inside a nested run. */
+  depth: number;
+  /** Agents this phase launched itself. A nested run's are in its own nodes. */
   agents: WorkflowAgentEntry[];
-  doneCount: number;
-  totalCount: number;
+  children: PhaseNode[];
+  done: number;
+  failed: number;
+  /** Still expected to report: `running` plus `queued`. */
+  live: number;
+  /** Waiting for a slot — scheduled, not started. */
+  queued: number;
+  /** Done plus failed — everything that has produced an outcome. */
+  settled: number;
+  /** Rolled up through `children`. */
+  total: number;
   tokens: number;
   durationMs: number;
+  /** Earliest activity in the subtree, for reading order. `Infinity` if none. */
+  order: number;
+  status: PhaseNodeStatus;
+}
+
+/** Rolled-up counts for the whole run. */
+export interface PhaseTotals {
+  settled: number;
+  failed: number;
+  live: number;
+  total: number;
+  tokens: number;
+}
+
+export interface PhaseTree {
+  /** Top-level phases, in the order their work started. */
+  nodes: PhaseNode[];
+  /**
+   * Declared `meta.phases` that have produced nothing yet, in declared order.
+   *
+   * Not rows — a phase with no agents is a plan, not work — so this exists only
+   * to be counted: `… · 3 phases to go`.
+   */
+  remaining: string[];
+  totals: PhaseTotals;
 }
 
 export interface WorkflowStats {
@@ -146,23 +215,28 @@ export interface WorkflowStats {
  * Fold the event log into its latest state.
  *
  * Agent entries collapse by index (last write wins); logs accumulate in order;
- * phase titles are a lookup for grouping.
+ * phase titles and their parents are lookups for grouping.
  */
 export function collapse(progress: readonly WorkflowEntry[]): CollapsedProgress {
   const agents = new Map<number, WorkflowAgentEntry>();
   const logs: string[] = [];
   const phaseTitles = new Map<number, string>();
+  const phaseParents = new Map<number, number>();
 
   for (const entry of progress) {
     if (entry.type === "workflow_agent") agents.set(entry.index, entry);
     else if (entry.type === "workflow_log") logs.push(entry.message);
-    else phaseTitles.set(entry.index, entry.title);
+    else {
+      phaseTitles.set(entry.index, entry.title);
+      if (entry.parentIndex !== undefined) phaseParents.set(entry.index, entry.parentIndex);
+    }
   }
 
   return {
     agents: [...agents.values()].sort((a, b) => a.index - b.index),
     logs,
     phaseTitles,
+    phaseParents,
   };
 }
 
@@ -190,128 +264,298 @@ export function isLive(entry: WorkflowAgentEntry): boolean {
   return entry.state === "start" || entry.state === "progress";
 }
 
-/** Bucket agents by phase. Returns null when no agent declared a phase. */
-function groupByPhase(
-  agents: readonly WorkflowAgentEntry[],
-  phaseTitles: Map<number, string>,
-): { phaseIndex: number; title: string; agents: WorkflowAgentEntry[] }[] | null {
-  if (!agents.some(a => a.phaseIndex != null)) return null;
+/** The `▸ ` a nested run prefixes onto every phase title it defines. */
+const NESTED_MARK = "\u25b8 ";
+/** Separates a nested run's name from the child phase's own title. */
+const NESTED_SEP = " \u203a ";
 
-  const byPhase = new Map<number, { phaseIndex: number; title: string; agents: WorkflowAgentEntry[] }>();
-  for (const agent of agents) {
-    const phaseIndex = agent.phaseIndex ?? 0;
-    let group = byPhase.get(phaseIndex);
-    if (!group) {
-      group = { phaseIndex, title: phaseTitles.get(phaseIndex) ?? `Phase ${phaseIndex}`, agents: [] };
-      byPhase.set(phaseIndex, group);
-    }
-    group.agents.push(agent);
-  }
-  return [...byPhase.values()].sort((a, b) => a.phaseIndex - b.phaseIndex);
+/**
+ * Read a phase title the way `scopedTitle` wrote it.
+ *
+ * `▸ ps-drive-tc` is the nested run itself; `▸ ps-drive-tc › Triage` is one of
+ * its phases. The parent script's own phases carry no mark at all.
+ */
+function parsePhaseTitle(title: string): { run?: string; own: string } {
+  if (!title.startsWith(NESTED_MARK)) return { own: title };
+  const rest = title.slice(NESTED_MARK.length);
+  const sep = rest.indexOf(NESTED_SEP);
+  if (sep < 0) return { run: rest, own: rest };
+  return { run: rest.slice(0, sep), own: rest.slice(sep + NESTED_SEP.length) };
 }
 
-/** Roll a phase's agents up into the counts and totals its header shows. */
-function summarize(group: { title: string; agents: WorkflowAgentEntry[] }): PhaseGroup {
+/** Earliest activity among agents: when a row first had something to show. */
+function firstActivity(agents: readonly WorkflowAgentEntry[]): number {
+  let first = Number.POSITIVE_INFINITY;
+  for (const agent of agents) {
+    // `queuedAt` counts: a phase whose agents are all waiting has been
+    // scheduled, and that is later than the row above it but earlier than
+    // nothing at all.
+    const at = agent.startedAt ?? agent.queuedAt;
+    if (at !== undefined && at < first) first = at;
+  }
+  return first;
+}
+
+/** Roll one phase's own agents up into the counts its row shows. */
+function rollUp(agents: readonly WorkflowAgentEntry[]): {
+  done: number;
+  failed: number;
+  live: number;
+  queued: number;
+  tokens: number;
+  durationMs: number;
+} {
   let done = 0;
   let failed = 0;
+  let live = 0;
+  let queued = 0;
   let tokens = 0;
   let minStart = Number.POSITIVE_INFINITY;
-  let maxProgress = 0;
+  let maxEnd = 0;
 
-  for (const agent of group.agents) {
+  for (const agent of agents) {
     if (agent.state === "done") done++;
     else if (agent.state === "error") failed++;
+    else {
+      live++;
+      // Scheduled but never given a slot: `start` with no start time.
+      if (agent.startedAt == null) queued++;
+    }
     if (agent.tokens) tokens += agent.tokens;
     if (agent.startedAt != null) {
       if (agent.startedAt < minStart) minStart = agent.startedAt;
-      const last = agent.lastProgressAt ?? agent.startedAt;
-      if (last > maxProgress) maxProgress = last;
+      // The agent's own duration is the only honest end time: `lastProgressAt`
+      // is absent on a settled row, and reading it as the start made a phase
+      // that ran for two minutes report the spread between its launches.
+      const end = agent.startedAt + (agent.durationMs ?? 0);
+      const last = agent.lastProgressAt ?? end;
+      if (last > maxEnd) maxEnd = last;
     }
   }
 
-  const total = group.agents.length;
-  const finished = done + failed === total && total > 0;
   return {
-    title: group.title,
-    status: finished ? (failed > 0 ? "failed" : "done") : "running",
-    agents: group.agents,
-    doneCount: done,
-    totalCount: total,
+    done,
+    failed,
+    live,
+    queued,
     tokens,
     // Wall-clock across the phase, not the sum of its agents: they overlap.
-    durationMs: minStart < Number.POSITIVE_INFINITY ? maxProgress - minStart : 0,
+    durationMs: minStart < Number.POSITIVE_INFINITY ? Math.max(0, maxEnd - minStart) : 0,
   };
 }
 
-/** A phase declared in `meta` that has not produced any agent yet. */
-function placeholder(title: string): PhaseGroup {
-  return { title, status: "not-started", agents: [], doneCount: 0, totalCount: 0, tokens: 0, durationMs: 0 };
+function statusOf(node: { live: number; queued: number; failed: number; total: number }): PhaseNodeStatus {
+  if (node.live > node.queued) return "running";
+  if (node.queued > 0 || node.total === 0) return "queued";
+  return node.failed > 0 ? "failed" : "done";
 }
 
-const normalizeTitle = (title: string) => title.toLowerCase().trim();
-
-/**
- * Reconcile the phases declared in `meta` with the phases actually observed.
- *
- * Matching is fuzzy on purpose: a script may call `phase("Review")` against a
- * declared `{ title: "Review changed files" }`, and Claude Code treats those as
- * the same phase when either title is a prefix of the other. Each observed
- * group is consumed at most once, declared-but-unseen phases render as
- * not-started placeholders, and observed groups with no declaration are
- * appended after — that is how an undeclared `phase()` "gets its own group".
- */
-function mergePhases(
-  declared: readonly WorkflowPhaseMeta[] | undefined,
-  observed: { phaseIndex: number; title: string; agents: WorkflowAgentEntry[] }[],
-): PhaseGroup[] {
-  const consumed = new Set<{ phaseIndex: number; title: string; agents: WorkflowAgentEntry[] }>();
-  const merged: PhaseGroup[] = [];
-
-  for (const phase of declared ?? []) {
-    const wanted = normalizeTitle(phase.title);
-    const match = observed.find(group => {
-      if (consumed.has(group)) return false;
-      const actual = normalizeTitle(group.title);
-      return actual === wanted || actual.startsWith(wanted) || wanted.startsWith(actual);
-    });
-    if (match) {
-      consumed.add(match);
-      merged.push(summarize(match));
-    } else {
-      merged.push(placeholder(phase.title));
-    }
+/** Fold a node's children into its own rolled-up counts. */
+function rollUpChildren(node: PhaseNode): void {
+  for (const child of node.children) {
+    node.done += child.done;
+    node.failed += child.failed;
+    node.live += child.live;
+    node.queued += child.queued;
+    node.tokens += child.tokens;
+    node.durationMs += child.durationMs;
+    if (child.order < node.order) node.order = child.order;
   }
-
-  for (const group of observed) {
-    if (!consumed.has(group)) merged.push(summarize(group));
-  }
-
-  return merged;
+  node.settled = node.done + node.failed;
+  node.total = node.done + node.failed + node.live;
+  node.status = statusOf(node);
 }
 
+const sameTitle = (a: string, b: string) => a.toLowerCase().trim() === b.toLowerCase().trim();
+
 /**
- * Build the phase groups a renderer walks.
+ * Build the tree the inspector and the card walk.
  *
- * When nothing declared or emitted a phase, every agent collapses into a single
- * group titled "Agents" so the tree still has one level of structure.
+ * Three things it fixes over the flat list it replaces:
+ *
+ * **Nesting.** A nested `workflow()`'s phases used to arrive as siblings with a
+ * `▸ name › ` prefix in the title, so the parent phase that merely awaited the
+ * run sat there with no agents of its own. Here the child's phases hang off
+ * that parent row, whose label picks up the run's name (`Run ▸ ps-drive-tc`),
+ * and the child's *root* entry — a container that usually owns no agents — is
+ * folded away instead of rendering as an empty row.
+ *
+ * **Reading order.** Rows are ordered by when their work first appeared, not by
+ * declaration order, because a run does not execute in declaration order: a
+ * `pipeline()` starts stage 2 for item A while item B is still in stage 1, and
+ * a nested run's phases are indexed whenever the child gets to them. Sorting by
+ * first activity is what makes the list read top-to-bottom as it happened.
+ *
+ * **Nothing empty.** A declared phase with no agents produces no row at all; it
+ * is counted in `remaining` instead, where `… · 3 phases to go` can say so
+ * without drawing a row that looks like stalled work.
  */
-export function buildPhaseGroups(
+export function buildPhaseTree(
   progress: readonly WorkflowEntry[],
   declared?: readonly WorkflowPhaseMeta[],
-): PhaseGroup[] {
-  const { agents, phaseTitles } = collapse(progress);
-  const observed = groupByPhase(agents, phaseTitles) ?? [];
-  const merged = mergePhases(declared, observed);
-  if (merged.length === 0 && agents.length > 0) {
-    return [summarize({ title: "Agents", agents })];
+): PhaseTree {
+  const { agents, phaseTitles, phaseParents } = collapse(progress);
+
+  // Direct agents per phase. An agent that never named a phase is bucketed by
+  // the index it carries (0), which is how an un-phased script reads as one
+  // group rather than losing its agents.
+  const direct = new Map<number, WorkflowAgentEntry[]>();
+  for (const agent of agents) {
+    const index = agent.phaseIndex ?? 0;
+    const bucket = direct.get(index);
+    if (bucket) bucket.push(agent);
+    else direct.set(index, [agent]);
   }
-  // A run that declared phases but produced un-phased agents would otherwise
-  // render placeholders and drop those agents from the tree entirely. Claude
-  // Code has the same hole; showing the work is worth the small divergence.
-  if (agents.length > 0 && !merged.some(group => group.totalCount > 0)) {
-    return [...merged, summarize({ title: "Agents", agents })];
+
+  const ownTitle = (index: number): string => {
+    const title = phaseTitles.get(index);
+    if (title === undefined) return index === 0 ? "Agents" : `Phase ${index}`;
+    return parsePhaseTitle(title).own;
+  };
+
+  /** The run a phase belongs to, when it is a nested run's phase. */
+  const runOf = (index: number): string | undefined => {
+    const title = phaseTitles.get(index);
+    return title === undefined ? undefined : parsePhaseTitle(title).run;
+  };
+
+  // A nested run's phases point at the run's root entry, and the root points at
+  // the phase that awaited it. Walk up to the phase a row should actually hang
+  // under, recording how many runs it passed through.
+  const effectiveParent = (index: number): { parent: number; depth: number } | undefined => {
+    let parent = phaseParents.get(index);
+    let depth = 0;
+    while (parent !== undefined && runOf(parent) !== undefined) {
+      const next = phaseParents.get(parent);
+      if (next === undefined) break;
+      parent = next;
+      depth++;
+    }
+    if (parent === undefined) return depth > 0 ? { parent: -1, depth } : undefined;
+    return { parent, depth };
+  };
+
+  const nodes = new Map<number, PhaseNode>();
+  const node = (index: number): PhaseNode => {
+    let existing = nodes.get(index);
+    if (existing) return existing;
+    const own = direct.get(index) ?? [];
+    const counts = rollUp(own);
+    existing = {
+      index,
+      title: ownTitle(index),
+      label: ownTitle(index),
+      depth: 0,
+      agents: own,
+      children: [],
+      done: counts.done,
+      failed: counts.failed,
+      live: counts.live,
+      queued: counts.queued,
+      settled: counts.done + counts.failed,
+      total: own.length,
+      tokens: counts.tokens,
+      durationMs: counts.durationMs,
+      order: firstActivity(own),
+      status: statusOf({ live: counts.live, queued: counts.queued, failed: counts.failed, total: own.length }),
+    };
+    nodes.set(index, existing);
+    return existing;
+  };
+
+  // Every phase that owns agents, plus the parents they hang under. A parent
+  // with no agents of its own still gets a node — it is the row the run's name
+  // is printed on.
+  for (const index of direct.keys()) {
+    node(index);
+    const up = effectiveParent(index);
+    if (up !== undefined && up.parent >= 0) node(up.parent);
   }
-  return merged;
+
+  // The run each parent row delegates to, so its label can say so.
+  const delegatedTo = new Map<number, string[]>();
+  for (const [childIndex, parentIndex] of phaseParents) {
+    const run = runOf(childIndex);
+    // Only a run's *root* entry names the run; its phases carry the same name
+    // and would otherwise be listed as separate delegations.
+    const rootTitle = phaseTitles.get(childIndex);
+    if (run === undefined || rootTitle === undefined) continue;
+    if (parsePhaseTitle(rootTitle).own !== run) continue;
+    const list = delegatedTo.get(parentIndex);
+    if (list) list.push(run);
+    else delegatedTo.set(parentIndex, [run]);
+  }
+
+  for (const [index, current] of nodes) {
+    const up = effectiveParent(index);
+    // A run whose `workflow()` was called before any `phase()` has nothing to
+    // hang under, so it stays a top-level row rather than disappearing.
+    if (up === undefined || up.parent < 0) {
+      current.depth = 0;
+      continue;
+    }
+    current.depth = up.depth + 1;
+    nodes.get(up.parent)?.children.push(current);
+  }
+
+  for (const current of nodes.values()) {
+    const runs = delegatedTo.get(current.index);
+    if (runs && runs.length > 0) current.label = `${current.title} ${NESTED_MARK}${runs.join(" \u00b7 ")}`;
+  }
+
+  const top = [...nodes.values()].filter(current => current.depth === 0);
+  for (const current of top) rollUpChildren(current);
+
+  // Children read in the same order as the top level: by first activity, so a
+  // nested run's phases also appear as they happened.
+  const byActivity = (a: PhaseNode, b: PhaseNode) => (a.order === b.order ? a.index - b.index : a.order - b.order);
+  const sortChildren = (current: PhaseNode) => {
+    current.children.sort(byActivity);
+    for (const child of current.children) sortChildren(child);
+  };
+  for (const current of top) sortChildren(current);
+
+  // Chronological, with ties broken by phase index so the order is stable
+  // between renders: a row must never move because an agent in another row
+  // reported progress.
+  top.sort((a, b) => (a.order === b.order ? a.index - b.index : a.order - b.order));
+
+  const totals: PhaseTotals = { settled: 0, failed: 0, live: 0, total: 0, tokens: 0 };
+  for (const current of top) {
+    totals.settled += current.settled;
+    totals.failed += current.failed;
+    totals.live += current.live;
+    totals.total += current.total;
+    totals.tokens += current.tokens;
+  }
+
+  // A declared phase counts as reached when a top-level row carries its title.
+  // Nested runs declare phases of their own, but `meta.phases` describes the
+  // script that was launched, so only its own rows may satisfy it.
+  const remaining = (declared ?? [])
+    .filter(phase => !top.some(current => sameTitle(current.title, phase.title)))
+    .map(phase => phase.title);
+
+  return { nodes: top, remaining, totals };
+}
+
+/**
+ * Flatten a tree into the rows a renderer prints, depth first.
+ *
+ * Separate from `buildPhaseTree` because the two callers indent differently:
+ * the inspector draws a real tree, the card has one column and relies on the
+ * label alone.
+ */
+export function flattenPhaseTree(tree: PhaseTree): PhaseNode[] {
+  const out: PhaseNode[] = [];
+  const walk = (nodes: readonly PhaseNode[]) => {
+    for (const current of nodes) {
+      out.push(current);
+      walk(current.children);
+    }
+  };
+  walk(tree.nodes);
+  return out;
 }
 
 /**
@@ -385,6 +629,13 @@ export function formatDuration(ms: number): string {
   return `${minutes}m${seconds.toString().padStart(2, "0")}s`;
 }
 
+/** `18.4k` / `1.2M` — bare magnitude, since the row already reads as a stat. */
+export function formatCompactTokens(count: number): string {
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
+  return `${count}`;
+}
+
 export interface WorkflowHeader {
   name: string;
   subtext: string;
@@ -406,7 +657,7 @@ export function header(
     totalPausedMs?: number;
   },
   meta: WorkflowMeta | undefined,
-  groups: readonly PhaseGroup[],
+  tree: PhaseTree,
   agentCount: number,
   now: number,
 ): WorkflowHeader {
@@ -417,18 +668,25 @@ export function header(
     : task.status === "failed" ? " · failed"
     : "";
 
-  let doneAgents = 0;
-  let totalAgents = 0;
-  for (const group of groups) {
-    doneAgents += group.doneCount;
-    totalAgents += group.totalCount;
-  }
-  totalAgents = Math.max(agentCount, totalAgents, doneAgents);
+  // Settled, not succeeded: a failed agent finished. Reporting only successes
+  // made a run with one failure read `29/31` forever, as if two agents had never
+  // run — and one of them had, and failed. The failure is named beside the
+  // count instead of being hidden inside it.
+  const { settled, failed } = tree.totals;
+  const total = Math.max(agentCount, tree.totals.total, settled);
+  const parts = [`${settled}/${total} ${plural(total, "agent")}`];
+  if (failed > 0) parts.push(`${failed} failed`);
+  // What is left of the declared agenda, counted rather than drawn: an empty
+  // phase is a plan, not work, and a row of it would read as stalled agents.
+  const ahead = task.status === "running" || task.status === "paused" ? tree.remaining.length : 0;
+  if (ahead > 0) parts.push(`${ahead} ${plural(ahead, "phase")} to go`);
+  parts.push(formatDuration(elapsedMs(task, now)));
+  if (tree.totals.tokens > 0) parts.push(`${formatCompactTokens(tree.totals.tokens)} tok`);
 
   return {
     name: task.workflowName ?? meta?.name ?? task.summary ?? task.description ?? "workflow",
     subtext: meta?.description ?? task.description ?? task.summary ?? "",
-    stats: `${doneAgents}/${totalAgents} ${plural(totalAgents, "agent")} · ${formatDuration(elapsedMs(task, now))}${suffix}`,
+    stats: `${parts.join(" · ")}${suffix}`,
   };
 }
 

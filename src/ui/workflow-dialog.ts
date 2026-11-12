@@ -1,24 +1,34 @@
 /**
- * workflow-dialog.ts — the `/agents → Workflows` two-pane inspector.
+ * workflow-dialog.ts — the `/agents → Workflows` tree inspector.
  *
  * ```
  *  review-changes
- *  Review changed files across dimensions              3/7 agents · 1m12s
+ *  Review changed files across dimensions              3/7 agents · 12m · 1.2M tok
  *
- *  ╭ Phases ──────────┬ Verify · 1 agent ──────────────────────────────╮
- *  │ ❯ ✔ Review   3/3 │ ❯ ◌ verify:auth.ts · attempt 2 · waiting 8s    │
- *  │   2 Verify   1/2 │                                                │
- *  │   3 Report       │                                                │
- *  ╰──────────────────┴────────────────────────────────────────────────╯
- *  ↑↓ select · ⏎ open · f filter · x stop · esc close · c convo
+ *  ╭ Verify · 4 agents ────────────────────────────────────────────────╮
+ *  │ ❯ ✔ Review                                              3/3 · 41s │
+ *  │   ⠋ Verify ▸ cross-check                 4/6 · ✘ 1 failed · 2 run │
+ *  │       ✔ auth.ts                                       2/2 · 8m     │
+ *  │       ⠋ data.ts                             2/4 · 1 failed · 12s   │
+ *  │   ◌ Report                                            0/1 · queued │
+ *  ╰────────────────────────────────────────────────────────────────────╯
+ *  ↑↓ select · ⏎ agents · f filter · x stop · esc close
  * ```
  *
- * Opening an agent swaps the panes: that phase's agents move left and the
- * right becomes the agent's Prompt / Activity / Outcome detail.
+ * One column, not two. Rows are the phases in the order their work started — a
+ * run does not execute in declaration order, and a list that claims otherwise
+ * makes the reader distrust it — with a nested `workflow()`'s phases indented
+ * under the phase that awaited it. `⏎` expands a phase's agents in place; `⏎`
+ * on an agent opens its detail, and `⏎` there opens the conversation.
  *
- * A phase with no agents yet shows its number and nothing else. The single-pane
- * layout this replaced spelled that out as "Not started yet"; the left pane is
- * too narrow to hold the words, and a numbered row with no count says it.
+ * A phase with no agents gets no row: an empty row is indistinguishable from
+ * work that stalled, so the declared-but-unstarted agenda is counted in the
+ * header instead (`4 phases to go`).
+ *
+ * **Counts are settled, not successful.** A failed agent ran. Showing `1/2`
+ * beside a ✘ reports an agent that never got a turn, which is a different and
+ * worse failure than one that ran and broke, so the numerator counts both and
+ * the failures are named separately (`2/2 · ✘ 1 failed`).
  *
  * **The glyphs are not the card's glyphs.** `workflow-card.ts` keys off the raw
  * entry `state`; this file keys off the *derived* `displayState(entry, active)`
@@ -26,9 +36,6 @@
  * interrupted all render as a plain ✘ or ⟳ inline but are distinct here. `◌`
  * (U+25CC) appears only in this file, and a running row animates a spinner where
  * the card draws a static `⟳`.
- *
- * **The phases pane is stranger still**: a phase that has not finished shows
- * *its number*, not a glyph. That is deliberate, recovered behaviour.
  *
  * **The layout is pure.** `layoutWorkflowDialog` returns coloured segments and
  * `handleWorkflowDialogKey` maps a keypress to the next state plus an optional
@@ -51,12 +58,14 @@ import {
 } from "@earendil-works/pi-tui";
 import type { WorkflowMeta } from "../workflow/meta.js";
 import {
-  buildPhaseGroups,
+  buildPhaseTree,
   displayState,
+  flattenPhaseTree,
   formatDuration,
   header,
   isLive,
-  type PhaseGroup,
+  type PhaseNode,
+  type PhaseTree,
   type WorkflowAgentEntry,
   type WorkflowDisplayState,
   type WorkflowEntry,
@@ -79,10 +88,6 @@ import {
 
 /** Fallback width when the caller does not know the terminal's. */
 const DEFAULT_WIDTH = 80;
-
-
-/** Inner width of the left pane at any comfortable terminal size. */
-const LEFT_PANE_WIDTH = 18;
 
 /**
  * Most rows the frame will ever draw between its top and bottom edges.
@@ -236,15 +241,18 @@ export const WORKFLOW_DIALOG_COPY = {
  * ------------------------------------------------------------------------- */
 
 /**
- * Which of the two drill-down levels is showing.
+ * Which of the two levels is showing.
  *
- * `phases` is the overview — phases on the left, the selected phase's agents on
- * the right. `agent` is the subview reached by opening one: the same phase's
- * agents move to the left pane and the right pane becomes that agent's detail.
- * The panes never change count, only what they hold, which is what makes the
- * frame stay put as you drill in and back out.
+ * `tree` is the overview — one column of phases in the order their work began,
+ * with a phase's agents expanded in place. `agent` is the subview reached by
+ * opening an agent row: the tree gives way to that agent's detail.
+ *
+ * The tree replaced a two-pane layout whose left column was 18 columns wide
+ * (`leftPaneWidth`), which is nowhere near enough room to show that a nested
+ * run's phases belong under the phase that awaited it. Indentation carries the
+ * whole hierarchy here, and it needs a wide line to read.
  */
-export type WorkflowDialogLevel = "phases" | "agent";
+export type WorkflowDialogLevel = "tree" | "agent";
 
 /** `all`, or exactly one display state. */
 export type WorkflowDialogFilter = "all" | WorkflowDisplayState;
@@ -262,22 +270,22 @@ export const WORKFLOW_DIALOG_FILTERS: readonly WorkflowDialogFilter[] = [
 ];
 
 export interface WorkflowDialogState {
-  /** Raw selection; `clampedPhase` is what actually renders. */
-  selectedPhase: number;
-  selectedAgent: number;
+  /** Cursor over the rows the tree currently draws. */
+  selectedRow: number;
+  /**
+   * Phase index whose agents are expanded inline, `-1` for none, or `undefined`
+   * to follow the run — the first row with live work opens itself, so the
+   * inspector lands on what is happening now rather than on a phase that
+   * finished twenty minutes ago.
+   */
+  expanded?: number;
   level: WorkflowDialogLevel;
   filter: WorkflowDialogFilter;
   promptExpanded: boolean;
 }
 
-export function initialWorkflowDialogState(initialPhaseIndex = 0): WorkflowDialogState {
-  return {
-    selectedPhase: initialPhaseIndex,
-    selectedAgent: 0,
-    level: "phases",
-    filter: "all",
-    promptExpanded: false,
-  };
+export function initialWorkflowDialogState(): WorkflowDialogState {
+  return { selectedRow: 0, expanded: undefined, level: "tree", filter: "all", promptExpanded: false };
 }
 
 /** Everything the dialog reads about a run, so it can be driven from a stub. */
@@ -339,14 +347,24 @@ export type WorkflowDialogAction =
   | { kind: "retry"; index: number }
   | { kind: "open"; recordId: string };
 
+/** One line of the tree: a phase, or an agent of an expanded one. */
+export type WorkflowTreeRow =
+  | { kind: "node"; node: PhaseNode; expanded: boolean }
+  | { kind: "agent"; node: PhaseNode; entry: WorkflowAgentEntry };
+
 export interface ResolvedWorkflowDialog {
-  groups: PhaseGroup[];
-  clampedPhase: number;
-  clampedAgent: number;
-  /** The selected phase's agents, after the state filter. */
-  visibleAgents: WorkflowAgentEntry[];
+  tree: PhaseTree;
+  /** Rows to draw, in reading order. */
+  rows: WorkflowTreeRow[];
+  clampedRow: number;
+  /** The phase currently expanded inline, if any. */
+  expandedIndex: number | undefined;
+  /** The phase row under the cursor. */
+  selectedNode: PhaseNode | undefined;
+  /** The agent under the cursor, or the one being inspected. */
   selectedEntry: WorkflowAgentEntry | undefined;
-  /** False once the run stops — which is what turns live agents "interrupted". */
+  /** The expanded phase's agents, after the state filter. */
+  visibleAgents: WorkflowAgentEntry[];
   workflowActive: boolean;
   paused: boolean;
 }
@@ -359,30 +377,80 @@ export function workflowDialogContentWidth(terminalWidth: number): number {
 const clampIndex = (index: number, length: number) =>
   length === 0 ? 0 : Math.min(Math.max(0, Math.trunc(index)), length - 1);
 
+/** Every agent in a subtree, in launch order. */
+function subtreeAgents(node: PhaseNode): WorkflowAgentEntry[] {
+  const out = [...node.agents];
+  for (const child of node.children) out.push(...subtreeAgents(child));
+  return out.sort((a, b) => a.index - b.index);
+}
+
 /**
- * Settle the selection against the data actually present.
+ * Settle the view against the data actually present.
  *
- * Selection is stored raw and clamped on read, so a phase finishing (and its
- * agents dropping out of a filtered view) never leaves the cursor pointing past
- * the end — the same trick `fleet-list.ts` plays, minus the mutation.
+ * Selection is stored raw and clamped on read, so a phase finishing (and rows
+ * dropping out of a filtered view) never leaves the cursor past the end — the
+ * same trick `fleet-list.ts` plays, minus the mutation.
  */
 export function resolveWorkflowDialog(input: WorkflowDialogInput): ResolvedWorkflowDialog {
-  const groups = buildPhaseGroups(input.progress, input.meta?.phases);
+  const tree = buildPhaseTree(input.progress, input.meta?.phases);
   const workflowActive = input.task.status === "running" || input.task.status === "paused";
-  const clampedPhase = clampIndex(input.state.selectedPhase, groups.length);
-  const all = groups[clampedPhase]?.agents ?? [];
-  const visibleAgents =
-    input.state.filter === "all"
-      ? [...all]
-      : all.filter(entry => displayState(entry, workflowActive) === input.state.filter);
-  const clampedAgent = clampIndex(input.state.selectedAgent, visibleAgents.length);
+  const flat = flattenPhaseTree(tree);
+
+  // `undefined` follows the run; `-1` means the reader collapsed everything.
+  //
+  // The deepest live row, not the first one: a phase that delegated inherits its
+  // nested run's liveness, and opening the parent would list a child's agents
+  // one level too high while the child's own phase rows vanished. A settled run
+  // has nothing live, so it opens on whatever ran last — the ending is what
+  // anyone opening a finished run came to read.
+  const live = flat.find(node => node.live > 0 && !node.children.some(child => child.live > 0));
+  const lastActive = flat.reduce<PhaseNode | undefined>((best, node) => {
+    if (!Number.isFinite(node.order)) return best;
+    return best === undefined || node.order >= best.order ? node : best;
+  }, undefined);
+  const auto = live ?? lastActive ?? flat[0];
+  const expandedIndex =
+    input.state.expanded === undefined ? auto?.index
+    : input.state.expanded < 0 ? undefined
+    : input.state.expanded;
+
+  const rows: WorkflowTreeRow[] = [];
+  const walk = (nodes: readonly PhaseNode[]) => {
+    for (const node of nodes) {
+      const expanded = node.index === expandedIndex;
+      rows.push({ kind: "node", node, expanded });
+      if (!expanded) {
+        walk(node.children);
+        continue;
+      }
+      // An expanded row shows its whole subtree's agents and hides the child
+      // rows beneath it: the same agents listed twice, once per level, is not a
+      // tree — it is the same work drawn twice.
+      for (const entry of subtreeAgents(node)) {
+        if (input.state.filter !== "all" && displayState(entry, workflowActive) !== input.state.filter) continue;
+        rows.push({ kind: "agent", node, entry });
+      }
+    }
+  };
+  walk(tree.nodes);
+
+  const clampedRow = clampIndex(input.state.selectedRow, rows.length);
+  const row = rows[clampedRow];
+  const expandedNode = expandedIndex === undefined ? undefined : flat.find(node => node.index === expandedIndex);
 
   return {
-    groups,
-    clampedPhase,
-    clampedAgent,
-    visibleAgents,
-    selectedEntry: visibleAgents[clampedAgent],
+    tree,
+    rows,
+    clampedRow,
+    expandedIndex,
+    selectedNode: row?.kind === "node" ? row.node : undefined,
+    selectedEntry: row?.kind === "agent" ? row.entry : undefined,
+    visibleAgents:
+      expandedNode === undefined
+        ? []
+        : subtreeAgents(expandedNode).filter(entry =>
+            input.state.filter === "all" ? true : displayState(entry, workflowActive) === input.state.filter,
+          ),
     workflowActive,
     paused: input.task.status === "paused",
   };
@@ -442,22 +510,6 @@ function windowRange(selected: number, total: number, max: number): { start: num
  * The pane frame
  * ------------------------------------------------------------------------- */
 
-/**
- * Inner width of the left pane.
- *
- * Fixed rather than proportional at usable terminal sizes: the left pane holds
- * short labels (a phase title, an agent label) and the right pane holds
- * everything that actually needs room, so giving the left a share of a wide
- * terminal would only pad it. It gives way on a narrow one.
- */
-export function leftPaneWidth(width: number): number {
-  // The two cells share everything except the three border columns, and the
-  // right one must keep at least a column — so the left is capped by what it
-  // can take without squeezing the right out and tearing the frame.
-  const available = Math.max(2, width - 3);
-  return Math.max(1, Math.min(LEFT_PANE_WIDTH, Math.floor(available / 3), available - 1));
-}
-
 /** Fill a title out to the cell width with rule, so the corners stay put. */
 function padTitle(line: WorkflowCardLine, width: number, horizontal: string): WorkflowCardLine {
   const gap = Math.max(0, width - lineWidth(line));
@@ -495,53 +547,89 @@ function frameTitle(title: string, width: number, glyphs: WorkflowDialogGlyphs):
 }
 
 /**
- * Draw the two panes into one framed block.
+ * Draw the tree into one framed column.
  *
- * Both columns are padded to `bodyRows` so the frame is the same height however
- * much either side holds — a box that grew and shrank as you moved the
- * selection would make the whole dialog jump.
+ * One cell rather than two: the hierarchy is indentation, and an 18-column left
+ * pane (what the two-pane layout gave a phase) cannot show it. Rows are padded
+ * to `bodyRows` so the frame keeps its height as the cursor moves.
  */
-function paneFrame(options: {
-  leftTitle: string;
-  rightTitle: string;
-  leftRows: WorkflowCardLine[];
-  rightRows: WorkflowCardLine[];
+function treeFrame(options: {
+  title: string;
+  rows: WorkflowCardLine[];
   width: number;
   bodyRows: number;
   glyphs: WorkflowDialogGlyphs;
 }): WorkflowCardLine[] {
   const { glyphs, width } = options;
   const box = glyphs.box;
-  const left = leftPaneWidth(width);
-  const right = Math.max(1, width - left - 3);
+  const inner = Math.max(1, width - 2);
 
   const lines: WorkflowCardLine[] = [];
   lines.push([
     { text: box.topLeft, color: "dim" },
-    ...padTitle(frameTitle(options.leftTitle, left, glyphs), left, box.horizontal),
-    { text: box.topTee, color: "dim" },
-    ...padTitle(frameTitle(options.rightTitle, right, glyphs), right, box.horizontal),
+    ...padTitle(frameTitle(options.title, inner, glyphs), inner, box.horizontal),
     { text: box.topRight, color: "dim" },
   ]);
-
   for (let row = 0; row < options.bodyRows; row++) {
     lines.push([
       { text: box.vertical, color: "dim" },
-      ...padCell(options.leftRows[row] ?? [], left),
-      { text: box.vertical, color: "dim" },
-      ...padCell(options.rightRows[row] ?? [], right),
+      ...padCell(options.rows[row] ?? [], inner),
       { text: box.vertical, color: "dim" },
     ]);
   }
-
   lines.push([
     { text: box.bottomLeft, color: "dim" },
-    { text: box.horizontal.repeat(left), color: "dim" },
-    { text: box.bottomTee, color: "dim" },
-    { text: box.horizontal.repeat(right), color: "dim" },
+    { text: box.horizontal.repeat(inner), color: "dim" },
     { text: box.bottomRight, color: "dim" },
   ]);
   return lines;
+}
+
+/** A phase row's glyph: what has happened there, not how far along it is. */
+function nodeGlyph(
+  node: PhaseNode,
+  glyphs: WorkflowDialogGlyphs,
+  spinnerFrame: number,
+  expanded: boolean,
+): string {
+  void expanded;
+  switch (node.status) {
+    case "done":
+      return glyphs.tick;
+    case "failed":
+      return glyphs.cross;
+    case "queued":
+      return glyphs.queued;
+    case "running":
+      return glyphs.spinner[spinnerFrame % glyphs.spinner.length];
+  }
+}
+
+/**
+ * A phase row's stat tail.
+ *
+ * `settled/total`, not `done/total`: a failed agent ran. Counting only successes
+ * left a finished phase reading `2/3` next to a ✘ — the same lie as an agent
+ * that never got a turn — so the failure is counted as work done and then named
+ * separately.
+ */
+function nodeStats(
+  node: PhaseNode,
+  glyphs: WorkflowDialogGlyphs,
+  now: number,
+): WorkflowCardLine {
+  const parts: WorkflowCardLine = [];
+  if (node.total === 0) return parts;
+  parts.push({ text: `${node.settled}/${node.total}`, color: "dim" });
+  const tail: string[] = [];
+  if (node.failed > 0) tail.push(`${glyphs.cross} ${node.failed} failed`);
+  const running = node.live - node.queued;
+  if (running > 0) tail.push(`${running} running`);
+  if (node.queued > 0) tail.push(`${node.queued} queued`);
+  for (const part of tail) parts.push({ text: ` · ${part}`, color: "dim" });
+  if (node.durationMs > 0) parts.push({ text: ` · ${formatDuration(node.durationMs)}`, color: "dim" });
+  void now;
+  return parts;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -634,6 +722,13 @@ function agentRow(options: {
   workflowActive: boolean;
   spinnerFrame: number;
   now: number;
+  /**
+   * Columns to sit in from the frame's edge.
+   *
+   * The tree indents a phase's agents one level inside it; the detail view and
+   * the card's own rows pass nothing and start at the margin.
+   */
+  indent?: string;
 }): WorkflowCardLine {
   const { entry, selected, glyphs, width } = options;
   const display = displayState(entry, options.workflowActive);
@@ -641,6 +736,7 @@ function agentRow(options: {
     { text: " " },
     { text: selected ? glyphs.pointer : " ", color: "accent" },
     { text: " " },
+    { text: options.indent ?? "" },
     dialogRowGlyph(display, glyphs, options.spinnerFrame),
     { text: " " },
     { text: entry.label, color: selected ? "accent" : undefined },
@@ -680,15 +776,15 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   const now = input.now ?? Date.now();
   const view = resolveWorkflowDialog(input);
   const { state } = input;
-  // What the panes may *hold*; the frame's actual height is settled below, once
-  // there is something to measure.
+  // What the frame may *hold*; the frame's height is settled below, once there
+  // is something to measure.
   const capacity = Math.max(MIN_PANE_BODY_ROWS, input.bodyRows ?? DEFAULT_PANE_BODY_ROWS);
   const spinnerFrame = input.spinnerFrame ?? 0;
 
   const lines: WorkflowCardLine[] = [];
 
   // ---- Header: the run's name, then its description with the stats flush right.
-  const head = header(input.task, input.meta, view.groups, input.agentCount ?? 0, now);
+  const head = header(input.task, input.meta, view.tree, input.agentCount ?? 0, now);
   lines.push(clampLine([{ text: " " }, { text: head.name, color: "toolTitle", bold: true }], width));
   lines.push(
     rightAlign(
@@ -700,72 +796,58 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   lines.push([]);
 
   const frameWidth = width - 1;
-  const leftWidth = leftPaneWidth(frameWidth);
-  const rightWidth = Math.max(1, frameWidth - leftWidth - 3);
-  const inPhases = state.level === "phases";
+  const contentWidth = frameWidth - 2;
+  const inTree = state.level === "tree";
   const entry = view.selectedEntry;
 
-  // ---- The pane listing phases, shown only at the overview level.
-  const phaseRows: WorkflowCardLine[] = [];
-  const digits = String(view.groups.length).length;
-  const phases = windowRange(view.clampedPhase, view.groups.length, capacity);
-  for (let i = phases.start; i < Math.min(phases.end, view.groups.length); i++) {
-    const group = view.groups[i];
-    const selected = i === view.clampedPhase;
-    const color: WorkflowCardColor =
-      selected ? "accent"
-      : group.status === "done" ? "success"
-      : group.status === "failed" ? "error"
-      : "dim";
-    // An unfinished phase shows its number where a finished one shows a glyph —
-    // so the list doubles as a numbered plan of the run.
-    const glyph =
-      group.status === "done" ? glyphs.tick
-      : group.status === "failed" ? glyphs.cross
-      : String(i + 1);
-    phaseRows.push(
-      rightAlign(
-        [
-          { text: " " },
-          { text: selected ? glyphs.pointer : " ", color: "accent" },
-          { text: " " },
-          { text: glyph.padStart(digits), color },
-          { text: " " },
-          { text: group.title, color },
-        ],
-        group.totalCount === 0 ? [] : [{ text: `${group.doneCount}/${group.totalCount} `, color }],
-        leftWidth,
-      ),
-    );
-  }
-
-  // ---- The pane listing this phase's agents. It is the right pane at the
-  // overview level and the left pane in the subview, so it is built once.
-  const agentPaneWidth = inPhases ? rightWidth : leftWidth;
-  const agentRows: WorkflowCardLine[] = [];
-  if (view.visibleAgents.length === 0) {
-    agentRows.push(clampLine([{ text: `   ${WORKFLOW_DIALOG_COPY.noAgents}`, color: "dim" }], agentPaneWidth));
-  } else {
-    const agents = windowRange(view.clampedAgent, view.visibleAgents.length, capacity);
-    for (let i = agents.start; i < Math.min(agents.end, view.visibleAgents.length); i++) {
-      agentRows.push(
+  // ---- The tree: one row per phase, in the order its work started.
+  const treeRows: WorkflowCardLine[] = [];
+  const rows = windowRange(view.clampedRow, view.rows.length, capacity);
+  for (let i = rows.start; i < Math.min(rows.end, view.rows.length); i++) {
+    const row = view.rows[i];
+    const selected = i === view.clampedRow;
+    if (row.kind === "agent") {
+      treeRows.push(
         agentRow({
-          entry: view.visibleAgents[i],
-          selected: i === view.clampedAgent,
-          compact: !inPhases,
-          width: agentPaneWidth,
+          entry: row.entry,
+          selected,
+          compact: false,
+          width: contentWidth,
           glyphs,
           workflowActive: view.workflowActive,
           spinnerFrame,
           now,
+          // One level in from the phase that owns it, so an expanded phase's
+          // agents are visibly below it rather than beside it.
+          indent: "  ".repeat(row.node.depth + 1),
         }),
       );
+      continue;
     }
+    const node = row.node;
+    const color: WorkflowCardColor =
+      selected ? "accent"
+      : node.status === "done" ? "success"
+      : node.status === "failed" ? "error"
+      : "dim";
+    // Two columns of indent per level, under a fixed pointer column, so the
+    // glyphs line up in a column and the nesting reads at a glance.
+    const indent = "  ".repeat(node.depth);
+    const left: WorkflowCardLine = [
+      { text: " " },
+      { text: selected ? glyphs.pointer : " ", color: "accent" },
+      { text: " " },
+      { text: indent },
+      { text: nodeGlyph(node, glyphs, spinnerFrame, row.expanded), color },
+      { text: " " },
+      { text: node.label, color },
+    ];
+    treeRows.push(rightAlign(left, nodeStats(node, glyphs, now), contentWidth));
   }
 
-  // ---- The detail pane, in the subview only.
+  // ---- Detail: what one agent did, full width. Reachable from an agent row.
   const detailRows: WorkflowCardLine[] = [];
-  if (!inPhases && entry) {
+  if (!inTree && entry) {
     const display = displayState(entry, view.workflowActive);
     // Prefers the canonical `provider/model-id` here — two providers can serve
     // models whose short names read alike, and this pane has the width for it.
@@ -778,23 +860,23 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
           { text: ` ${statusWord(display)}`, color: "muted" },
           ...(model ? [{ text: " · ", color: "dim" as const }, { text: model, color: "dim" as const }] : []),
         ],
-        rightWidth,
+        contentWidth,
       ),
     );
     // Rebuilt rather than filtered out of `agentStatSegments`: the model and the
     // agent type are already on the line above, and the token count wants its
     // unit here exactly as it has one in the row.
     const stats: string[] = [];
-    // The thinking level lives here rather than on the tight card row: it is
-    // per-agent configuration, which is what someone opening this pane came to
-    // see, and `thinking: medium` on every row of a fan-out would be noise.
+    // The thinking level lives here rather than on a tree row: it is per-agent
+    // configuration, which is what someone opening this pane came to see, and
+    // `thinking: medium` on every row of a fan-out would be noise.
     const thinking = formatThinking(entry);
     if (thinking) stats.push(thinking);
     if (entry.tokens) stats.push(`${formatCompactTokens(entry.tokens)} tok`);
     if (entry.toolCalls) stats.push(`${entry.toolCalls} tool call${entry.toolCalls === 1 ? "" : "s"}`);
     if (entry.durationMs) stats.push(formatDuration(entry.durationMs));
     if (stats.length > 0) {
-      detailRows.push(clampLine([{ text: ` ${stats.join(" · ")}`, color: "dim" }], rightWidth));
+      detailRows.push(clampLine([{ text: ` ${stats.join(" · ")}`, color: "dim" }], contentWidth));
     }
 
     const prompt = previewLines(entry.promptPreview);
@@ -805,16 +887,16 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
       promptSuffix.push(`e ${state.promptExpanded ? "collapse" : "expand"}`);
     }
     detailRows.push([]);
-    detailRows.push(detailHeading("Prompt", promptSuffix, rightWidth));
+    detailRows.push(detailHeading("Prompt", promptSuffix, contentWidth));
     if (prompt.length === 0) {
-      detailRows.push(detailBody(WORKFLOW_DIALOG_COPY.availableOnceStarted, rightWidth));
+      detailRows.push(detailBody(WORKFLOW_DIALOG_COPY.availableOnceStarted, contentWidth));
     } else {
       const shown = collapsed ? prompt.slice(0, PROMPT_COLLAPSED_LINES) : prompt;
-      for (const text of shown) detailRows.push(detailBody(text, rightWidth));
+      for (const text of shown) detailRows.push(detailBody(text, contentWidth));
       // Named rather than silently cut: the reader has to know the prompt goes on.
       if (collapsed) {
         const hidden = prompt.length - PROMPT_COLLAPSED_LINES;
-        detailRows.push(detailBody(`${glyphs.ellipsis} ${hidden} more line${hidden === 1 ? "" : "s"}`, rightWidth));
+        detailRows.push(detailBody(`${glyphs.ellipsis} ${hidden} more line${hidden === 1 ? "" : "s"}`, contentWidth));
       }
     }
 
@@ -824,43 +906,42 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
       detailHeading(
         "Activity",
         toolCalls > 0 ? [`${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`] : [],
-        rightWidth,
+        contentWidth,
       ),
     );
-    detailRows.push(detailBody(activityBody(entry, display), rightWidth));
+    detailRows.push(detailBody(activityBody(entry, display), contentWidth));
 
     detailRows.push([]);
-    detailRows.push(detailHeading("Outcome", [], rightWidth));
+    detailRows.push(detailHeading("Outcome", [], contentWidth));
     // Wrapped, not clamped: the outcome is the thing the reader came for, and
     // cutting it at the pane edge would hide the half that matters.
-    for (const text of wrapTextWithAnsi(outcomeBody(entry, display), Math.max(1, rightWidth - 4))) {
-      detailRows.push(detailBody(text, rightWidth));
+    for (const text of wrapTextWithAnsi(outcomeBody(entry, display), Math.max(1, contentWidth - 4))) {
+      detailRows.push(detailBody(text, contentWidth));
     }
   }
 
-  const phaseTitle = view.groups[view.clampedPhase]?.title ?? "Phases";
   // With a filter on, the count is of what survived it — so the title says
   // which filter, rather than leaving "3 agents" looking like the whole phase.
   const shown = view.visibleAgents.length;
-  const agentPaneTitle =
-    state.filter === "all" ?
-      `${phaseTitle} · ${shown} agent${shown === 1 ? "" : "s"}`
-    : `${phaseTitle} · ${shown} ${state.filter}`;
-  // Indented one column, so the frame's left edge lines up under the name and
-  // the description rather than hanging off the edge of them.
-  const leftRows = inPhases ? phaseRows : agentRows;
-  const rightRows = inPhases ? agentRows : detailRows;
+  const expandedLabel = view.visibleAgents.length === 0 ? undefined : view.rows.find(row => row.kind === "node" && row.expanded);
+  const expandedTitle =
+    expandedLabel?.kind === "node" ?
+      `${expandedLabel.node.label} · ${
+        state.filter === "all" ? `${shown} agent${shown === 1 ? "" : "s"}` : `${shown} ${state.filter}`
+      }`
+    : undefined;
+  const title =
+    inTree ? (expandedTitle ?? "Phases")
+    : (entry?.label ?? WORKFLOW_DIALOG_COPY.noAgents);
+  const bodyRows = inTree ? treeRows : detailRows;
   lines.push(
-    ...paneFrame({
-      leftTitle: inPhases ? "Phases" : agentPaneTitle,
-      rightTitle: inPhases ? agentPaneTitle : (entry?.label ?? WORKFLOW_DIALOG_COPY.noAgents),
-      leftRows,
-      rightRows,
-      width: width - 1,
-      // Tall enough for whichever pane holds more, and no taller. Both panes
-      // were built against `capacity`, so neither can exceed it and nothing
-      // measured here is ever cut by the frame it is sizing.
-      bodyRows: Math.min(capacity, Math.max(MIN_PANE_BODY_ROWS, leftRows.length, rightRows.length)),
+    ...treeFrame({
+      title,
+      rows: bodyRows,
+      width: frameWidth,
+      // Tall enough for what it holds, and no taller: a three-phase run is not
+      // twenty rows of nothing.
+      bodyRows: Math.max(MIN_PANE_BODY_ROWS, Math.min(capacity, bodyRows.length)),
       glyphs,
     }).map(line => [{ text: " " }, ...line]),
   );
@@ -873,9 +954,18 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   // what the layout tests want.
   const can = (action: keyof WorkflowDialogActions) => input.available?.[action] ?? true;
   const hints: string[] = [];
-  if (inPhases) {
+  if (inTree) {
     hints.push(`${glyphs.upDown} select`);
-    if (view.visibleAgents.length > 0) hints.push(`${glyphs.enter} open`);
+    // Enter does the one thing the row under the cursor can do: open a phase's
+    // agents, or open the agent itself. Said per row, so the key never promises
+    // something the row cannot deliver.
+    if (view.selectedNode) {
+      const node = view.selectedNode;
+      const hasAgents = subtreeAgents(node).length > 0 || node.children.length > 0;
+      if (hasAgents) hints.push(`${glyphs.enter} ${view.expandedIndex === node.index ? "collapse" : "agents"}`);
+    } else if (entry?.recordId !== undefined && can("onOpenAgent")) {
+      hints.push(`${glyphs.enter} convo`);
+    }
     hints.push("f filter");
   } else {
     hints.push(`${glyphs.upDown} agent`);
@@ -890,12 +980,10 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   if (view.paused && can("onResume")) hints.push("p resume");
   else if (view.workflowActive && can("onPause")) hints.push("p pause");
   if (view.workflowActive && can("onKill")) hints.push("x stop");
-  hints.push(inPhases ? "esc close" : "esc back");
-  // `c` remains available at both levels; the detail view advertises Enter
-  // instead, placing the primary conversation action before secondary hints.
-  if (inPhases && view.selectedEntry?.recordId !== undefined && can("onOpenAgent")) {
-    hints.push("c convo");
-  }
+  hints.push(inTree ? "esc close" : "esc back");
+  // `c` opens the conversation from either level, on any row that has a child
+  // behind it.
+  if (inTree && view.selectedEntry?.recordId !== undefined && can("onOpenAgent")) hints.push("c convo");
   lines.push(clampLine([{ text: ` ${hints.join(" · ")}`, color: "dim" }], width));
 
   return lines;
@@ -927,52 +1015,59 @@ export function handleWorkflowDialogKey(
   // overlay on screen, which is the stuck feeling the key exists to avoid.
   if (matchesKey(data, "ctrl+c")) return { state, action: { kind: "cancel" } };
 
-  // Back one level before out of the dialog: `esc` in the subview returns to
-  // the overview, and only closes from there. Anything else would make a wrong
-  // turn cost the whole dialog.
+  // Back one level before out of the dialog: `esc` in the detail returns to the
+  // tree, and only closes from there. Anything else would make a wrong turn
+  // cost the whole dialog.
   if (matchesKey(data, "escape") || matchesKey(data, "q")) {
-    if (state.level === "agent") return { state: { ...state, level: "phases", promptExpanded: false } };
+    if (state.level === "agent") return { state: { ...state, level: "tree", promptExpanded: false } };
     return { state, action: { kind: "cancel" } };
   }
-  if (matchesKey(data, "left") && state.level === "agent") {
-    return { state: { ...state, level: "phases", promptExpanded: false } };
+  if (matchesKey(data, "left")) {
+    if (state.level === "agent") return { state: { ...state, level: "tree", promptExpanded: false } };
+    // Collapsing keeps the cursor on the row that was open, which is the row
+    // whose agents just disappeared.
+    if (view.expandedIndex !== undefined) return { state: { ...state, expanded: -1 } };
   }
 
   const down = matchesKey(data, "j") || matchesKey(data, "down");
   const up = matchesKey(data, "k") || matchesKey(data, "up");
   if (down || up) {
     const delta = down ? 1 : -1;
-    if (state.level === "phases") {
-      const next = clampIndex(view.clampedPhase + delta, view.groups.length);
-      // Changing phase re-points the agent list at a different set of rows, so
-      // the old row index would be meaningless.
-      return { state: next === view.clampedPhase ? state : { ...state, selectedPhase: next, selectedAgent: 0 } };
-    }
-    return { state: { ...state, selectedAgent: clampIndex(view.clampedAgent + delta, view.visibleAgents.length) } };
+    const next = clampIndex(view.clampedRow + delta, view.rows.length);
+    return { state: next === view.clampedRow ? state : { ...state, selectedRow: next } };
   }
 
   const descend = matchesKey(data, "enter") || matchesKey(data, "right");
-  if (descend && state.level === "phases") {
-    // Do not enter an empty pane with no agent detail to show.
-    if (view.visibleAgents.length === 0) return { state };
-    return { state: { ...state, level: "agent", promptExpanded: false } };
-  }
   if (matchesKey(data, "e") && state.level === "agent") {
     return { state: { ...state, promptExpanded: !state.promptExpanded } };
   }
 
-  // Enter descends from the agent detail into the same conversation viewer as
-  // a fleet row. `c` remains a shortcut at either level. Queued and replayed
-  // entries without a record have no conversation to open.
+  // Enter does what the row under the cursor can do: a phase opens its agents
+  // in place, an agent opens its detail. In the detail it opens the
+  // conversation, which is the only thing left to show.
+  if (descend && state.level === "tree") {
+    const node = view.selectedNode;
+    if (node) {
+      const open = view.expandedIndex === node.index;
+      return { state: { ...state, expanded: open ? -1 : node.index } };
+    }
+    if (view.selectedEntry) return { state: { ...state, level: "agent", promptExpanded: false } };
+    return { state };
+  }
+
+  // The one key that opens something instead of changing the run, so unlike
+  // skip/retry it works at both levels and on a settled agent. A row with no
+  // record id has no conversation to open, and falls through as unbound.
   if ((descend && state.level === "agent") || matchesKey(data, "c")) {
     const recordId = view.selectedEntry?.recordId;
     return recordId === undefined ? undefined : { state, action: { kind: "open", recordId } };
   }
 
-  // The filter re-points the agent list, so it belongs to the level that shows
-  // the whole list rather than the one showing a single agent's detail.
-  if (matchesKey(data, "f") && state.level === "phases") {
-    return { state: { ...state, filter: nextFilter(state.filter), selectedAgent: 0 } };
+  // The filter re-points the agent rows, so it belongs to the tree rather than
+  // to the level showing a single agent's detail.
+  if (matchesKey(data, "f") && state.level === "tree") {
+    const at = view.rows.findIndex(row => row.kind === "node" && row.node.index === view.expandedIndex);
+    return { state: { ...state, filter: nextFilter(state.filter), selectedRow: at < 0 ? state.selectedRow : at } };
   }
 
   // Gated on the run being live, exactly as the footer's hints are. A settled
@@ -1022,9 +1117,8 @@ export class WorkflowDialog implements Component {
     private theme: Theme,
     private done: (result: undefined) => void,
     private actions: WorkflowDialogActions = {},
-    initialPhaseIndex = 0,
   ) {
-    this.state = initialWorkflowDialogState(initialPhaseIndex);
+    this.state = initialWorkflowDialogState();
     this.timer = setInterval(() => {
       this.spinnerFrame++;
       if (!this.closed) this.tui.requestRender();

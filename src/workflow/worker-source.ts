@@ -360,6 +360,13 @@ function makeScope(name, depth) {
   const scope = {
     name: name,
     depth: depth,
+    // Where this child's phases hang in the parent's tree: the parent's ambient
+    // phase for the run's own entry, then that entry for everything the child
+    // defines. Undefined at the top level and for a \`workflow()\` called before
+    // any \`phase()\` — an unplaced run then reads as its own top-level section
+    // rather than being attached to a phase it never ran inside.
+    parentAmbientPhaseIndex: undefined,
+    rootPhaseIndex: undefined,
     // Prefixed into every phase title the child defines, which is the whole of
     // how a nested run reads as its own group in the progress tree — no new
     // entry type, no renderer change.
@@ -395,7 +402,16 @@ function definePhaseIn(scope, title) {
   if (index !== undefined) return index;
   index = nextPhaseIndex++;
   scope.phaseIndexByTitle.set(title, index);
-  emit({ type: "workflow_phase", index: index, title: scopedTitle(scope, title) });
+  const parentIndex =
+    scope.depth === 0 ? undefined
+    : title === undefined ? scope.parentAmbientPhaseIndex
+    : scope.rootPhaseIndex;
+  emit({
+    type: "workflow_phase",
+    index: index,
+    title: scopedTitle(scope, title),
+    ...(parentIndex === undefined ? {} : { parentIndex: parentIndex }),
+  });
   return index;
 }
 
@@ -671,8 +687,13 @@ async function workflowIn(scope, nameOrRef, args) {
   const child = makeScope(loaded.name, scope.depth + 1);
   // The child's own group, defined before its first agent so a child that never
   // calls phase() still reads as its own section rather than falling into the
-  // parent's un-phased bucket.
-  child.ambientPhaseIndex = definePhaseIn(child, undefined);
+  // parent's un-phased bucket. It is also the anchor: the parent phase that
+  // awaited this call is what the whole run hangs under, and every phase the
+  // child defines hangs under this entry.
+  child.parentAmbientPhaseIndex = scope.ambientPhaseIndex;
+  const rootPhaseIndex = definePhaseIn(child, undefined);
+  child.rootPhaseIndex = rootPhaseIndex;
+  child.ambientPhaseIndex = rootPhaseIndex;
   child.ambientPhaseTitle = scopedTitle(child, undefined);
 
   let run;

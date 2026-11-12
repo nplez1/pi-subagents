@@ -69,6 +69,10 @@ describe("workflow conversation overlay", () => {
 		await vi.waitFor(() => expect(dialog).toBeDefined());
 		if (!dialog) throw new Error("workflow dialog did not open");
 		try {
+			// The tree opens on the run's row with its agents listed under it, so
+			// the agent is one row down; Enter there opens the detail, Enter again
+			// the conversation.
+			dialog.handleInput("\x1b[B");
 			dialog.handleInput("\r");
 			dialog.handleInput("\r");
 			expect(viewAgentConversation).toHaveBeenCalledWith(ctx, record);
