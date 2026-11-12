@@ -71,7 +71,7 @@ import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
-import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
+import { openWorkflowFromFleet, showWorkflowsMenu, summarizeRuns, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
 import { decideWorkflowCollision, FOREIGN_WORKFLOW_TOOL_NAMES } from "./workflow/collisions.js";
 import { WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData } from "./workflow/entry.js";
@@ -2271,7 +2271,12 @@ Terse command-style prompts produce shallow, generic work.
     // Cached counters only, no derivation: the fleet list calls this on a
     // 200ms tick and reads the roster several times per update, so walking a
     // run's progress log here would put O(log) work in the render loop.
-    return [...workflowTasks.values()].map(task => ({
+    //
+    // Folded the same way the picker folds: settled runs keep one row per
+    // workflow name, because a loop that re-runs one workflow would otherwise
+    // push another identical row above the agents every round. The runs stay in
+    // the registry, where `resumeFromRunId` can still reach them.
+    return summarizeRuns(workflowTasks.values()).shown.map(task => ({
       id: task.id,
       name: task.meta?.name ?? task.workflowName ?? task.id,
       status: task.status,
@@ -2896,9 +2901,15 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     // Workflow runs, on the same terms as scheduled jobs: shown only when the
-    // feature is on, so the menu never advertises something switched off.
+    // feature is on, so the menu never advertises something switched off. The
+    // count is what the submenu will actually list — the runs the session is
+    // still working with — not every run it has ever held, which for a repeated
+    // loop grows by one every round and tells the reader nothing.
     if (isWorkflowsEnabled()) {
-      options.push(`Workflows (${workflowTasks.size})`);
+      const { shown, older } = summarizeRuns(workflowTasks.values());
+      options.push(
+        older.length > 0 ? `Workflows (${shown.length} + ${older.length} older)` : `Workflows (${shown.length})`,
+      );
     }
 
     // Actions
