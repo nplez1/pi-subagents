@@ -5,7 +5,7 @@ Available agent types and the tools they have access to:
 
 Custom agents can be defined in .pi/agents/<name>.md (project) or {{agentDir}}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
+Choose the agent with the subagent_type parameter. Omit it to use general-purpose — the agent an unknown type also falls back to.
 
 ## When not to use
 

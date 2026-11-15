@@ -48,7 +48,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, persistToastFor, readAgentOverridesForScope, readClaudeCodeSetting, saveClaudeCodeSetting, type SubagentsSettings, saveAgentOverridesForScope, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type ThinkingLevel, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -1416,6 +1416,18 @@ export default function (pi: ExtensionAPI) {
     ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
     : "";
 
+  // An omitted `subagent_type` is not a second dispatch rule — it is the same
+  // unresolvable-name branch of `resolveSpawnType`, so the schema and the tool
+  // description advertise whichever answer that resolver would give rather than
+  // hardcoding general-purpose and drifting from a project's `fallbackSubagent`.
+  const describeDefaultType = (): string => {
+    const fallback = getFallbackSubagent()?.trim();
+    if (fallback !== undefined && fallback.toLowerCase() === NO_FALLBACK) {
+      return `Required in this project: fallbackSubagent is "${NO_FALLBACK}", so a call with no type is refused.`;
+    }
+    return `Omit it to use ${fallback ?? "general-purpose"} — the agent an unknown type also falls back to.`;
+  };
+
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
   // the same load-bearing facts as the full version at ~75% fewer tokens, for
   // small/local models. Per-option details live in the param descriptions.
@@ -1426,6 +1438,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
+- subagent_type selects the agent type. ${describeDefaultType()}
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
@@ -1438,7 +1451,7 @@ ${buildTypeListText()}
 
 Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
+Choose the agent with the subagent_type parameter. ${describeDefaultType()}
 
 ## When not to use
 
@@ -1549,9 +1562,11 @@ Terse command-style prompts produce shallow, generic work.
             'Optional memorable name for this agent, e.g. "auth-audit", so it can be addressed as `@name` at the prompt and by steer_subagent / get_subagent_result. Letters, digits, `_` and `-`. Worth setting when several agents of the same type run at once; omit for one-off work. The agent stays reachable by its type either way.',
         }),
       ),
-      subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
-      }),
+      subagent_type: Type.Optional(
+        Type.String({
+          description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available. Omit it to use ${describeDefaultType()}.`,
+        }),
+      ),
       model: Type.Optional(
         Type.String({
           description:
@@ -1713,7 +1728,11 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
-      const rawType = params.subagent_type as SubagentType;
+      // Blank, not just absent: a model that fills every optional field with an
+      // empty string is a real pattern (see `isolation` in invocation-config),
+      // so a missing type is normalised to "" and left to the same resolver as
+      // an unknown one instead of being a second special case here.
+      const rawType = typeof params.subagent_type === "string" ? params.subagent_type : "";
       // Single decision point for dispatch (#183): unknown, disabled and
       // case-ambiguous types are refused here, BEFORE anything spawns, so a
       // background or scheduled call can't start running the wrong agent while
@@ -1721,11 +1740,16 @@ Terse command-style prompts produce shallow, generic work.
       // unresolvable type falls back or fails closed.
       const dispatch = resolveSpawnType(rawType);
       // `resume` replays a stored session and ignores `subagent_type` entirely,
-      // but the parameter is required by the schema — so gating it here would
-      // make a live agent unresumable the moment its type is deleted, disabled,
-      // or gains a case-clashing sibling. Only a real spawn is gated.
+      // so gating it here would make a live agent unresumable the moment its
+      // type is deleted, disabled, or gains a case-clashing sibling. Only a real
+      // spawn is gated.
       if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
-      const subagentType = dispatch.ok ? dispatch.type : rawType;
+      // The refused-but-resuming case still needs a label for the surfaces that
+      // render before the record is fetched; the record's own type is the
+      // truthful one, and the resume branch below re-derives it anyway.
+      const subagentType = dispatch.ok
+        ? dispatch.type
+        : (params.resume ? manager.getRecord(params.resume)?.type : undefined) ?? rawType;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
       // once persisted an empty type into a scheduled job.
@@ -1736,7 +1760,9 @@ Terse command-style prompts produce shallow, generic work.
       // session and ignores `subagent_type` entirely, so a note about type
       // substitution would be describing something that didn't happen.
       const fallbackNote = dispatch.ok && dispatch.fellBackFrom !== undefined
-        ? `Note: Unknown agent type "${dispatch.fellBackFrom}" — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
+        ? `${dispatch.fellBackFrom
+          ? `Note: Unknown agent type "${dispatch.fellBackFrom}"`
+          : `Note: No subagent_type given`} — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
         : "";
 
       const displayName = getDisplayName(subagentType);

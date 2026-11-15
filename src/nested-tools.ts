@@ -170,7 +170,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     parameters: Type.Object({
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
-      subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
+      subagent_type: Type.Optional(
+        Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}. Omit it only when exactly one type is allowed — that one is then used — or the call is refused with the list.` }),
+      ),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       run_in_background: Type.Optional(
@@ -204,7 +206,16 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
       // Reloaded per call so new agent files are picked up without a restart.
       const registry = loadRegistry();
-      const rawType = params.subagent_type;
+      const allowed = allowedTypesIn(registry);
+      // Optional in the schema, so an omitted type has to be answered here
+      // rather than by pi's argument validator. The answer cannot be the
+      // project's `fallbackSubagent` — that would hand a nested caller an agent
+      // its allowlist never named — so it is only ever the one agent a
+      // single-entry allowlist already forces, and otherwise a refusal that
+      // names what is allowed.
+      const rawType = typeof params.subagent_type === "string"
+        ? params.subagent_type
+        : allowed?.size === 1 ? [...allowed][0]! : "";
       // Strict resolve, never the fallback policy: a project-level
       // `fallbackSubagent` must not hand a nested caller an agent its allowlist
       // never named. The list stays allowlist-filtered so a typo can't enumerate
@@ -212,11 +223,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const resolvedType = resolveEnabledTypeIn(registry, rawType);
       if (resolvedType === undefined) {
         return textResult(
-          `Unknown or disabled nested agent type: "${rawType}". Allowed: ${availableIn(registry).join(", ") || "none"}.`,
+          `${rawType ? `Unknown or disabled nested agent type: "${rawType}".` : "No nested agent type given."} ` +
+          `Allowed: ${availableIn(registry).join(", ") || "none"}.`,
           true,
         );
       }
-      const allowed = allowedTypesIn(registry);
       if (allowed !== undefined && !allowed.has(resolvedType)) {
         return textResult(
           `Nested agent type "${resolvedType}" is not allowed for this parent. Allowed: ${[...allowed].join(", ")}.`,
