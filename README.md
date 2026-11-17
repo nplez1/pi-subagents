@@ -453,7 +453,7 @@ return await pipeline(
 )
 ```
 
-Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, independent of the session's `maxConcurrent` pool, which its agents do not enter. There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
+Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, independent of the session's `maxConcurrent` pool, which its agents do not enter — and 4096 items per `parallel`/`pipeline` call. The total number of agents a run may schedule is uncapped: a loop meant to run for days passes any fixed ceiling.
 
 **Full guide:** [`docs/workflows.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md) — how the model writes the script for you, how to edit and re-run it, how to save one as a reusable named workflow, plus the complete `agent()` option reference, recipes and troubleshooting.
 

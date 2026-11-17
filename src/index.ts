@@ -78,7 +78,7 @@ import { WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData } from "
 import { createWorkflowHost } from "./workflow/host.js";
 import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
 import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/meta.js";
-import { elapsedMs } from "./workflow/progress.js";
+import { elapsedMs, roundSummaries } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId, workflowSettledEvent, workflowStartedEvent } from "./workflow/task.js";
@@ -2302,17 +2302,29 @@ Terse command-style prompts produce shallow, generic work.
     // workflow name, because a loop that re-runs one workflow would otherwise
     // push another identical row above the agents every round. The runs stay in
     // the registry, where `resumeFromRunId` can still reach them.
-    return summarizeRuns(workflowTasks.values()).shown.map(task => ({
-      id: task.id,
-      name: task.meta?.name ?? task.workflowName ?? task.id,
-      status: task.status,
-      doneCount: task.settledCount,
-      failedCount: task.failedCount,
-      totalCount: task.agentCount,
-      startedAt: task.startTime,
-      ...(task.endTime !== undefined ? { completedAt: task.endTime } : {}),
-      tokens: task.totalTokens,
-    }));
+    return summarizeRuns(workflowTasks.values()).shown.map(task => {
+      // Rounds are read from the same version-keyed cache the card and the
+      // inspector use, so this is a walk once per progress batch rather than one
+      // per 200 ms tick — the reason this function still does no derivation of
+      // its own. `length > 1` keeps a run that has not looped on the row shape it
+      // has always had.
+      const rounds = roundSummaries(task.workflowProgress, task.progressVersion);
+      const live = rounds.length > 1 ? rounds[rounds.length - 1] : undefined;
+      return {
+        id: task.id,
+        name: task.meta?.name ?? task.workflowName ?? task.id,
+        status: task.status,
+        doneCount: task.settledCount,
+        failedCount: task.failedCount,
+        totalCount: task.agentCount,
+        startedAt: task.startTime,
+        ...(task.endTime !== undefined ? { completedAt: task.endTime } : {}),
+        tokens: task.totalTokens,
+        ...(live !== undefined
+          ? { round: { index: live.index, settled: live.settled, total: Math.max(live.agents, live.settled + live.live) } }
+          : {}),
+      };
+    });
   }
 
   /**
@@ -2489,6 +2501,8 @@ Terse command-style prompts produce shallow, generic work.
           meta: task.meta,
           agentCount: task.agentCount,
           totalTokens: task.totalTokens,
+          version: task.progressVersion,
+          ...(task.archived.rounds > 0 ? { archived: task.archived } : {}),
         },
         theme,
       );

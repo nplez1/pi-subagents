@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
 import type { AgentActivity, Theme } from "./agent-widget.js";
-import { FleetList, type FleetUICtx } from "./fleet-list.js";
+import { FleetList, type FleetUICtx, type FleetWorkflow } from "./fleet-list.js";
 
 const theme: Theme = {
 	fg: (_color, text) => text,
@@ -149,5 +149,53 @@ describe("FleetList below-editor view", () => {
 		expect(h.render().some(l => l.includes("find auth files"))).toBe(true);
 		h.key("\x1b[B"); // activation is disabled
 		expect(h.render().some(l => l.includes("❯"))).toBe(false);
+	});
+});
+
+describe("FleetList workflow rows", () => {
+	let h: ReturnType<typeof harness>;
+
+	beforeEach(() => {
+		h = harness();
+	});
+
+	function mountWorkflow(workflow: FleetWorkflow) {
+		const fleet = new FleetList(manager([]), activity(), () => false, () => "all", () => false);
+		fleet.setUICtx(h.ui);
+		fleet.setWorkflowSource(() => [workflow], async () => {});
+		fleet.update();
+		return fleet;
+	}
+
+	const base: FleetWorkflow = {
+		id: "wf_loop",
+		name: "ps-drive-tester",
+		status: "running",
+		doneCount: 47,
+		totalCount: 49,
+		failedCount: 1,
+		startedAt: Date.now() - 3_723_000,
+		tokens: 12_345_678,
+	};
+
+	it("reports a looping run by its round, not by a climbing total", () => {
+		mountWorkflow({ ...base, round: { index: 7, settled: 2, total: 4 } });
+		const row = h.render().find(line => line.includes("ps-drive-tester"));
+		expect(row).toContain("r7 2/4");
+		// The run's total is still named, as a quantity rather than a fraction.
+		expect(row).toContain("47 settled");
+		expect(row).not.toContain("47/49");
+	});
+
+	it("keeps `done/total agents` for a run that has not looped", () => {
+		mountWorkflow(base);
+		const row = h.render().find(line => line.includes("ps-drive-tester"));
+		expect(row).toContain("47/49 agents");
+	});
+
+	it("climbs past minutes on the row's clock", () => {
+		mountWorkflow({ ...base, completedAt: base.startedAt + 7_200_000 });
+		const row = h.render().find(line => line.includes("ps-drive-tester"));
+		expect(row).toContain("2h00m");
 	});
 });

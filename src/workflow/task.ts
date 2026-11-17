@@ -8,17 +8,27 @@
  * Claude Code's `local_workflow` task so the fields line up with what the
  * renderers already expect.
  *
- * The progress log is append-only and collapses by index (see `progress.ts`),
- * so every derived counter here is recomputed from the log rather than
- * incremented as entries arrive — a re-emitted agent entry replaces its
- * predecessor, and adding its tokens on top would double-count them.
+ * The progress log is append-only in emission order but last-write-wins by
+ * index (see `progress.ts`), so an agent's queued, started and settled rows are
+ * one row that gets rewritten. That is exactly what {@link updateWorkflowProgressBatch}
+ * does — writes in place — and the counters are moved by the difference rather
+ * than recomputed, because a loop can keep a run going for weeks and both the
+ * fourfold log growth and the per-batch full fold were costs that only show up
+ * at that scale.
  */
 
 import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import {
+  type ArchivedRounds,
+  elapsedMs,
+  roundOf,
+  stats,
+  type WorkflowEntry,
+  type WorkflowRunStatus,
+} from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -64,6 +74,25 @@ export interface WorkflowTask {
   workflowProgress: WorkflowEntry[];
   /** Bumped once per applied batch, so a renderer can tell nothing changed. */
   progressVersion: number;
+  /**
+   * Agent index → its slot in {@link workflowProgress}.
+   *
+   * What makes a re-emit a rewrite instead of an append. See the module note.
+   */
+  agentSlots: Map<number, number>;
+  /** The round in flight. Anything below it is history and never changes again. */
+  liveRound: number;
+  /** Log lines currently in the log, so a chatty run is bounded too. */
+  logLines: number;
+  /**
+   * Rounds whose rows have been pruned — the fold every surface draws.
+   *
+   * A weeks-long loop has no bound on rounds, so per-agent rows are held for the
+   * newest {@link WORKFLOW_ROW_RETENTION} and everything older collapses to
+   * counts here. Without it the log is the largest thing in the session and it
+   * grows forever.
+   */
+  archived: ArchivedRounds;
   agentCount: number;
   /**
    * Agents that have settled successfully, recomputed with the other counters.
@@ -84,7 +113,6 @@ export interface WorkflowTask {
   failedCount: number;
   totalTokens: number;
   totalToolCalls: number;
-  logs: string[];
 
   abortController: AbortController;
   startTime: number;
@@ -125,13 +153,16 @@ export function createWorkflowTask(init: {
     replayedCount: 0,
     workflowProgress: [],
     progressVersion: 0,
+    agentSlots: new Map(),
+    liveRound: 1,
+    logLines: 0,
+    archived: { rounds: 0, through: 0, agents: 0, settled: 0, failed: 0, tokens: 0, durationMs: 0 },
     agentCount: 0,
     doneCount: 0,
     settledCount: 0,
     failedCount: 0,
     totalTokens: 0,
     totalToolCalls: 0,
-    logs: [],
     abortController: new AbortController(),
     startTime: init.startTime ?? Date.now(),
     totalPausedMs: 0,
@@ -141,44 +172,262 @@ export function createWorkflowTask(init: {
 /**
  * Apply one batch of progress entries.
  *
- * Batched rather than per-entry because that is how the worker emits them, and
- * because every counter below is an O(log) recompute — doing it once per fan-out
- * frame instead of once per agent is the difference that keeps a 200-agent run
- * cheap to render.
+ * Batched rather than per-entry because that is how the worker emits them. Two
+ * costs used to be paid per batch and both grow with the run: the log kept every
+ * write (four rows per agent), and the whole thing was folded to recompute the
+ * counters. A loop left going for weeks makes both unbounded, so this writes
+ * each agent's row in place and moves the counters by the difference — O(1) per
+ * entry, O(agents) memory, no full fold.
  */
 export function updateWorkflowProgressBatch(
   task: WorkflowTask,
   entries: readonly WorkflowEntry[],
 ): void {
   if (entries.length === 0) return;
-  task.workflowProgress.push(...entries);
-  task.progressVersion++;
 
-  const { agents, logs } = collapse(task.workflowProgress);
-  task.logs = logs;
-  // `agentCount` is what the runtime has scheduled, which can lead what the log
-  // has seen — never let a recompute walk it backwards.
-  task.agentCount = Math.max(task.agentCount, agents.length);
+  for (const entry of entries) {
+    if (entry.type !== "workflow_agent") {
+      // Phases are emitted once per title per scope, so a phase entry is always
+      // new; a log line is new by definition. Both are pruned by age in
+      // `pruneOverflow`, since neither is rewritten in place.
+      task.workflowProgress.push(entry);
+      if (entry.type === "workflow_log") {
+        task.logLines++;
+        if (task.logLines > WORKFLOW_LOG_RETENTION + WORKFLOW_OVERFLOW_SLACK) pruneOverflow(task);
+      }
+      continue;
+    }
 
-  let totalTokens = 0;
-  let totalToolCalls = 0;
-  let done = 0;
-  let failed = 0;
-  for (const agent of agents) {
-    totalTokens += agent.tokens ?? 0;
-    totalToolCalls += agent.toolCalls ?? 0;
-    // Counted off the collapsed agents, so a re-emitted row counts once.
-    if (agent.state === "done") done++;
-    else if (agent.state === "error") failed++;
+    const round = roundOf(entry);
+    const slot = task.agentSlots.get(entry.index);
+    if (slot === undefined) {
+      task.agentSlots.set(entry.index, task.workflowProgress.length);
+      task.workflowProgress.push(entry);
+      // `agentCount` is what the runtime has scheduled, which can lead what the
+      // log has seen — never let it walk backwards. Keyed off the index, not off
+      // `agentSlots.size`: pruning old rounds removes rows, and a size would then
+      // report the rows still held as the number of agents that ever ran.
+      task.agentCount = Math.max(task.agentCount, entry.index + 1);
+      if (task.agentSlots.size > WORKFLOW_ROW_RETENTION + WORKFLOW_OVERFLOW_SLACK) pruneOverflow(task);
+    } else {
+      // Rolled back before the replacement is counted, so a re-emit moves a row
+      // between states instead of adding to the totals.
+      const previous = task.workflowProgress[slot];
+      if (previous.type === "workflow_agent") {
+        task.totalTokens -= previous.tokens ?? 0;
+        task.totalToolCalls -= previous.toolCalls ?? 0;
+        if (previous.state === "done") {
+          task.doneCount--;
+          task.settledCount--;
+        } else if (previous.state === "error") {
+          task.failedCount--;
+          task.settledCount--;
+        }
+      }
+      task.workflowProgress[slot] = entry;
+    }
+
+    task.totalTokens += entry.tokens ?? 0;
+    task.totalToolCalls += entry.toolCalls ?? 0;
+    if (entry.state === "done") {
+      task.doneCount++;
+      task.settledCount++;
+    } else if (entry.state === "error") {
+      task.failedCount++;
+      task.settledCount++;
+    }
+
+    // A straggler from an earlier round — a long-running agent that settles
+    // after the loop moved on — is stripped as it lands, because its round's
+    // one-shot pass has already been and gone.
+    if (round < task.liveRound && (entry.state === "done" || entry.state === "error")) slimEntry(entry);
+
+    if (round > task.liveRound) {
+      task.liveRound = round;
+      retireRounds(task);
+    }
   }
-  task.totalTokens = totalTokens;
-  task.totalToolCalls = totalToolCalls;
-  task.doneCount = done;
-  // A failure is work that finished. The fleet row and every header read
-  // `settled/total` so a run that hit one error does not look like one that is
-  // still waiting for an agent to start.
-  task.failedCount = failed;
-  task.settledCount = done + failed;
+
+  task.progressVersion++;
+}
+
+/**
+ * Agent rows kept in memory before the oldest rounds are pruned to counts.
+ *
+ * Sized for inspection rather than for the run: the round in flight is what
+ * anyone reads, and the few hundred behind it are there so stepping back in the
+ * inspector works. A settled row is ~120 bytes, so the log stays a couple of
+ * megabytes however long the loop runs.
+ */
+export const WORKFLOW_ROW_RETENTION = 10_000;
+
+/**
+ * Drop what only ever mattered while a row was worth reading in full.
+ *
+ * The prompt and result previews are most of a settled row's bytes, so a run
+ * that goes for weeks turns the log into the largest thing in the session for
+ * text nobody scrolls back to. Everything that makes the row inspectable stays:
+ * index, label, state, tokens, duration, and the `recordId` an inspector's `c`
+ * opens a conversation with.
+ */
+function slimEntry(entry: WorkflowEntry): void {
+  if (entry.type !== "workflow_agent") return;
+  delete entry.promptPreview;
+  delete entry.resultPreview;
+}
+
+/**
+ * Fold finished rounds away as the loop moves on.
+ *
+ * Runs once per round boundary rather than per batch, and walks only the rows
+ * still held, so its cost is bounded by {@link WORKFLOW_ROW_RETENTION} no matter
+ * how long the run is:
+ *
+ * 1. strip the previews of every settled row in a finished round;
+ * 2. while the held rows are over the bound, freeze the oldest round into
+ *    {@link WorkflowTask.archived} and drop its rows.
+ *
+ * A round still holding a running agent is skipped, never pruned: dropping it
+ * would hide live work to save memory, which is the wrong trade.
+ */
+function retireRounds(task: WorkflowTask): void {
+  const byRound = new Map<number, number[]>();
+  const entries = task.workflowProgress;
+  for (let slot = 0; slot < entries.length; slot++) {
+    const entry = entries[slot];
+    if (entry.type !== "workflow_agent") continue;
+    const round = roundOf(entry);
+    if (round >= task.liveRound) continue;
+    if (entry.state === "done" || entry.state === "error") slimEntry(entry);
+    const slots = byRound.get(round);
+    if (slots) slots.push(slot);
+    else byRound.set(round, [slot]);
+  }
+  if (byRound.size === 0) return;
+
+  let retained = task.agentSlots.size;
+  if (retained <= WORKFLOW_ROW_RETENTION) return;
+
+  const drop = new Set<number>();
+  for (const round of [...byRound.keys()].sort((a, b) => a - b)) {
+    if (retained <= WORKFLOW_ROW_RETENTION) break;
+    const slots = byRound.get(round) as number[];
+    const hasLive = slots.some(slot => {
+      const entry = entries[slot];
+      return entry.type === "workflow_agent" && (entry.state === "start" || entry.state === "progress");
+    });
+    if (hasLive) continue;
+
+    // Frozen before the rows go: this is all the card and the inspector will
+    // have to say about the round from here on.
+    let agents = 0;
+    let settled = 0;
+    let failed = 0;
+    let tokens = 0;
+    let firstAt = Number.POSITIVE_INFINITY;
+    let lastAt = 0;
+    for (const slot of slots) {
+      const entry = entries[slot];
+      if (entry.type !== "workflow_agent") continue;
+      agents++;
+      if (entry.state === "done") settled++;
+      else if (entry.state === "error") {
+        settled++;
+        failed++;
+      }
+      tokens += entry.tokens ?? 0;
+      if (entry.startedAt !== undefined) {
+        if (entry.startedAt < firstAt) firstAt = entry.startedAt;
+        const end = entry.startedAt + (entry.durationMs ?? 0);
+        if (end > lastAt) lastAt = end;
+      }
+    }
+
+    task.archived.rounds++;
+    task.archived.through = Math.max(task.archived.through, round);
+    task.archived.agents += agents;
+    task.archived.settled += settled;
+    task.archived.failed += failed;
+    task.archived.tokens += tokens;
+    task.archived.durationMs += firstAt < Number.POSITIVE_INFINITY ? Math.max(0, lastAt - firstAt) : 0;
+
+    for (const slot of slots) drop.add(slot);
+    retained -= slots.length;
+  }
+  if (drop.size > 0) compactProgress(task, drop);
+}
+
+/**
+ * Keep at most this many log lines. The card draws the last few; the rest are
+ * kept for the same reason the rows are — so a recent scroll-back still reads.
+ */
+const WORKFLOW_LOG_RETENTION = 200;
+
+/**
+ * Inserts allowed past the row bound before the overflow walk runs, so the walk
+ * is amortised rather than per batch. Exported because it is part of the bound
+ * callers can rely on, not an implementation detail of when the walk happens.
+ */
+export const WORKFLOW_OVERFLOW_SLACK = 512;
+
+/**
+ * Drop the oldest detail when the bound is exceeded with nothing to retire.
+ *
+ * `retireRounds` needs a round boundary, and a loop can have none to give it:
+ * `while (…) { await agent(…) }` never calls `phase()`, so it stays in round one
+ * forever and would otherwise keep every row for the rest of the run. Here the
+ * oldest settled rows and the oldest log lines go instead. The counters are
+ * untouched — they are maintained per entry, not derived from the rows — so the
+ * header, the fleet row and the round's own summary stay exact; only the detail
+ * list is bounded.
+ */
+function pruneOverflow(task: WorkflowTask): void {
+  const overflow = task.agentSlots.size - WORKFLOW_ROW_RETENTION;
+  const excessLogs = Math.max(0, task.logLines - WORKFLOW_LOG_RETENTION);
+  if (overflow <= 0 && excessLogs === 0) return;
+
+  const drop = new Set<number>();
+  let dropped = 0;
+  let logBudget = excessLogs;
+  const entries = task.workflowProgress;
+
+  for (let slot = 0; slot < entries.length; slot++) {
+    const entry = entries[slot];
+    if (entry.type === "workflow_log") {
+      // Oldest first: the tail is what the card draws.
+      if (logBudget > 0) {
+        drop.add(slot);
+        logBudget--;
+      }
+      continue;
+    }
+    if (entry.type !== "workflow_agent") continue;
+    if (dropped >= overflow) continue;
+    // Live work is never dropped to save memory.
+    if (entry.state === "start" || entry.state === "progress") continue;
+    drop.add(slot);
+    dropped++;
+  }
+  if (drop.size > 0) compactProgress(task, drop);
+}
+
+/**
+ * Rebuild the log without the pruned slots.
+ *
+ * A rebuild rather than in-place splice because every surviving slot index
+ * shifts, and the map that turns an agent index into one has to follow. It runs
+ * once per {@link WORKFLOW_ROW_RETENTION} agents, not per batch.
+ */
+function compactProgress(task: WorkflowTask, drop: Set<number>): void {
+  const kept = task.workflowProgress.filter((_entry, slot) => !drop.has(slot));
+  task.workflowProgress = kept;
+  task.agentSlots = new Map();
+  task.logLines = 0;
+  for (let slot = 0; slot < kept.length; slot++) {
+    const entry = kept[slot];
+    if (entry.type === "workflow_agent") task.agentSlots.set(entry.index, slot);
+    else if (entry.type === "workflow_log") task.logLines++;
+  }
 }
 
 /**

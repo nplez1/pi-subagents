@@ -24,14 +24,28 @@ import { WORKER_SOURCE } from "./worker-source.js";
 /** Matches the `script` field's `maxLength` in the tool schema. */
 export const MAX_SCRIPT_LENGTH = 524_288;
 
-/** Agents one run may schedule, in total. */
-export const WORKFLOW_AGENT_CAP = 1000;
-
-/** Items one `parallel()` or `pipeline()` call may take. */
+/**
+ * Items one `parallel()` or `pipeline()` call may take.
+ *
+ * There is deliberately no counterpart for the total agent count. There was —
+ * 1000 per run, a "runaway-loop backstop" — and it was the wrong axis: a loop
+ * that is *meant* to run for weeks passes 1000 in a couple of hours, so the cap
+ * killed healthy work while a tight `while (true)` fan-out is still caught by
+ * the per-round size warning and `x stop`. A host may still set
+ * {@link RunWorkflowOptions.agentCap} for its own boundary.
+ */
 export const WORKFLOW_ITEM_CAP = 4096;
 
-/** Nested `workflow()` invocations allowed per run. */
-export const WORKFLOW_NESTED_CAP = 256;
+/**
+ * Nested `workflow()` invocations allowed per run.
+ *
+ * Raised from 256 for the same reason the agent cap was removed: a loop that
+ * composes a saved workflow once per pass would have hit the old bound on its
+ * 257th iteration — hours into a run meant to last weeks. Each call costs a
+ * compile and a scope rather than a thread, so 10,000 is still a runaway
+ * backstop and no longer a wall an intentional loop meets.
+ */
+export const WORKFLOW_NESTED_CAP = 10_000;
 
 /** How much of a prompt or result is kept for the UI. */
 const PREVIEW_LENGTH = 200;
@@ -277,6 +291,14 @@ export interface RunWorkflowOptions {
   /** Fired per batch, not per entry — see the worker's progress batching. */
   onProgress?(entries: readonly WorkflowEntry[]): void;
   concurrency?: number;
+  /**
+   * Total agents this run may schedule. Unlimited unless the caller sets one.
+   *
+   * Left unset for the tool: a loop that is meant to run for weeks schedules
+   * far more agents than any fixed ceiling would allow, and the count is the
+   * wrong thing to bound an intentional loop by. A host that wants a boundary
+   * of its own — an embedder, a test proving the refusal path — passes it here.
+   */
   agentCap?: number;
   itemCap?: number;
   /**
@@ -436,6 +458,13 @@ interface AgentCallPayload {
   isolation?: "worktree";
   phaseIndex?: number;
   phaseTitle?: string;
+  /**
+   * Which loop pass asked for this agent, inferred worker-side from the
+   * script's own `phase()` sequence. Presentation only: nothing about the spawn
+   * depends on it, and it rides on every emit so a row keeps its round through
+   * the queued → started → settled rewrites.
+   */
+  roundIndex?: number;
   /** Shell command that has to pass before the agent counts as done. */
   gate?: string;
   /** Label of an earlier child in this run to continue instead of starting one. */
@@ -588,7 +617,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   assertBoundarySafe(options.args, "args");
 
   const { meta, body } = validateScript(script);
-  const agentCap = options.agentCap ?? WORKFLOW_AGENT_CAP;
+  const agentCap = options.agentCap;
   const itemCap = options.itemCap ?? WORKFLOW_ITEM_CAP;
   const semaphore = new Semaphore(options.concurrency ?? workflowConcurrency());
 
@@ -730,7 +759,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   return await new Promise<WorkflowRunResult>(resolve => {
     const emit = (entries: WorkflowEntry[]) => {
       if (entries.length === 0) return;
-      progress.push(...entries);
+      // Collected only when nobody is listening. The task keeps its own copy and
+      // is the copy every surface reads, so accumulating a second one here would
+      // double a weeks-long run's memory for an array nothing ever drains:
+      // `onProgress` is the live path, and `result.progress` is for callers that
+      // ran a script without one (the tests, an embedder).
+      if (options.onProgress === undefined) progress.push(...entries);
       options.onProgress?.(entries);
     };
 
@@ -837,7 +871,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         compiledSchema = compilation.compiled;
       }
 
-      if (agentCount >= agentCap) {
+      if (agentCap !== undefined && agentCount >= agentCap) {
         // Fatal, so parallel()/pipeline() rethrow instead of folding it into a
         // null. A cap that silently drops work is worse than no cap.
         respond(callId, false, undefined, `Workflow exceeded its cap of ${agentCap} agents.`, true);
@@ -866,6 +900,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         ...(isolation !== undefined ? { isolation } : {}),
         ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
         ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+        ...(typeof payload.roundIndex === "number" ? { roundIndex: payload.roundIndex } : {}),
       };
 
       const queuedAt = Date.now();

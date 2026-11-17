@@ -286,3 +286,62 @@ describe("workflow tree navigation", () => {
 		}
 	});
 });
+
+describe("workflow dialog rounds", () => {
+	/** Two looping rounds, both settled except the last agent. */
+	const looping: WorkflowEntry[] = [
+		{ type: "workflow_phase", index: 0, title: "Wait" },
+		{ type: "workflow_phase", index: 1, title: "Run" },
+		{ type: "workflow_agent", index: 0, phaseIndex: 0, roundIndex: 1, label: "claim-1", state: "done", tokens: 10 },
+		{ type: "workflow_agent", index: 1, phaseIndex: 1, roundIndex: 1, label: "run-1", state: "done", tokens: 10 },
+		{ type: "workflow_agent", index: 2, phaseIndex: 0, roundIndex: 2, label: "claim-2", state: "done", tokens: 10 },
+		{ type: "workflow_agent", index: 3, phaseIndex: 1, roundIndex: 2, label: "run-2", state: "progress" },
+	];
+	const loopingSource: WorkflowDialogSource = {
+		progress: looping,
+		task: { status: "running", workflowName: "ps-drive-tester", startTime: 0 },
+	};
+
+	it("draws the live round and folds the ones behind it", () => {
+		const rendered = text(initialWorkflowDialogState(), loopingSource);
+		expect(rendered).toContain("round 2");
+		expect(rendered).toContain("round 1 ·");
+		expect(rendered).toContain("run-2");
+		// Round 1's agents are not rows while round 2 is drawn.
+		expect(rendered).not.toContain("run-1");
+		expect(rendered).not.toContain("claim-1");
+	});
+
+	it("steps back through rounds with `[` and returns with `]`", () => {
+		const stepped = key("[", initialWorkflowDialogState(), loopingSource);
+		expect(stepped?.state.round).toBe(1);
+		const past = text(stepped?.state ?? initialWorkflowDialogState(), loopingSource);
+		expect(past).toContain("round 1 past");
+		expect(past).toContain("claim-1");
+		expect(past).not.toContain("run-2");
+
+		const forward = key("]", stepped?.state ?? initialWorkflowDialogState(), loopingSource);
+		// Back on the live round the state follows it again, rather than pinning the
+		// number 2 and stranding the reader once round 3 starts.
+		expect(forward?.state.round).toBeUndefined();
+	});
+
+	it("clamps at both ends instead of wrapping", () => {
+		const atLive = key("]", initialWorkflowDialogState(), loopingSource);
+		expect(atLive?.state.round ?? 2).toBe(2);
+		const atFirst = key("[", { ...initialWorkflowDialogState(), round: 1 }, loopingSource);
+		expect(atFirst?.state.round ?? 1).toBe(1);
+	});
+
+	it("does nothing on a run that has not looped", () => {
+		expect(key("[", initialWorkflowDialogState())).toBeUndefined();
+		const rendered = text(initialWorkflowDialogState());
+		expect(rendered).not.toContain("[ ] round");
+	});
+
+	it("keeps the header reporting the live round while a past one is drawn", () => {
+		const past = text({ ...initialWorkflowDialogState(), round: 1 }, loopingSource);
+		// The header still says where the run is, not where the reader is.
+		expect(past).toContain("round 2 · 1/2");
+	});
+});

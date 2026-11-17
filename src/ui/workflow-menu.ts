@@ -85,6 +85,8 @@ export async function showWorkflowDialog(
           },
           meta: task.meta,
           agentCount: task.agentCount,
+          version: task.progressVersion,
+          ...(task.archived.rounds > 0 ? { archived: task.archived } : {}),
         }),
         theme,
         done,

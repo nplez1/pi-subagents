@@ -348,6 +348,19 @@ const UNSUPPORTED_AGENT_OPTIONS = {};
 let nextPhaseIndex = 0;
 
 /**
+ * How many \`parallel()\`/\`pipeline()\` calls are executing right now.
+ *
+ * A \`phase()\` inside a fan-out is per-item work, not a loop iteration. Three
+ * thunks that each call \`phase('Review')\` are one pass over three items, and
+ * treating them as revisits made a pipeline over N items look like N rounds —
+ * with the card then drawing one item and the per-round size warning measuring
+ * a single agent. Round inference is suppressed while this is above zero: the
+ * boundary a reader cares about is the loop *around* the fan-out, which is the
+ * only place a pass can actually begin.
+ */
+let fanoutDepth = 0;
+
+/**
  * One script's view of the world.
  *
  * A nested \`workflow()\` runs in this same worker and this same vm context —
@@ -374,6 +387,15 @@ function makeScope(name, depth) {
     ambientPhaseIndex: undefined,
     ambientPhaseTitle: undefined,
     phaseIndexByTitle: new Map(),
+    //
+    // Round tracking. A script's loop shows up here as its phase sequence
+    // starting over, which is the only signal the runtime has: \`phase()\` is a
+    // plain function call and a \`while\` leaves no trace anywhere else. Only the
+    // top-level script counts — a nested \`workflow()\` executes inside the round
+    // that called it, so its \`phase()\` calls must not advance the cursor.
+    roundIndex: 1,
+    roundVisits: [],
+    agentsInPhase: 0,
   };
   scope.agent = function (prompt, opts) {
     return agentIn(scope, prompt, opts);
@@ -417,8 +439,70 @@ function definePhaseIn(scope, title) {
 
 function phaseIn(scope, title) {
   const text = requireText(title, "phase(title)");
-  scope.ambientPhaseIndex = definePhaseIn(scope, text);
+  const index = definePhaseIn(scope, text);
+  notePhaseVisit(scope, index);
+  scope.ambientPhaseIndex = index;
   scope.ambientPhaseTitle = scopedTitle(scope, text);
+}
+
+/**
+ * Advance the round cursor when the script's phase sequence starts over.
+ *
+ * Two shapes, both inferred from \`phase()\` alone:
+ *
+ *   phase('Wait') → phase('Sync') → phase('Run') → phase('Wait')   // went back
+ *   while (…) { phase('Tick'); await agent(…) }                     // same phase again
+ *
+ * The first is a loop returning to its head: revisiting a phase we already
+ * passed means a new pass started there. The second has no forward movement to
+ * detect, so it needs the other half of the signal — the phase was re-entered
+ * after work happened under it, and a \`phase()\` that merely repeats itself
+ * before any agent runs is idempotent rather than a new pass.
+ *
+ * A false positive costs a round boundary in the reader's view, never in the
+ * run: nothing else keys off this, and the agents keep their order.
+ */
+/**
+ * Note the phase a fan-out left ambient, once the fan-out is over.
+ *
+ * Suppressing inference *inside* a fan-out is what stops N items reading as N
+ * passes. Suppressing it entirely would lose the phase the fan-out belonged to,
+ * so the last one is recorded here — but only as a first sighting, never as a
+ * revisit: two sequential \`parallel()\` calls whose stages name the same phase
+ * are two stages, not two passes, and a fixed fan-out has no pass structure of
+ * its own to report.
+ */
+function recordFanoutPhase() {
+  if (fanoutDepth > 0 || rootScope === null) return;
+  const index = rootScope.ambientPhaseIndex;
+  if (index === undefined) return;
+  if (rootScope.roundVisits.indexOf(index) === -1) rootScope.roundVisits.push(index);
+}
+
+function notePhaseVisit(scope, index) {
+  // Inside a fan-out: per-item phases, not a pass boundary.
+  if (fanoutDepth > 0) return;
+  if (scope.depth !== 0) return;
+  const visits = scope.roundVisits;
+  const at = visits.indexOf(index);
+  if (at === -1) {
+    visits.push(index);
+    scope.agentsInPhase = 0;
+    return;
+  }
+  if (at !== visits.length - 1) {
+    // Dropped back to an earlier phase in this pass. Truncate to it rather than
+    // clearing: a loop may resume mid-sequence (\`A B C\` restarting at \`B\`).
+    visits.length = at;
+    visits.push(index);
+    scope.roundIndex++;
+    scope.agentsInPhase = 0;
+    return;
+  }
+  if (scope.agentsInPhase > 0) {
+    scope.roundIndex++;
+    scope.agentsInPhase = 0;
+  }
 }
 
 function describe(value) {
@@ -539,6 +623,14 @@ async function agentIn(scope, prompt, opts) {
   const phaseIndex = phaseName !== undefined ? definePhaseIn(scope, phaseName) : scope.ambientPhaseIndex;
   const phaseTitle = phaseName !== undefined ? scopedTitle(scope, phaseName) : scope.ambientPhaseTitle;
 
+  // The round this call belongs to — the top-level script's cursor, whichever
+  // scope is asking. Counted as work under the ambient phase, which is what
+  // lets a one-phase \`while\` loop read as rounds. Both are module-level
+  // mutations of the root rather than the calling scope: a nested run is work
+  // done inside the parent's round, not a round of its own.
+  const roundIndex = rootScope === null ? 1 : rootScope.roundIndex;
+  if (rootScope !== null) rootScope.agentsInPhase++;
+
   const result = await callHost("agent", {
     prompt: text,
     label: label,
@@ -547,6 +639,7 @@ async function agentIn(scope, prompt, opts) {
     isolation: isolation,
     phaseIndex: phaseIndex,
     phaseTitle: phaseTitle,
+    roundIndex: roundIndex,
     gate: gate,
     resume: resume,
     effort: effort,
@@ -577,17 +670,23 @@ async function parallel(thunks) {
       throw new Error("parallel(thunks) expects an array of functions; item " + i + " is not one.");
     }
   }
-  const settled = await Promise.all(
-    list.map(async function (thunk) {
-      try {
-        return await thunk();
-      } catch (error) {
-        if (isFatal(error)) throw error;
-        return null;
-      }
-    })
-  );
-  return toRealmArray(settled);
+  fanoutDepth++;
+  try {
+    const settled = await Promise.all(
+      list.map(async function (thunk) {
+        try {
+          return await thunk();
+        } catch (error) {
+          if (isFatal(error)) throw error;
+          return null;
+        }
+      })
+    );
+    return toRealmArray(settled);
+  } finally {
+    fanoutDepth--;
+    recordFanoutPhase();
+  }
 }
 
 /**
@@ -606,21 +705,27 @@ async function pipeline(items, ...stages) {
       throw new Error("pipeline(items, ...stages) expects stages to be functions; stage " + i + " is not one.");
     }
   }
-  const settled = await Promise.all(
-    list.map(async function (item, index) {
-      let value = item;
-      for (let s = 0; s < stages.length; s++) {
-        try {
-          value = await stages[s](value, item, index);
-        } catch (error) {
-          if (isFatal(error)) throw error;
-          return null;
+  fanoutDepth++;
+  try {
+    const settled = await Promise.all(
+      list.map(async function (item, index) {
+        let value = item;
+        for (let s = 0; s < stages.length; s++) {
+          try {
+            value = await stages[s](value, item, index);
+          } catch (error) {
+            if (isFatal(error)) throw error;
+            return null;
+          }
         }
-      }
-      return value;
-    })
-  );
-  return toRealmArray(settled);
+        return value;
+      })
+    );
+    return toRealmArray(settled);
+  } finally {
+    fanoutDepth--;
+    recordFanoutPhase();
+  }
 }
 
 /**

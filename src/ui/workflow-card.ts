@@ -35,12 +35,16 @@ import { stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@ea
 import type { WorkflowEntryData } from "../workflow/entry.js";
 import type { WorkflowMeta } from "../workflow/meta.js";
 import {
+  type ArchivedRounds,
   buildPhaseTree,
   collapse,
+  earlierRounds,
   flattenPhaseTree,
   formatCompactTokens,
   formatDuration,
   header,
+  roundOf,
+  roundSummaries,
   sizeWarning,
   stats,
   type WorkflowAgentEntry,
@@ -59,6 +63,27 @@ export const WORKFLOW_TICK_MS = 1000;
 /** Widest label column before stats stop being aligned and just follow the label. */
 const LABEL_COLUMN_MAX = 28;
 
+/**
+ * Agent rows the card draws before it folds the oldest settled ones away.
+ *
+ * A round is bounded by the phase tree's shape, not by the number of agents in
+ * it: one `pipeline()` over 200 items is 200 rows, and the transcript card is
+ * re-laid-out on every render, so it has to stop somewhere. Live rows are never
+ * among the folded ones — hiding work in flight to save lines is worse than a
+ * long card.
+ */
+export const CARD_AGENT_ROW_BUDGET = 24;
+
+/**
+ * Log lines kept below the tree.
+ *
+ * `log()` has no natural end in a loop — a script that reports each pass writes
+ * one per round forever — so the card shows the tail and says how many it is
+ * not showing. A single-round run is not capped: its log is as long as its
+ * script, which the author already bounded.
+ */
+export const CARD_LOG_LINES = 6;
+
 /** Fallback width when the caller does not know the terminal's. */
 const DEFAULT_WIDTH = 80;
 
@@ -73,6 +98,11 @@ export interface WorkflowGlyphs {
   cross: string;
   /** Running/queued. A static glyph, hence no spinner inline. */
   running: string;
+  /**
+   * History the card is not drawing: folded rounds, folded rows, older log
+   * lines. One glyph for all three so they read as one kind of note.
+   */
+  folded: string;
   /** First and subsequent phase groups. */
   groupTop: string;
   /** A group that is neither the first nor the last. */
@@ -93,6 +123,7 @@ export const UNICODE_GLYPHS: WorkflowGlyphs = {
   tick: "✔",
   cross: "✘",
   running: "⟳",
+  folded: "⋯",
   groupTop: "╭─",
   groupMid: "├─",
   groupBottom: "╰─",
@@ -113,6 +144,7 @@ export const ASCII_GLYPHS: WorkflowGlyphs = {
   tick: "√",
   cross: "×",
   running: "*",
+  folded: "...",
   groupTop: ",-",
   groupMid: "|-",
   groupBottom: "`-",
@@ -163,6 +195,16 @@ export interface WorkflowCardInput {
   meta?: WorkflowMeta;
   /** Agents the runtime has scheduled, which can exceed those that have reported. */
   agentCount?: number;
+  /**
+   * The task's `progressVersion`.
+   *
+   * Enables the derived-view cache in `progress.ts`: the card is laid out again
+   * on every render, and re-walking a loop's whole log per render is the cost
+   * that turns a weeks-long run into a permanent tax on the transcript.
+   */
+  version?: number;
+  /** Rounds pruned from memory by the task, which the fold has to include. */
+  archived?: ArchivedRounds;
   /** Total tokens for the size warning; summed from the entries when omitted. */
   totalTokens?: number;
   agentCap?: number;
@@ -303,11 +345,31 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   const width = Math.max(1, input.width ?? DEFAULT_WIDTH);
   const now = input.now ?? Date.now();
 
-  const tree = buildPhaseTree(input.progress, input.meta?.phases);
+  const summaries = roundSummaries(input.progress, input.version);
+  // The round in flight, and the only one drawn in full. `undefined` for a run
+  // that has not looped, which keeps every surface's single-round shape.
+  const liveRound = summaries.length > 1 ? summaries[summaries.length - 1]?.index : undefined;
+  const earlier = earlierRounds(summaries, input.archived);
+  const tree = buildPhaseTree(input.progress, input.meta?.phases, {
+    ...(liveRound !== undefined ? { round: liveRound } : {}),
+    ...(input.version !== undefined ? { version: input.version } : {}),
+  });
   const nodes = flattenPhaseTree(tree);
   const { agents, logs } = collapse(input.progress);
   const totals = stats(input.progress, input.agentCount ?? 0);
-  const head = header(input.task, input.meta, tree, input.agentCount ?? 0, now);
+  const head = header(input.task, input.meta, tree, input.agentCount ?? 0, now, summaries, input.archived);
+
+  // The live round can itself be a huge fan-out, so the rows are budgeted. The
+  // oldest settled rows go first; live ones are never dropped.
+  const drawnAgents = nodes.flatMap(node => node.agents);
+  const hiddenAgents = new Set<number>();
+  if (drawnAgents.length > CARD_AGENT_ROW_BUDGET) {
+    const isLiveRow = (agent: WorkflowAgentEntry) => agent.state === "start" || agent.state === "progress";
+    const liveRows = drawnAgents.filter(isLiveRow).length;
+    const settledRows = drawnAgents.filter(agent => !isLiveRow(agent)).sort((a, b) => a.index - b.index);
+    const room = Math.max(0, CARD_AGENT_ROW_BUDGET - liveRows);
+    for (const agent of settledRows.slice(0, Math.max(0, settledRows.length - room))) hiddenAgents.add(agent.index);
+  }
 
   const lines: WorkflowCardLine[] = [];
 
@@ -329,6 +391,19 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   lines.push([...clampedLeft, { text: " ".repeat(gap) }, { text: head.stats, color: "dim" }]);
 
   if (head.subtext) lines.push(clampLine([{ text: `  ${head.subtext}`, color: "dim" }], width));
+
+  // ---- Every round before the live one, as one line ----
+  // A loop's history has no end, so it can only be a summary. Drawn above the
+  // tree because that is where it sits in time: the reader sees what has been
+  // done, then what is happening.
+  if (earlier !== undefined) {
+    const span = earlier.from === earlier.to ? `round ${earlier.from}` : `rounds ${earlier.from}–${earlier.to}`;
+    const parts = [span, `${formatCompactTokens(earlier.agents)} agent${earlier.agents === 1 ? "" : "s"}`];
+    if (earlier.failed > 0) parts.push(`${earlier.failed} failed`);
+    if (earlier.tokens > 0) parts.push(`${formatCompactTokens(earlier.tokens)} tok`);
+    if (earlier.durationMs > 0) parts.push(formatDuration(earlier.durationMs));
+    lines.push(clampLine([{ text: `  ${glyphs.folded} ${parts.join(" · ")}`, color: "dim" }], width));
+  }
 
   // ---- Phase tree ----
   // Stats line up in one column across the whole card, not per group, so the
@@ -378,8 +453,9 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
     );
 
     const rail = lastGroup ? "  " : `${glyphs.vertical} `;
-    node.agents.forEach((entry, agentIndex) => {
-      const lastAgent = agentIndex === node.agents.length - 1;
+    const visibleAgents = node.agents.filter(agent => !hiddenAgents.has(agent.index));
+    visibleAgents.forEach((entry, agentIndex) => {
+      const lastAgent = agentIndex === visibleAgents.length - 1;
       const segments: WorkflowCardLine = [
         { text: "  " },
         { text: rail, color: "dim" },
@@ -404,8 +480,30 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
     });
   });
 
+  // ---- Rows the budget folded away ----
+  if (hiddenAgents.size > 0) {
+    const noun = hiddenAgents.size === 1 ? "agent" : "agents";
+    lines.push(
+      clampLine(
+        [
+          { text: `  ${glyphs.folded} ${hiddenAgents.size} earlier ${noun} · `, color: "dim" },
+          { text: "/agents → Workflows", color: "dim" },
+        ],
+        width,
+      ),
+    );
+  }
+
   // ---- log() output, below the tree ----
-  for (const message of logs) {
+  // A looping run's log is unbounded, so only its tail is drawn and the count of
+  // the rest is named rather than the lines being silently cut.
+  const logTail = earlier === undefined ? logs : logs.slice(-CARD_LOG_LINES);
+  const droppedLogs = logs.length - logTail.length;
+  if (droppedLogs > 0) {
+    const noun = droppedLogs === 1 ? "message" : "messages";
+    lines.push(clampLine([{ text: `  ${glyphs.folded} ${droppedLogs} earlier ${noun}`, color: "dim" }], width));
+  }
+  for (const message of logTail) {
     const [first, ...rest] = message.split("\n");
     lines.push(clampLine([{ text: `  ${glyphs.log}  ${first}`, color: "dim" }], width));
     for (const continuation of rest) {
@@ -414,18 +512,25 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   }
 
   // ---- Size warning ----
-  const totalTokens =
-    input.totalTokens ?? agents.reduce((sum, entry) => sum + (entry.tokens ?? 0), 0);
+  // Measured per round once a run loops: the run's own total is unbounded by
+  // design, so a warning against it would fire from the first hour and stay on
+  // forever, which is how a warning becomes wallpaper.
+  const scopedAgents = liveRound === undefined ? agents : agents.filter(agent => roundOf(agent) === liveRound);
+  const scopedTokens = scopedAgents.reduce((sum, entry) => sum + (entry.tokens ?? 0), 0);
   const warning = sizeWarning({
-    scheduledAgents: Math.max(input.agentCount ?? 0, totals.total),
-    startedAgents: totals.started,
-    totalTokens,
+    scheduledAgents:
+      liveRound === undefined ? Math.max(input.agentCount ?? 0, totals.total) : Math.max(scopedAgents.length, 1),
+    startedAgents: scopedAgents.filter(
+      entry => entry.state === "done" || entry.state === "error" || entry.startedAt !== undefined,
+    ).length,
+    totalTokens: liveRound === undefined ? (input.totalTokens ?? scopedTokens) : scopedTokens,
     agentCap: input.agentCap,
     tokenCap: input.tokenCap,
   });
   if (warning) {
+    const subject = liveRound === undefined ? "Large workflow" : "Large round";
     lines.push(
-      clampLine([{ text: `  ${glyphs.warning} Large workflow · /agents → Workflows to stop`, color: "warning" }], width),
+      clampLine([{ text: `  ${glyphs.warning} ${subject} · /agents → Workflows to stop`, color: "warning" }], width),
     );
   }
 
@@ -480,6 +585,8 @@ export function renderWorkflowEntryCard(data: WorkflowEntryData | undefined, the
       meta: data.meta,
       agentCount: data.agentCount,
       totalTokens: data.totalTokens,
+      version: data.version,
+      ...(data.archived !== undefined ? { archived: data.archived } : {}),
       showToolTitle: true,
     },
     theme,

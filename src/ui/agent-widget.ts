@@ -9,6 +9,7 @@
 
 import { renderAgentName } from "../agent-color.js";
 import { getConfig } from "../agent-types.js";
+import { formatSpan } from "../duration.js";
 import type { AgentInvocation, EffectiveThinkingLevel, SubagentType } from "../types.js";
 import { getLifetimeCost, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
@@ -182,9 +183,16 @@ export function formatTurns(turnCount: number, maxTurns?: number | null): string
   return maxTurns != null ? `↻${turnCount}≤${maxTurns}` : `↻${turnCount}`;
 }
 
-/** Format milliseconds as human-readable duration. */
+/**
+ * Format milliseconds as human-readable duration.
+ *
+ * One decimal of a second while it is still seconds (`4.1s`), then the shared
+ * ladder in `duration.ts` — `1m12s`, `7h04m`, `3d04h`. An agent left running for
+ * an hour used to read `3600.0s`, which is a number that stops being legible
+ * exactly when you need it.
+ */
 export function formatMs(ms: number): string {
-  return `${(ms / 1000).toFixed(1)}s`;
+  return formatSpan(ms, "tenths");
 }
 
 /** Format duration from start/completed timestamps. */

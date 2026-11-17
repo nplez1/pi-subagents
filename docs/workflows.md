@@ -293,14 +293,13 @@ The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only
 | Limit | Value |
 |---|---|
 | Agents running at once | `max(1, min(16, cpus - 2))` — 6 on an 8-core machine |
-| Agents per run, total | 1000 |
 | Items per `parallel`/`pipeline` **call** | 4096 |
-| Nested `workflow()` calls per run | 256 |
+| Nested `workflow()` calls per run | 10,000 |
 | Script length | 512 KiB |
 
-These are three different things and are easy to conflate: 1000 is a budget for the whole run, the concurrency figure is how many run *simultaneously*, and 4096 is per call rather than per run. Excess items queue rather than melting the machine.
+These are three different things and are easy to conflate: the concurrency figure is how many run *simultaneously*, 4096 is per call rather than per run, and there is deliberately **no cap on the total number of agents a run may schedule**. There used to be one — 1000, billed as a runaway-loop backstop — and it was the wrong axis: a loop that is meant to run for days passes 1000 within a couple of hours, so the ceiling killed healthy work. A script bug that fans out in a tight `while` is still visible: the per-round warning below fires within seconds, and `x stop` in the inspector is the control. A host embedding the runtime can still pass `agentCap` for a boundary of its own.
 
-Above 25 scheduled agents, or 1.5M tokens actual or projected, the card adds `⚠ Large workflow · /agents → Workflows to stop`.
+Above 25 agents in the round in flight, or 1.5M tokens for that round, actual or projected, the card adds `⚠ Large round · /agents → Workflows to stop`. Measured per round rather than per run, because a loop's run total is unbounded by design — a warning against it would switch on in the first hour and never go off.
 
 A run's concurrency limit is its own, independent of the session's `maxConcurrent` and `maxConcurrentForeground` pools — its agents do not enter either.
 
@@ -359,6 +358,42 @@ See [`review-panel.js`](../examples/workflows/review-panel.js).
 > *"map the repo first, then run the audit against what it found"*
 
 Recognize it by `await workflow('repo-map', { … })`. Reach for it to reuse something already saved, not to structure one script — inline composition is cheaper.
+
+## Loops, rounds and long runs
+
+A workflow may loop for as long as its work takes — hours, days, weeks. The runtime reads the loop off the script's own `phase()` sequence and reports it as **rounds**: re-entering a phase it has already passed, or re-entering the same phase after work ran under it, means the loop went round again. Nothing has to be declared:
+
+```js
+while (n < MAX_ITEMS && !stopped) {
+  phase('Wait');   await agent(…)   // round 1
+  phase('Sync');   await agent(…)   //   … same round
+  phase('Run');    await agent(…)   //
+  phase('Triage'); await agent(…)   // then back to 'Wait' → round 2
+}
+```
+
+What that buys is a number that can finish. `3/7 agents` is a progress bar only while the total is a plan; over a loop the total is whatever the loop has reached, so it reads as `47/85` and then `48/86` and never arrives. A looping run is reported by its round instead:
+
+```
+▸ ps-drive-tester                   round 7 · 2/4 · 47 settled · 6h12m · 3.1M tok
+  ⋯ rounds 1–6 · 41 agents · 1 failed · 2.6M tok · 5h58m
+  ╭─ Wait                                                  3/3
+  │ ├─ ✔ claim PSQ-118
+  │ └─ ✔ claim PSQ-121
+  ╰─ Sync                                                  1/2
+```
+
+Three things follow from that shape, all of them about a run that does not end:
+
+- **The card draws the round in flight and folds the rest.** One line stands in for every round behind it, so the card's height depends on the round, not on the run.
+- **The inspector steps through rounds.** `[` and `]` in `/agents → Workflows` walk them — over the rounds that exist, so a pass that launched nothing costs no keypress — the header keeps reporting the live round while the body shows a past one, and a past round says so in the title. Returning to the live round resumes following it.
+- **Memory is bounded by design.** Each agent's row is rewritten in place instead of appended four times; once the run holds 10,000 settled rows the oldest rounds collapse to counts, and log lines are capped at their tail. The row, the tokens and the `recordId` (`c` opens a child's conversation) stay for everything still held, and nothing on the run's counters is lost — the header and the fleet row keep counting agents whose rows have been pruned.
+
+A corollary worth knowing when you write the script: **a `phase()` inside `parallel()` or `pipeline()` is per-item work, not a pass.** Three thunks each naming a phase are one round over three items, so round inference is suppressed inside a fan-out and the phase is noted once when it finishes. The boundary you get is the loop *around* the fan-out, which is the only place a pass can really begin. A loop that calls no `phase()` at all has no boundary to find; its detail rows are still pruned at the bound above, it just stays one round.
+
+Durations climb the same ladder everywhere — `9s`, `1m12s`, `6h12m`, `3d04h`, `2w3d` — so a run measured in weeks does not read as a seven-digit number of seconds.
+
+> **Note on disk.** The progress log stays small, but every child still writes its own pi session and output transcript: a week-long loop at a few hundred agents an hour is tens of gigabytes under `~/.pi/agent/sessions/<cwd>/`. `outputTranscript: false` and `persist_session` govern the transcript and the session respectively; clearing that directory is safe once a run's conversations are no longer needed.
 
 See [`compose.js`](../examples/workflows/compose.js).
 

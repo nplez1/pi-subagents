@@ -14,7 +14,7 @@
  */
 
 import type { WorkflowMeta } from "./meta.js";
-import type { WorkflowEntry, WorkflowRunStatus } from "./progress.js";
+import type { ArchivedRounds, WorkflowEntry, WorkflowRunStatus } from "./progress.js";
 import type { WorkflowTask } from "./task.js";
 
 /** `customType` of the session entry a flag-launched workflow renders through. */
@@ -29,6 +29,15 @@ export interface WorkflowEntryData {
   progress: WorkflowEntry[];
   agentCount: number;
   totalTokens: number;
+  /**
+   * The run's progress version at the moment of the snapshot.
+   *
+   * Kept so a reloaded card can use the same derived-view cache a live one does;
+   * without it every render of a long run's entry re-walks its whole log.
+   */
+  version?: number;
+  /** Rounds the task pruned from memory while the run was live. */
+  archived?: ArchivedRounds;
   meta?: WorkflowMeta;
 }
 
@@ -42,6 +51,8 @@ export function workflowEntryData(task: WorkflowTask): WorkflowEntryData {
     progress: task.workflowProgress,
     agentCount: task.agentCount,
     totalTokens: task.totalTokens,
+    version: task.progressVersion,
+    ...(task.archived.rounds > 0 ? { archived: task.archived } : {}),
     ...(task.meta !== undefined ? { meta: task.meta } : {}),
   };
 }

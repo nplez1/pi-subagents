@@ -58,14 +58,19 @@ import {
 } from "@earendil-works/pi-tui";
 import type { WorkflowMeta } from "../workflow/meta.js";
 import {
+  type ArchivedRounds,
   buildPhaseTree,
   displayState,
+  earlierRounds,
   flattenPhaseTree,
   formatDuration,
   header,
   isLive,
   type PhaseNode,
   type PhaseTree,
+  type EarlierRounds,
+  type RoundSummary,
+  roundSummaries,
   type WorkflowAgentEntry,
   type WorkflowDisplayState,
   type WorkflowEntry,
@@ -138,6 +143,8 @@ export interface WorkflowDialogGlyphs {
   };
   /** Trailing marker on a title the pane was too narrow to hold. */
   ellipsis: string;
+  /** History folded into one row: the rounds before the one being drawn. */
+  folded: string;
   /** How the footer names the arrow keys and Enter. */
   upDown: string;
   enter: string;
@@ -161,6 +168,7 @@ export const UNICODE_DIALOG_GLYPHS: WorkflowDialogGlyphs = {
     bottomTee: "┴",
   },
   ellipsis: "…",
+  folded: UNICODE_GLYPHS.folded,
   upDown: "↑↓",
   enter: "⏎",
 };
@@ -184,6 +192,7 @@ export const ASCII_DIALOG_GLYPHS: WorkflowDialogGlyphs = {
     bottomTee: "+",
   },
   ellipsis: "~",
+  folded: ASCII_GLYPHS.folded,
   upDown: "up/down",
   enter: "enter",
 };
@@ -279,6 +288,13 @@ export interface WorkflowDialogState {
    * finished twenty minutes ago.
    */
   expanded?: number;
+  /**
+   * Round the tree is drawn for, `undefined` to follow the live one.
+   *
+   * Same trick as {@link expanded}: stored as a number only once the reader has
+   * actually stepped, so a run that keeps looping stays where the work is.
+   */
+  round?: number;
   level: WorkflowDialogLevel;
   filter: WorkflowDialogFilter;
   promptExpanded: boolean;
@@ -295,6 +311,16 @@ export interface WorkflowDialogSource {
   meta?: WorkflowMeta;
   /** Agents the runtime has scheduled, which can exceed those that reported. */
   agentCount?: number;
+  /**
+   * The task's `progressVersion`.
+   *
+   * The dialog re-renders at the spinner cadence, so without this every frame
+   * would re-walk a looping run's entire log — the one surface where that cost is
+   * paid twelve times a second for as long as the run lives.
+   */
+  version?: number;
+  /** Rounds the task pruned from memory, so the fold can still count them. */
+  archived?: ArchivedRounds;
 }
 
 export interface WorkflowDialogInput extends WorkflowDialogSource {
@@ -354,6 +380,21 @@ export type WorkflowTreeRow =
 
 export interface ResolvedWorkflowDialog {
   tree: PhaseTree;
+  /**
+   * The tree of the round in flight.
+   *
+   * Distinct from {@link tree} while the reader is looking at a past round: the
+   * header keeps reporting the run's live numbers, and only the body travels.
+   */
+  liveTree: PhaseTree;
+  /** One summary per round still held in memory, oldest first. */
+  rounds: RoundSummary[];
+  /** The round in flight, or `undefined` until the run has looped. */
+  liveRound: number | undefined;
+  /** The round being drawn. `undefined` when the run has one round. */
+  shownRound: number | undefined;
+  /** Everything before the drawn round, folded into one line. */
+  earlier: EarlierRounds | undefined;
   /** Rows to draw, in reading order. */
   rows: WorkflowTreeRow[];
   clampedRow: number;
@@ -385,6 +426,20 @@ function subtreeAgents(node: PhaseNode): WorkflowAgentEntry[] {
 }
 
 /**
+ * The round the body draws.
+ *
+ * `undefined` follows the live round; a stored number is clamped into the rounds
+ * still held, because a pruned round can disappear underneath a reader who
+ * stepped back and then let the dialog sit.
+ */
+function shownRoundOf(state: WorkflowDialogState, rounds: readonly RoundSummary[]): number | undefined {
+  const live = rounds.length > 1 ? rounds[rounds.length - 1]?.index : undefined;
+  if (live === undefined || state.round === undefined) return live;
+  const first = rounds[0]?.index ?? live;
+  return Math.min(Math.max(state.round, first), live);
+}
+
+/**
  * Settle the view against the data actually present.
  *
  * Selection is stored raw and clamped on read, so a phase finishing (and rows
@@ -392,7 +447,23 @@ function subtreeAgents(node: PhaseNode): WorkflowAgentEntry[] {
  * same trick `fleet-list.ts` plays, minus the mutation.
  */
 export function resolveWorkflowDialog(input: WorkflowDialogInput): ResolvedWorkflowDialog {
-  const tree = buildPhaseTree(input.progress, input.meta?.phases);
+  const rounds = roundSummaries(input.progress, input.version);
+  const liveRound = rounds.length > 1 ? rounds[rounds.length - 1]?.index : undefined;
+  const shownRound = shownRoundOf(input.state, rounds);
+  const tree = buildPhaseTree(input.progress, input.meta?.phases, {
+    ...(shownRound !== undefined ? { round: shownRound } : {}),
+    ...(input.version !== undefined ? { version: input.version } : {}),
+  });
+  // The header reports the run, not the body: stepping back through history must
+  // not make a live loop look finished. The live tree is the same object unless
+  // the reader is on a past round, and it is cached per version either way.
+  const liveTree =
+    liveRound === undefined || shownRound === liveRound ? tree
+    : buildPhaseTree(input.progress, input.meta?.phases, {
+        round: liveRound,
+        ...(input.version !== undefined ? { version: input.version } : {}),
+      });
+  const earlier = earlierRounds(rounds, input.archived, shownRound);
   const workflowActive = input.task.status === "running" || input.task.status === "paused";
   const flat = flattenPhaseTree(tree);
 
@@ -440,6 +511,11 @@ export function resolveWorkflowDialog(input: WorkflowDialogInput): ResolvedWorkf
 
   return {
     tree,
+    liveTree,
+    rounds,
+    liveRound,
+    shownRound,
+    earlier,
     rows,
     clampedRow,
     expandedIndex,
@@ -784,7 +860,7 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   const lines: WorkflowCardLine[] = [];
 
   // ---- Header: the run's name, then its description with the stats flush right.
-  const head = header(input.task, input.meta, view.tree, input.agentCount ?? 0, now);
+  const head = header(input.task, input.meta, view.liveTree, input.agentCount ?? 0, now, view.rounds, input.archived);
   lines.push(clampLine([{ text: " " }, { text: head.name, color: "toolTitle", bold: true }], width));
   lines.push(
     rightAlign(
@@ -802,6 +878,19 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
 
   // ---- The tree: one row per phase, in the order its work started.
   const treeRows: WorkflowCardLine[] = [];
+  // The rounds behind the live one, as one row above the tree. Deliberately not
+  // selectable: `[` and `]` walk them, and a row the cursor can land on but do
+  // nothing with is worse than a label. Including the counts is what makes a
+  // pruned history honest rather than a silently short list.
+  if (view.earlier !== undefined) {
+    const span =
+      view.earlier.from === view.earlier.to ? `round ${view.earlier.from}` : `rounds ${view.earlier.from}–${view.earlier.to}`;
+    const parts = [span, `${formatCompactTokens(view.earlier.agents)} agent${view.earlier.agents === 1 ? "" : "s"}`];
+    if (view.earlier.failed > 0) parts.push(`${view.earlier.failed} failed`);
+    if (view.earlier.tokens > 0) parts.push(`${formatCompactTokens(view.earlier.tokens)} tok`);
+    if (view.earlier.durationMs > 0) parts.push(formatDuration(view.earlier.durationMs));
+    treeRows.push(clampLine([{ text: ` ${glyphs.folded} ${parts.join(" · ")}`, color: "dim" }], contentWidth));
+  }
   const rows = windowRange(view.clampedRow, view.rows.length, capacity);
   for (let i = rows.start; i < Math.min(rows.end, view.rows.length); i++) {
     const row = view.rows[i];
@@ -930,8 +1019,16 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
         state.filter === "all" ? `${shown} agent${shown === 1 ? "" : "s"}` : `${shown} ${state.filter}`
       }`
     : undefined;
+  // `round N` belongs in the title because it answers the question the phase
+  // list cannot: which pass am I looking at. A past round says so, since the
+  // header is still reporting the live one. Appended to whichever title wins so
+  // an expanded phase does not hide the round it belongs to.
+  const roundSuffix =
+    view.shownRound === undefined ? ""
+    : view.shownRound === view.liveRound ? ` · round ${view.shownRound}`
+    : ` · round ${view.shownRound} past`;
   const title =
-    inTree ? (expandedTitle ?? "Phases")
+    inTree ? `${expandedTitle ?? "Phases"}${roundSuffix}`
     : (entry?.label ?? WORKFLOW_DIALOG_COPY.noAgents);
   const bodyRows = inTree ? treeRows : detailRows;
   lines.push(
@@ -966,6 +1063,9 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
     } else if (entry?.recordId !== undefined && can("onOpenAgent")) {
       hints.push(`${glyphs.enter} convo`);
     }
+    // Round navigation, advertised only once the run has looped: on a
+    // single-round run the keys do nothing, so the footer does not offer them.
+    if (view.liveRound !== undefined) hints.push("[ ] round");
     hints.push("f filter");
   } else {
     hints.push(`${glyphs.upDown} agent`);
@@ -1040,6 +1140,27 @@ export function handleWorkflowDialogKey(
   const descend = matchesKey(data, "enter") || matchesKey(data, "right");
   if (matchesKey(data, "e") && state.level === "agent") {
     return { state: { ...state, promptExpanded: !state.promptExpanded } };
+  }
+
+  // Rounds: `[` and `]` step the tree through the loop's passes. Only the body
+  // moves — the header keeps reporting the live round, so stepping back cannot
+  // make a running loop look finished. The phase expansion is cleared because
+  // the phase indices belong to the round that was drawn.
+  if (state.level === "tree" && (matchesKey(data, "[") || matchesKey(data, "]"))) {
+    const live = view.liveRound;
+    if (live === undefined) return undefined;
+    // Stepped over the rounds that exist, not over the numbers: a pass that
+    // launched no agents has no summary, and walking through empty trees would
+    // cost a keypress per skipped iteration on a long-running loop.
+    const indices = view.rounds.map(round => round.index);
+    const current = view.shownRound ?? live;
+    const at = indices.indexOf(current);
+    const target = Math.max(0, Math.min(indices.length - 1, at + (matchesKey(data, "]") ? 1 : -1)));
+    const next = indices[target];
+    if (next === undefined || next === current) return { state };
+    // Back on the live round: store "follow", not the number. Pinned to a number,
+    // the reader would stop following as soon as the loop went round again.
+    return { state: { ...state, round: next === live ? undefined : next, expanded: undefined, selectedRow: 0 } };
   }
 
   // Enter does what the row under the cursor can do: a phase opens its agents

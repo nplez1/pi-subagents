@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
 	buildPhaseTree,
+	earlierRounds,
 	flattenPhaseTree,
+	header,
+	roundSummaries,
 	stats,
 	type WorkflowAgentEntry,
 	type WorkflowEntry,
@@ -165,5 +168,138 @@ describe("buildPhaseTree", () => {
 		expect(tree.nodes).toHaveLength(1);
 		expect(tree.nodes[0].title).toBe("Agents");
 		expect(tree.nodes[0].total).toBe(2);
+	});
+});
+
+describe("rounds", () => {
+	it("folds agents into one summary per round", () => {
+		const log: WorkflowEntry[] = [
+			...agentRows(0, { roundIndex: 1, tokens: 100 }),
+			...agentRows(1, { roundIndex: 1, tokens: 100 }),
+			...agentRows(2, { roundIndex: 3, tokens: 7 }),
+		];
+		const rounds = roundSummaries(log);
+		expect(rounds.map(r => r.index)).toEqual([1, 3]);
+		expect(rounds[0]).toMatchObject({ agents: 2, settled: 2, failed: 0, tokens: 200 });
+		expect(rounds[1]).toMatchObject({ agents: 1, settled: 1, tokens: 7 });
+	});
+
+	it("treats an agent logged before rounds existed as round one", () => {
+		// A session entry written by an older build has no `roundIndex` at all, and
+		// one round is what it was.
+		expect(roundSummaries([done(0, 0, 10)]).map(r => r.index)).toEqual([1]);
+	});
+
+	it("marks a round with a failure as failed", () => {
+		const log: WorkflowEntry[] = [
+			{ type: "workflow_agent", index: 0, roundIndex: 2, label: "a", state: "error", startedAt: 5, durationMs: 1 },
+		];
+		expect(roundSummaries(log)[0]).toMatchObject({ failed: 1, settled: 1, status: "failed" });
+	});
+
+	it("draws one round's phases when asked for a round", () => {
+		const log: WorkflowEntry[] = [
+			{ type: "workflow_phase", index: 0, title: "Wait" },
+			{ type: "workflow_phase", index: 1, title: "Run" },
+			done(0, 0, 10, { roundIndex: 1 }),
+			done(1, 1, 11, { roundIndex: 2 }),
+			done(2, 1, 12, { roundIndex: 2 }),
+		];
+		const whole = buildPhaseTree(log);
+		expect(whole.totals.total).toBe(3);
+		const second = buildPhaseTree(log, undefined, { round: 2 });
+		expect(flattenPhaseTree(second).map(node => node.title)).toEqual(["Run"]);
+		expect(second.totals.total).toBe(2);
+	});
+
+	it("drops `phases to go` for a round that has settled", () => {
+		// A past round is behind, whatever `meta` declared: "2 phases to go" beside
+		// it would read as work still owed.
+		const log: WorkflowEntry[] = [
+			{ type: "workflow_phase", index: 0, title: "Wait" },
+			done(0, 0, 10, { roundIndex: 1 }),
+			done(1, 0, 11, { roundIndex: 2 }),
+		];
+		const declared = [{ title: "Wait" }, { title: "Run" }];
+		expect(buildPhaseTree(log, declared).remaining).toEqual(["Run"]);
+		expect(buildPhaseTree(log, declared, { round: 1 }).remaining).toEqual([]);
+	});
+
+	it("caches the derived tree until the version moves", () => {
+		// The inspector redraws at 80 ms; a loop's log is the largest thing in the
+		// session, so the walk has to be once per batch rather than once per frame.
+		const log: WorkflowEntry[] = [done(0, 0, 10, { roundIndex: 1 })];
+		const first = buildPhaseTree(log, undefined, { round: 1, version: 1 });
+		log.push(done(1, 0, 11, { roundIndex: 1 }));
+		expect(buildPhaseTree(log, undefined, { round: 1, version: 1 })).toBe(first);
+		expect(buildPhaseTree(log, undefined, { round: 1, version: 2 })).not.toBe(first);
+	});
+});
+
+describe("header", () => {
+	const task = { status: "running" as const, startTime: 0 };
+	const meta = { name: "ps-drive-tester", description: "triage" };
+
+	it("leads with the round when a run has looped", () => {
+		const log: WorkflowEntry[] = [
+			{ type: "workflow_phase", index: 0, title: "Wait" },
+			...agentRows(0, { roundIndex: 1 }),
+			...agentRows(1, { roundIndex: 2 }),
+		];
+		const rounds = roundSummaries(log);
+		const stats = header(task, meta, buildPhaseTree(log, undefined, { round: 2 }), 2, 60_000, rounds).stats;
+		expect(stats).toContain("round 2");
+		// The round's own fraction can finish; the run's total cannot.
+		expect(stats).toContain("1/1");
+		expect(stats).toContain("2 settled");
+	});
+
+	it("adds the pruned rounds back into the run's totals", () => {
+		// The counters a prune leaves behind live in `archived`; without them the
+		// header's settled count would fall every time memory was reclaimed.
+		const log: WorkflowEntry[] = [...agentRows(0, { roundIndex: 5 }), ...agentRows(1, { roundIndex: 6 })];
+		const rounds = roundSummaries(log);
+		const archived = { rounds: 4, through: 4, agents: 100, settled: 100, failed: 2, tokens: 900_000, durationMs: 5 };
+		const stats = header(task, meta, buildPhaseTree(log, undefined, { round: 6 }), 2, 60_000, rounds, archived)
+			.stats;
+		expect(stats).toContain("102 settled");
+		expect(stats).toContain("2 failed");
+		expect(stats).toContain("900.0k tok");
+	});
+
+	it("keeps the single-round header a run has always had", () => {
+		const log = agentRows(0);
+		const rounds = roundSummaries(log);
+		const stats = header(task, meta, buildPhaseTree(log), 1, 60_000, rounds).stats;
+		expect(stats).toMatch(/^1\/1 agent · 1m00s/);
+	});
+});
+
+describe("earlierRounds", () => {
+	it("folds the rounds behind the live one", () => {
+		const log: WorkflowEntry[] = [
+			...agentRows(0, { roundIndex: 1, tokens: 10 }),
+			...agentRows(1, { roundIndex: 2, tokens: 20 }),
+			...agentRows(2, { roundIndex: 3, tokens: 40 }),
+		];
+		const fold = earlierRounds(roundSummaries(log));
+		expect(fold).toMatchObject({ from: 1, to: 2, rounds: 2, agents: 2, tokens: 30 });
+	});
+
+	it("includes rounds pruned from memory", () => {
+		const log: WorkflowEntry[] = [...agentRows(0, { roundIndex: 5 }), ...agentRows(1, { roundIndex: 6 })];
+		const archived = { rounds: 4, through: 4, agents: 100, settled: 100, failed: 3, tokens: 900, durationMs: 5 };
+		expect(earlierRounds(roundSummaries(log), archived)).toMatchObject({
+			from: 1,
+			to: 5,
+			rounds: 5,
+			agents: 101,
+			failed: 3,
+			tokens: 900,
+		});
+	});
+
+	it("has nothing to fold before a run has looped", () => {
+		expect(earlierRounds(roundSummaries(agentRows(0)))).toBeUndefined();
 	});
 });

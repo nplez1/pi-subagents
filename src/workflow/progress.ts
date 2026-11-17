@@ -20,6 +20,7 @@
  * unit-testable without a terminal.
  */
 
+import { formatSpan } from "../duration.js";
 import type { WorkflowMeta, WorkflowPhaseMeta } from "./meta.js";
 
 /** Raw entry lifecycle, as written by the runtime. */
@@ -69,6 +70,16 @@ export interface WorkflowAgentEntry {
    */
   phaseIndex?: number;
   phaseTitle?: string;
+  /**
+   * Which loop pass spawned it, 1-based.
+   *
+   * The worker infers this from the script's own `phase()` sequence — a revisit
+   * of a phase it already passed means the loop went round again — so a run of
+   * `while (…) { phase('Wait'); …; phase('Report') }` reports round 7 instead of
+   * a single agent total that climbs until the cap. Absent on entries written
+   * before rounds existed, which is one round — hence {@link roundOf}.
+   */
+  roundIndex?: number;
   state: WorkflowEntryState;
   agentId?: string;
   /**
@@ -240,6 +251,218 @@ export function collapse(progress: readonly WorkflowEntry[]): CollapsedProgress 
   };
 }
 
+/* ------------------------------------------------------------------------- *
+ * Rounds
+ * ------------------------------------------------------------------------- */
+
+/** The round every agent belongs to before a loop has gone round again. */
+export const FIRST_ROUND = 1;
+
+/**
+ * The round an agent belongs to.
+ *
+ * `?? FIRST_ROUND` rather than a migration: an entry logged before rounds
+ * existed, or restored from a session entry an older build wrote, belongs to
+ * the run's one and only round.
+ */
+export function roundOf(entry: WorkflowAgentEntry): number {
+  return entry.roundIndex ?? FIRST_ROUND;
+}
+
+/**
+ * One loop pass, rolled up — everything needed to fold it away.
+ *
+ * A looping run is unbounded, so no surface can keep drawing a row per agent:
+ * the round is the unit that both settles (so it can be collapsed) and carries
+ * the numbers worth reading (what this pass cost, whether it finished).
+ */
+export interface RoundSummary {
+  /** 1-based, as the worker counted it. */
+  index: number;
+  /** Agents this round launched. */
+  agents: number;
+  /** Done plus failed — everything that produced an outcome. */
+  settled: number;
+  failed: number;
+  /** Still expected to report: running plus queued. */
+  live: number;
+  queued: number;
+  tokens: number;
+  /** Wall-clock across the round's activity, not the sum of its agents. */
+  durationMs: number;
+  /** Earliest start and latest activity. Absent when nothing ran. */
+  firstAt?: number;
+  lastAt?: number;
+  status: PhaseNodeStatus;
+}
+
+/**
+ * Rounds whose agent rows have been pruned from memory.
+ *
+ * A loop left running for weeks makes the progress log the largest thing in the
+ * session and there is no bound on how many rounds it will produce, so the task
+ * keeps full rows for the newest rounds and collapses everything older into
+ * this: counts, not rows. Nothing is lost that the card or the inspector draws —
+ * an old round is a line either way — and the footprint stops growing with the
+ * run.
+ */
+export interface ArchivedRounds {
+  /** How many rounds were pruned. */
+  rounds: number;
+  /** Highest pruned round index, so a fold can read `rounds 1–40`. */
+  through: number;
+  agents: number;
+  settled: number;
+  failed: number;
+  tokens: number;
+  /** Summed across the pruned rounds, which ran one after another. */
+  durationMs: number;
+}
+
+/** Everything folded away above the live round, whether pruned or merely old. */
+export interface EarlierRounds {
+  /** First and last round in the fold. */
+  from: number;
+  to: number;
+  /** Total rounds in the fold, which is `to - from + 1` once nothing is missing. */
+  rounds: number;
+  agents: number;
+  settled: number;
+  failed: number;
+  tokens: number;
+  durationMs: number;
+}
+
+/**
+ * The single line that stands in for every round before the one in flight.
+ *
+ * Shared so the card and the inspector fold identically — the same numbers in
+ * the same order, whether the history is rows still held or rows already pruned.
+ * `undefined` until a run has looped: a single-round run has nothing behind it.
+ */
+export function earlierRounds(
+  summaries: readonly RoundSummary[],
+  archived?: ArchivedRounds,
+  /**
+   * Fold only the rounds before this one.
+   *
+   * Defaults to the live round, which is what the card wants. The inspector
+   * passes the round it is drawing, so a past round's fold does not claim the
+   * round right below it.
+   */
+  before?: number,
+): EarlierRounds | undefined {
+  const cutoff = before ?? summaries[summaries.length - 1]?.index;
+  const older = summaries.filter(round => cutoff === undefined || round.index < cutoff);
+  if (archived === undefined && older.length === 0) return undefined;
+
+  const totals = older.reduce(
+    (acc, round) => ({
+      agents: acc.agents + round.agents,
+      settled: acc.settled + round.settled,
+      failed: acc.failed + round.failed,
+      tokens: acc.tokens + round.tokens,
+      durationMs: acc.durationMs + round.durationMs,
+    }),
+    { agents: 0, settled: 0, failed: 0, tokens: 0, durationMs: 0 },
+  );
+
+  const agents = totals.agents + (archived?.agents ?? 0);
+  const rounds = older.length + (archived?.rounds ?? 0);
+  if (rounds === 0 || older.length === 0 && archived === undefined) return undefined;
+
+  // Pruned rounds are always the oldest, so the fold starts at 1 unless nothing
+  // was pruned — in which case it starts at the first round still held.
+  const first = older.at(0)?.index;
+  const last = older.at(-1)?.index;
+  const from = archived !== undefined ? 1 : (first ?? 1);
+  const to = last ?? archived?.through ?? from;
+
+  return {
+    from,
+    to,
+    rounds,
+    agents,
+    settled: totals.settled + (archived?.settled ?? 0),
+    failed: totals.failed + (archived?.failed ?? 0),
+    tokens: totals.tokens + (archived?.tokens ?? 0),
+    durationMs: totals.durationMs + (archived?.durationMs ?? 0),
+  };
+}
+
+/**
+ * Cache of the derived views, keyed on the progress array and a version counter.
+ *
+ * Every surface used to re-walk the whole log per render: the inspector at the
+ * 80 ms spinner cadence, the card on every transcript render. That was fine
+ * while a run was a handful of agents; a loop left going for weeks makes the
+ * log the largest thing in the session, and a walk per frame becomes a
+ * permanent tax — thousands of agents is tens of thousands of entry visits,
+ * twelve times a second, indefinitely. Keying on the caller's `progressVersion`
+ * (bumped once per batch) turns that into one walk per batch.
+ *
+ * `version` is optional and nothing is cached without it, so the pure functions
+ * stay pure for tests and one-shot callers.
+ */
+interface DerivedView {
+  version: number;
+  rounds?: RoundSummary[];
+  trees: Map<string, PhaseTree>;
+}
+
+const derivedViews = new WeakMap<readonly WorkflowEntry[], DerivedView>();
+
+function derivedView(progress: readonly WorkflowEntry[], version: number | undefined): DerivedView | undefined {
+  if (version === undefined) return undefined;
+  const existing = derivedViews.get(progress);
+  if (existing !== undefined && existing.version === version) return existing;
+  const fresh: DerivedView = { version, trees: new Map() };
+  derivedViews.set(progress, fresh);
+  return fresh;
+}
+
+/**
+ * Fold the log into one summary per round, oldest first.
+ *
+ * This is what replaces the climbing total: the round in flight is drawn in
+ * full and every round behind it collapses to a single line, so `3/7 agents`
+ * keeps its meaning instead of becoming `47/∞`.
+ */
+export function roundSummaries(progress: readonly WorkflowEntry[], version?: number): RoundSummary[] {
+  const view = derivedView(progress, version);
+  if (view?.rounds !== undefined) return view.rounds;
+
+  const byRound = new Map<number, WorkflowAgentEntry[]>();
+  for (const agent of collapse(progress).agents) {
+    const index = roundOf(agent);
+    const bucket = byRound.get(index);
+    if (bucket) bucket.push(agent);
+    else byRound.set(index, [agent]);
+  }
+
+  const rounds = [...byRound.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, list]): RoundSummary => {
+      const counts = rollUp(list);
+      return {
+        index,
+        agents: list.length,
+        settled: counts.done + counts.failed,
+        failed: counts.failed,
+        live: counts.live,
+        queued: counts.queued,
+        tokens: counts.tokens,
+        durationMs: counts.durationMs,
+        ...(counts.firstAt !== undefined ? { firstAt: counts.firstAt } : {}),
+        ...(counts.lastAt !== undefined ? { lastAt: counts.lastAt } : {}),
+        status: statusOf({ live: counts.live, queued: counts.queued, failed: counts.failed, total: list.length }),
+      };
+    });
+
+  if (view) view.rounds = rounds;
+  return rounds;
+}
+
 /**
  * Derive what to render for one agent.
  *
@@ -304,6 +527,8 @@ function rollUp(agents: readonly WorkflowAgentEntry[]): {
   queued: number;
   tokens: number;
   durationMs: number;
+  firstAt?: number;
+  lastAt?: number;
 } {
   let done = 0;
   let failed = 0;
@@ -333,6 +558,7 @@ function rollUp(agents: readonly WorkflowAgentEntry[]): {
     }
   }
 
+  const started = minStart < Number.POSITIVE_INFINITY;
   return {
     done,
     failed,
@@ -340,7 +566,9 @@ function rollUp(agents: readonly WorkflowAgentEntry[]): {
     queued,
     tokens,
     // Wall-clock across the phase, not the sum of its agents: they overlap.
-    durationMs: minStart < Number.POSITIVE_INFINITY ? Math.max(0, maxEnd - minStart) : 0,
+    durationMs: started ? Math.max(0, maxEnd - minStart) : 0,
+    ...(started ? { firstAt: minStart } : {}),
+    ...(started ? { lastAt: maxEnd } : {}),
   };
 }
 
@@ -393,8 +621,31 @@ const sameTitle = (a: string, b: string) => a.toLowerCase().trim() === b.toLower
 export function buildPhaseTree(
   progress: readonly WorkflowEntry[],
   declared?: readonly WorkflowPhaseMeta[],
+  options?: {
+    /**
+     * Draw one round instead of the whole run.
+     *
+     * Omitted, the tree covers every agent the run ever launched — the shape a
+     * single-round run has always had. A looping run passes its live round so
+     * the tree stops growing with the loop.
+     */
+    round?: number;
+    /** The task's `progressVersion`; enables the per-batch cache. */
+    version?: number;
+  },
 ): PhaseTree {
-  const { agents, phaseTitles, phaseParents } = collapse(progress);
+  const view = derivedView(progress, options?.version);
+  const round = options?.round;
+  // Declared titles are part of the key because they decide `remaining`. They do
+  // not change within a run; the count keeps the key from depending on the meta
+  // object's identity.
+  const cacheKey = `${round ?? "all"}|${declared?.length ?? 0}`;
+  const cached = view?.trees.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const collapsed = collapse(progress);
+  const { phaseTitles, phaseParents } = collapsed;
+  const agents = round === undefined ? collapsed.agents : collapsed.agents.filter(a => roundOf(a) === round);
 
   // Direct agents per phase. An agent that never named a phase is bucketed by
   // the index it carries (0), which is how an un-phased script reads as one
@@ -532,11 +783,20 @@ export function buildPhaseTree(
   // A declared phase counts as reached when a top-level row carries its title.
   // Nested runs declare phases of their own, but `meta.phases` describes the
   // script that was launched, so only its own rows may satisfy it.
-  const remaining = (declared ?? [])
-    .filter(phase => !top.some(current => sameTitle(current.title, phase.title)))
-    .map(phase => phase.title);
+  //
+  // A round with nothing live has nothing ahead of it by definition, whatever
+  // `meta` declared: the pass ended, and "2 phases to go" beside a settled
+  // round would read as work still owed. Only the live round can be behind.
+  const liveInScope = agents.some(a => isLive(a));
+  const remaining =
+    round !== undefined && !liveInScope ? []
+    : (declared ?? [])
+        .filter(phase => !top.some(current => sameTitle(current.title, phase.title)))
+        .map(phase => phase.title);
 
-  return { nodes: top, remaining, totals };
+  const tree: PhaseTree = { nodes: top, remaining, totals };
+  if (view) view.trees.set(cacheKey, tree);
+  return tree;
 }
 
 /**
@@ -619,18 +879,14 @@ export function elapsedMs(
 
 const plural = (n: number, word: string) => (n === 1 ? word : `${word}s`);
 
-/** `1m12s` / `9s` / `340ms`, matching how the rest of the extension reads. */
+/** `1m12s` / `9s` / `340ms` / `7h04m` / `3d04h` — the shared ladder in `duration.ts`. */
 export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
-  const totalSeconds = Math.round(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes === 0) return `${seconds}s`;
-  return `${minutes}m${seconds.toString().padStart(2, "0")}s`;
+  return formatSpan(ms, "precise");
 }
 
-/** `18.4k` / `1.2M` — bare magnitude, since the row already reads as a stat. */
+/** `18.4k` / `1.2M` / `3.4B` — bare magnitude, since the row already reads as a stat. */
 export function formatCompactTokens(count: number): string {
+  if (count >= 1_000_000_000) return `${(count / 1_000_000_000).toFixed(1)}B`;
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
   if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
   return `${count}`;
@@ -645,6 +901,15 @@ export interface WorkflowHeader {
 /**
  * The one-line summary above the tree: `3/7 agents · 1m12s`, plus a terminal
  * suffix once the run stops. Deliberately carries no phase count.
+ *
+ * A run with more than one round reports differently, because the shape of the
+ * number has to change with it. `settled/total agents` is a progress bar: it
+ * means something when the total is a plan and nothing when the total is
+ * whatever the loop has got to so far — a looping run reported `47/85` and then
+ * `48/86`, climbing until the cap. So a looping run leads with the round it is
+ * in and that round's own `settled/total`, which can reach its denominator, and
+ * carries the run's settled total beside it as a quantity rather than a
+ * fraction.
  */
 export function header(
   task: {
@@ -660,6 +925,15 @@ export function header(
   tree: PhaseTree,
   agentCount: number,
   now: number,
+  rounds: readonly RoundSummary[] = [],
+  /**
+   * Rounds the task pruned from memory, whose rows are gone from the log.
+   *
+   * Without them the run's totals would *fall* at every prune — the settled
+   * count, the failures and the tokens are exactly what a prune leaves behind in
+   * `task.archived` — and the header would contradict the fold line beside it.
+   */
+  archived?: ArchivedRounds,
 ): WorkflowHeader {
   const suffix =
     task.status === "completed" ? " · done"
@@ -668,20 +942,43 @@ export function header(
     : task.status === "failed" ? " · failed"
     : "";
 
-  // Settled, not succeeded: a failed agent finished. Reporting only successes
-  // made a run with one failure read `29/31` forever, as if two agents had never
-  // run — and one of them had, and failed. The failure is named beside the
-  // count instead of being hidden inside it.
-  const { settled, failed } = tree.totals;
-  const total = Math.max(agentCount, tree.totals.total, settled);
-  const parts = [`${settled}/${total} ${plural(total, "agent")}`];
-  if (failed > 0) parts.push(`${failed} failed`);
-  // What is left of the declared agenda, counted rather than drawn: an empty
-  // phase is a plan, not work, and a row of it would read as stalled agents.
-  const ahead = task.status === "running" || task.status === "paused" ? tree.remaining.length : 0;
-  if (ahead > 0) parts.push(`${ahead} ${plural(ahead, "phase")} to go`);
-  parts.push(formatDuration(elapsedMs(task, now)));
-  if (tree.totals.tokens > 0) parts.push(`${formatCompactTokens(tree.totals.tokens)} tok`);
+  const parts: string[] = [];
+  if (rounds.length > 1) {
+    const live = rounds[rounds.length - 1] as RoundSummary;
+    // Held rounds plus pruned ones: the run's totals have to cover the rounds
+    // whose rows are no longer in the log.
+    const overallSettled = rounds.reduce((sum, round) => sum + round.settled, 0) + (archived?.settled ?? 0);
+    const failed = rounds.reduce((sum, round) => sum + round.failed, 0) + (archived?.failed ?? 0);
+    const tokens = rounds.reduce((sum, round) => sum + round.tokens, 0) + (archived?.tokens ?? 0);
+    // The round's own denominator, never the run's: `live.live` is what the
+    // round still owes, so this is the count that can finish.
+    const roundTotal = Math.max(live.agents, live.settled + live.live);
+    parts.push(`round ${live.index}`);
+    parts.push(roundTotal > 0 ? `${live.settled}/${roundTotal}` : "0 agents");
+    // `settled`, not `done`: a failed agent finished. Said as a quantity, so the
+    // failures named beside it are not read as included in it twice.
+    parts.push(`${overallSettled} settled`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    const ahead = task.status === "running" || task.status === "paused" ? tree.remaining.length : 0;
+    if (ahead > 0) parts.push(`${ahead} ${plural(ahead, "phase")} to go`);
+    parts.push(formatDuration(elapsedMs(task, now)));
+    if (tokens > 0) parts.push(`${formatCompactTokens(tokens)} tok`);
+  } else {
+    // Settled, not succeeded: a failed agent finished. Reporting only successes
+    // made a run with one failure read `29/31` forever, as if two agents had never
+    // run — and one of them had, and failed. The failure is named beside the
+    // count instead of being hidden inside it.
+    const { settled, failed } = tree.totals;
+    const total = Math.max(agentCount, tree.totals.total, settled);
+    parts.push(`${settled}/${total} ${plural(total, "agent")}`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    // What is left of the declared agenda, counted rather than drawn: an empty
+    // phase is a plan, not work, and a row of it would read as stalled agents.
+    const ahead = task.status === "running" || task.status === "paused" ? tree.remaining.length : 0;
+    if (ahead > 0) parts.push(`${ahead} ${plural(ahead, "phase")} to go`);
+    parts.push(formatDuration(elapsedMs(task, now)));
+    if (tree.totals.tokens > 0) parts.push(`${formatCompactTokens(tree.totals.tokens)} tok`);
+  }
 
   return {
     name: task.workflowName ?? meta?.name ?? task.summary ?? task.description ?? "workflow",

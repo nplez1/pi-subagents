@@ -19,6 +19,7 @@
 
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { formatSpan } from "../duration.js";
 import type { AgentRecord, WidgetMode } from "../types.js";
 import {
   type AgentActivity,
@@ -85,11 +86,31 @@ export interface FleetWorkflow {
   /** Set once the run settles, which is what freezes its clock. */
   completedAt?: number;
   tokens: number;
+  /**
+   * The round a looping run is in, present only once a run has looped.
+   *
+   * A single-round run keeps the `3/7 agents` row it has always had, because
+   * there the fraction is a plan. A looping run's total is not a plan — it is
+   * whatever the loop has reached — so the row reports the round instead:
+   * `r7 2/4` says where the loop is and what this pass still owes.
+   */
+  round?: {
+    /** The round in flight, or the last one once the run has settled. */
+    index: number;
+    settled: number;
+    total: number;
+  };
 }
 
-/** `11s` — integer seconds, no decimal/suffix (matches Claude Code, unlike formatMs). */
+/**
+ * `11s`, then `1m12s` / `7h04m` / `3d04h` — whole seconds below a minute, the
+ * shared ladder above it.
+ *
+ * It used to be whole seconds at every scale, which is fine for an agent and
+ * unreadable for a workflow left looping for a week (`604800s`).
+ */
 export function formatFleetElapsed(ms: number): string {
-  return `${Math.max(0, Math.round(ms / 1000))}s`;
+  return formatSpan(ms, "seconds");
 }
 
 /** `↓ 13.1k tokens` — down-arrow prefix, compact magnitude, plural "tokens". */
@@ -626,11 +647,16 @@ export class FleetList {
   private renderWorkflowLine(workflow: FleetWorkflow, theme: Theme): string {
     // Frozen once the run settles, exactly as an agent's clock is.
     const elapsed = (workflow.completedAt ?? Date.now()) - workflow.startedAt;
-    const agents = `${workflow.doneCount}/${workflow.totalCount} agent${workflow.totalCount === 1 ? "" : "s"}`;
     // A failure is called out rather than left inside the count: `31/31 agents`
     // on a run that lost two of them is true and useless.
     const failed = workflow.failedCount ? ` · ${workflow.failedCount} failed` : "";
-    const stats = `${agents}${failed} · ${formatFleetElapsed(elapsed)} · ${formatFleetTokens(workflow.tokens)}`;
+    // Where the loop is, then what the whole run has finished — the round's own
+    // fraction is the one that can reach its denominator.
+    const progress =
+      workflow.round !== undefined
+        ? `r${workflow.round.index} ${workflow.round.settled}/${workflow.round.total} · ${workflow.doneCount} settled`
+        : `${workflow.doneCount}/${workflow.totalCount} agent${workflow.totalCount === 1 ? "" : "s"}`;
+    const stats = `${progress}${failed} · ${formatFleetElapsed(elapsed)} · ${formatFleetTokens(workflow.tokens)}`;
     return `${theme.fg("accent", "◆")} ${theme.fg("muted", "workflow")}  ${workflow.name} ${theme.fg("dim", "·")} ${theme.fg("dim", stats)}`;
   }
 }
