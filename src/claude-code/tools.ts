@@ -271,9 +271,16 @@ export function claudeToolAllowList(piToolNames: readonly string[]): string[] {
  */
 export function claudeToolPolicyFor(
 	declaredToolNames: string[] | undefined,
+	options: { wildcard?: boolean } = {},
 ): string[] | undefined {
 	if (!declaredToolNames) return undefined;
-	if (namesEveryPiBuiltin(declaredToolNames)) return undefined;
+	// The caller's own reading of `tools:` when it has one. Without it, fall back
+	// to the set: an agent file that lists every built-in is indistinguishable
+	// from the default. With it, an explicit list stays a restriction — Claude Code
+	// names are normalized into pi names now, so a full Claude Code spelling
+	// (`Read, Glob, LS, …`) would otherwise look exactly like `tools: *` and hand
+	// the CLI its own extra defaults (WebFetch, WebSearch) back.
+	if (options.wildcard ?? namesEveryPiBuiltin(declaredToolNames)) return undefined;
 	return claudeToolAllowList(declaredToolNames);
 }
 

@@ -382,9 +382,24 @@ describe("nested-call scope gate", () => {
     });
   });
 
-  it("admits everything until the scope is installed", () => {
+  it("blocks until the scope is installed rather than admitting everything", () => {
+    // `bindExtensions()` runs every extension's `session_start` before the scope
+    // exists, and an extension that starts a turn from there reaches the registry
+    // with no scope to consult. Admitting in that window is the one case where a
+    // broken gate looks exactly like a working one, so it fails closed.
     const { handler } = gateHandler({});
-    expect(handler({ toolName: "anything" })).toBeUndefined();
+    expect(handler({ toolName: "anything" })).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("still being installed"),
+    });
+  });
+
+  it("admits precisely what the installed scope admits", () => {
+    const { session } = scopeSession([{ name: "allowed" }, { name: "other" }]);
+    const gate = installScope(session, scopeLoader({}), { toolNames: ["allowed"] });
+    const { handler } = gateHandler(gate);
+    expect(handler({ toolName: "allowed" })).toBeUndefined();
+    expect(handler({ toolName: "other" })).toMatchObject({ block: true });
   });
 });
 

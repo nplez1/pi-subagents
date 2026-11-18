@@ -1476,6 +1476,14 @@ describe("backend opt-in and tool policy (M8)", () => {
 		]);
 		// ...including the empty declaration, which means "no built-ins".
 		expect(claudeToolPolicyFor([])).toEqual([]);
+		// A declaration that names every built-in is still a declaration: with the
+		// caller's `wildcard: false` it stays a finite `--tools` list rather than
+		// becoming "no restriction", which is what normalization would otherwise
+		// make it indistinguishable from.
+		expect(claudeToolPolicyFor([...BUILTIN_TOOL_NAMES], { wildcard: false })).toEqual(
+			claudeToolAllowList([...BUILTIN_TOOL_NAMES]),
+		);
+		expect(claudeToolPolicyFor([...BUILTIN_TOOL_NAMES], { wildcard: true })).toBeUndefined();
 	});
 
 	it("recognizes a Claude Code tool name as known rather than as a typo", () => {

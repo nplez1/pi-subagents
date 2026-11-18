@@ -380,7 +380,13 @@ export function installExtensionToolScope(
   };
 }
 
-/** Set once the child's tool scope is installed; until then the gate admits everything. */
+/**
+ * Set once the child's tool scope is installed. Until then the gate blocks:
+ * `bindExtensions()` runs every extension's `session_start` before the scope
+ * exists, and an extension that starts a turn from there could otherwise reach
+ * any registered `codemode`/`deferred` tool unscoped. Failing closed costs at
+ * most a nested call made during that startup window.
+ */
 export type NestedCallGate = { allows?: (name: string) => boolean };
 
 /**
@@ -397,11 +403,15 @@ export function scopeGateExtension(gate: NestedCallGate): InlineExtension {
     name: SCOPE_GATE_NAME,
     hidden: true,
     factory: (ext) => {
-      ext.on("tool_call", (event) =>
-        gate.allows?.(event.toolName) === false
-          ? { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` }
-          : undefined,
-      );
+      ext.on("tool_call", (event) => {
+        const allowed = gate.allows;
+        if (allowed === undefined) {
+          return { block: true, reason: `Tool "${event.toolName}" is not available yet: this agent's tool scope is still being installed.` };
+        }
+        return allowed(event.toolName)
+          ? undefined
+          : { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` };
+      });
     },
   };
 }

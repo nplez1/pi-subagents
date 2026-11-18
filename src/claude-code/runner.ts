@@ -715,7 +715,9 @@ export async function runClaudeCodeAgent(
 	// Tool policy, translated once so the session can remember it: a resumed
 	// conversation re-spawns the CLI, and a per-invocation `--tools` that were not
 	// reapplied would silently widen a restricted agent back to the full set.
-	const allowedTools = claudeToolPolicyFor(agentConfig?.builtinToolNames);
+	const allowedTools = claudeToolPolicyFor(agentConfig?.builtinToolNames, {
+		wildcard: agentConfig?.toolsWildcard,
+	});
 	const disallowedTools = agentConfig?.disallowedTools
 		? claudeToolDenyList(agentConfig.disallowedTools)
 		: undefined;

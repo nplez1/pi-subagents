@@ -42,6 +42,13 @@ export interface AgentConfig {
   /** Raw `ext:` selector entries from the `tools:` CSV, e.g. ["ext:foo", "ext:bar/x"].
    * Presence of any entry flips extension tools to an explicit allowlist. */
   extSelectors?: string[];
+  /**
+   * True when `tools:` was omitted or written as `*`/`all`, i.e. `builtinToolNames`
+   * holds pi's default set rather than a declaration. The Claude Code backend needs
+   * the difference: a declaration that happens to name every built-in is still a
+   * restriction (`--tools read,bash,…`), while the default means "no restriction".
+   */
+  toolsWildcard?: boolean;
   /** Bare `mcp__` entries from the `tools:` CSV (exact names or `*` patterns), as in
    * pi's `--tools`: MCP tools are narrowed to the matching ones. */
   mcpToolPatterns?: string[];

@@ -41,15 +41,26 @@ const RESERVED_IN_TYPE = ":";
  * files can claim the same one; the later load wins, as it always has for a
  * filename clash, and `warnSkippedOverride` reports the substitution.
  */
-export function loadCustomAgents(cwd: string, strict = false): Map<string, AgentConfig> {
+export function loadCustomAgents(
+  cwd: string,
+  strict = false,
+  options: { trusted?: boolean } = {},
+): Map<string, AgentConfig> {
   const globalDir = join(getAgentDir(), "agents");
   const workspaceProjectDir = join(cwd, ".agents", "agents");
   const projectDir = join(cwd, ".pi", "agents");
 
   const agents = new Map<string, AgentConfig>();
   loadFromDir(globalDir, agents, "global", strict);            // lowest priority
-  loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
-  loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  // A project the user declined to trust contributes no agents. An agent file is
+  // project code with two levers: it overrides a global agent of the same name
+  // ("Explore" included), and its `extensions:`/`ext:` entries become explicit
+  // extension sources that pi loads without re-checking trust. Undefined means
+  // "no session has resolved this yet", which keeps the historical behaviour.
+  if (options.trusted !== false) {
+    loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
+    loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  }
 
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();
@@ -102,7 +113,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
     // filename-derived one down with it.
     const name = declared || filenameType;
 
-    const { builtinToolNames, extSelectors, mcpToolPatterns } = parseToolsField(fm.tools);
+    const { builtinToolNames, extSelectors, mcpToolPatterns, toolsWildcard } = parseToolsField(fm.tools);
 
     agents.set(name, {
       name,
@@ -115,6 +126,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       builtinToolNames,
       extSelectors,
       mcpToolPatterns,
+      toolsWildcard,
       // `disallowedTools` is Claude Code's spelling of the key. Each entry denies the tool
       // with exactly that name, as in Claude Code, and the pi built-in it maps to, so an
       // extension tool named `glob` stays denied rather than becoming `find`.
@@ -290,6 +302,8 @@ function parseToolsField(val: unknown): {
   builtinToolNames: string[];
   extSelectors: string[] | undefined;
   mcpToolPatterns: string[] | undefined;
+  /** Omitted or `*` — see AgentConfig.toolsWildcard. Not `tools: none`, which is a restriction. */
+  toolsWildcard: boolean;
 } {
   const entries = csvList(val, BUILTIN_TOOL_NAMES);
   const isWildcard = (e: string) => e === "*" || e.toLowerCase() === "all";
@@ -308,6 +322,9 @@ function parseToolsField(val: unknown): {
     builtinToolNames: hasWildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,
     extSelectors: extEntries.length > 0 ? extEntries : undefined,
     mcpToolPatterns: mcpEntries.length > 0 ? mcpEntries : undefined,
+    // An omitted field parses to the default set through `csvList`; `*`/`all` do
+    // so explicitly. Either way the list is pi's default, not the agent's choice.
+    toolsWildcard: val === undefined || val === null || hasWildcard,
   };
 }
 

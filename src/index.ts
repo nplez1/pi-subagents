@@ -380,9 +380,16 @@ export default function (pi: ExtensionAPI) {
   // the initial load, which happens hundreds of lines before settings are applied.
   let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
 
+  // Declared here, not beside the RPC block below: the agent reload reads it to
+  // decide whether this project's agent files apply, and that reload runs before
+  // those lines.
+  let currentCtx: ExtensionContext | undefined;
+
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
-    const userAgents = loadCustomAgents(process.cwd(), strict);
+    const userAgents = loadCustomAgents(process.cwd(), strict, {
+      trusted: currentCtx?.isProjectTrusted() ?? true,
+    });
     // Re-read settings each reload so a `/subagents` default takes effect on the
     // next spawn without restarting pi, the same contract agent files have.
     registerAgents(userAgents, loadSettings(process.cwd()).agentOverrides);
@@ -722,7 +729,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   // --- Cross-extension RPC via pi.events ---
-  let currentCtx: ExtensionContext | undefined;
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -760,6 +766,9 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    // Trust is only answerable once a session exists, and the initial load ran
+    // before that: redo it now so a declined project's agent files never register.
+    if (ctx.isProjectTrusted() === false) reloadCustomAgents();
     if (ctx.hasUI) {
       fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
     }

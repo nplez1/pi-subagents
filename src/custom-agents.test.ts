@@ -98,3 +98,51 @@ describe("disallowedTools", () => {
     expect(load("disallowed_tools: write\ndisallowedTools: bash").disallowedTools).toEqual(["write"]);
   });
 });
+
+describe("project trust", () => {
+  it("reads no project agent files from a project the user declined to trust", () => {
+    // An agent file is project code with two levers: it overrides a global agent
+    // of the same name, and its `extensions:` entries become explicit extension
+    // sources pi loads without re-checking trust. A declined project gets neither.
+    writeFileSync(join(cwd, ".pi", "agents", "probe.md"), "---\nname: probe\n---\n\nPrompt.\n");
+    expect(loadCustomAgents(cwd, true, { trusted: false }).get("probe")).toBeUndefined();
+    expect(loadCustomAgents(cwd, true, { trusted: true }).get("probe")).toBeDefined();
+  });
+
+  it("still loads global agents when the project is untrusted", () => {
+    const globalDir = join(process.env.PI_CODING_AGENT_DIR as string, "agents");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "shared.md"), "---\nname: shared\n---\n\nPrompt.\n");
+    writeFileSync(join(cwd, ".pi", "agents", "probe.md"), "---\nname: probe\n---\n\nPrompt.\n");
+
+    const agents = loadCustomAgents(cwd, true, { trusted: false });
+    expect(agents.get("shared")?.name).toBe("shared");
+    expect(agents.get("probe")).toBeUndefined();
+  });
+
+  it("keeps the historical behaviour when no session has resolved trust yet", () => {
+    writeFileSync(join(cwd, ".pi", "agents", "probe.md"), "---\nname: probe\n---\n\nPrompt.\n");
+    expect(loadCustomAgents(cwd, true).get("probe")).toBeDefined();
+  });
+});
+
+describe("tools: wildcard intent", () => {
+  it("records an omitted or starred list as the default, not a declaration", () => {
+    expect(load("description: d").toolsWildcard).toBe(true);
+    // Quoted: an unquoted `*` is a YAML alias and the file would not parse.
+    expect(load('tools: "*"').toolsWildcard).toBe(true);
+    expect(load("tools: all").toolsWildcard).toBe(true);
+  });
+
+  it("keeps an explicit list explicit, even when it names every built-in", () => {
+    // The Claude Code backend needs the difference: an explicit `--tools` list is
+    // a restriction, the default is "no restriction".
+    const agent = load("tools: read, bash, edit, write, grep, find, ls");
+    expect(agent.toolsWildcard).toBe(false);
+    expect(agent.builtinToolNames).toHaveLength(7);
+  });
+
+  it("treats `tools: none` as a restriction", () => {
+    expect(load("tools: none").toolsWildcard).toBe(false);
+  });
+});
