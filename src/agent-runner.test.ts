@@ -15,10 +15,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
 // over ordinary top-level consts. Only the pieces `runAgent` builds a child
 // from are replaced; everything else is pi's own.
-const { createAgentSession, settingsManagerCreate, loaders } = vi.hoisted(() => ({
+const { createAgentSession, settingsManagerCreate, loaders, loaderExtensions } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   settingsManagerCreate: vi.fn(),
   loaders: [] as any[],
+  /** What every mocked child loader reports as loaded. */
+  loaderExtensions: [] as any[],
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", async () => {
@@ -29,7 +31,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
     // Records its options; a real one would read the user's agent dir.
     DefaultResourceLoader: class {
       reload = vi.fn(async () => {});
-      getExtensions = () => ({ extensions: [], errors: [] });
+      getExtensions = () => ({ extensions: loaderExtensions, errors: [] });
       constructor(public options: any) {
         loaders.push(this);
       }
@@ -291,6 +293,7 @@ function installScope(
     disallowedSet: undefined,
     extNames: new Set(),
     narrowing: new Map(),
+    mcpToolPatterns: undefined,
     readmitToolNames: new Set(),
     nestedCallGate,
     ...overrides,
@@ -428,6 +431,7 @@ describe("runAgent child loader", () => {
 
   beforeEach(() => {
     loaders.length = 0;
+    loaderExtensions.length = 0;
     createAgentSession.mockReset();
     createAgentSession.mockImplementation(async () => {
       throw STOP;
@@ -530,5 +534,164 @@ describe("runAgent child loader", () => {
       errors: [],
     });
     expect(kept.extensions.map((e: { path: string }) => e.path)).toEqual(["builtin:mcp", `<inline:${SCOPE_GATE_NAME}>`]);
+  });
+});
+
+// ─── `tools:` mcp__ entries and Claude Code names ────────────────────────────
+
+describe("bare mcp__ entries in tools:", () => {
+  const mcpLoader = () =>
+    scopeLoader({
+      "builtin:mcp": ["mcp__github__issue", "mcp__github__pr", "mcp__slack__post", "read_mcp_resource"],
+      "builtin:codemode": ["codemode"],
+      "builtin:tool-search": ["tool_search"],
+    });
+
+  it("without them, every MCP tool is in scope (the old reading of `tools: mcp__…`)", () => {
+    // The entry used to be taken for a mistyped built-in and dropped, which left
+    // the agent with every MCP tool rather than the one it asked for.
+    const { session } = scopeSession([{ name: "read" }]);
+    const gate = installScope(session, mcpLoader(), { toolNames: ["mcp__github__issue"] });
+
+    expect(gate.allows?.("mcp__slack__post")).toBe(true);
+  });
+
+  it("narrows MCP tools to the matching ones, keeping the bridges that reach them", () => {
+    const { session } = scopeSession([{ name: "read" }]);
+    const gate = installScope(session, mcpLoader(), { mcpToolPatterns: ["mcp__github__*"] });
+
+    expect(gate.allows?.("mcp__github__issue")).toBe(true);
+    expect(gate.allows?.("mcp__github__pr")).toBe(true);
+    expect(gate.allows?.("mcp__slack__post")).toBe(false);
+    // pi counts its resource tools as MCP tools, so a narrowed agent loses them too.
+    expect(gate.allows?.("read_mcp_resource")).toBe(false);
+    expect(gate.allows?.("codemode")).toBe(true);
+    expect(gate.allows?.("tool_search")).toBe(true);
+    expect(gate.allows?.("read")).toBe(true);
+  });
+
+  it("reaches a matching tool even from an extension the ext: opt-in left out", () => {
+    const { session } = scopeSession([{ name: "read" }]);
+    const gate = installScope(
+      session,
+      scopeLoader({ "/ext/other.ts": ["other_tool"], "builtin:mcp": ["mcp__github__issue", "mcp__slack__post"] }),
+      { extNames: new Set(["other"]), mcpToolPatterns: ["mcp__github__issue"] },
+    );
+
+    expect(gate.allows?.("other_tool")).toBe(true);
+    expect(gate.allows?.("mcp__github__issue")).toBe(true);
+    expect(gate.allows?.("mcp__slack__post")).toBe(false);
+  });
+
+  it("still lets disallowed_tools win over a matching entry", () => {
+    const { session } = scopeSession([{ name: "read" }]);
+    const gate = installScope(session, mcpLoader(), {
+      mcpToolPatterns: ["mcp__github__*"],
+      disallowedSet: new Set(["mcp__github__pr", "tool_search"]),
+    });
+
+    expect(gate.allows?.("mcp__github__issue")).toBe(true);
+    expect(gate.allows?.("mcp__github__pr")).toBe(false);
+    expect(gate.allows?.("tool_search")).toBe(false);
+  });
+
+  it("activates an exactly named MCP tool that opts out of default activation", () => {
+    const { session, active } = scopeSession([
+      { name: "read" },
+      { name: "mcp__github__issue", defaultActive: false },
+      { name: "mcp__github__pr", defaultActive: false },
+    ]);
+    installScope(session, mcpLoader(), { mcpToolPatterns: ["mcp__github__issue", "mcp__github__p*"] });
+
+    // Named exactly → activated; matched only by a pattern → left as pi would.
+    expect(active()).toEqual(["read", "mcp__github__issue"]);
+  });
+});
+
+describe("runAgent with mcp__ entries and unusable tools: lists", () => {
+  const STOP = new Error("stop after scope install");
+  const pi = { exec: vi.fn(async () => ({ code: 1, stdout: "", stderr: "" })) } as never;
+  const ctx = {
+    cwd: "/project",
+    model: undefined,
+    modelRegistry: {},
+    getSystemPrompt: () => "parent prompt",
+    isProjectTrusted: () => true,
+    sessionManager: { getSessionFile: () => undefined },
+  } as never;
+
+  function agent(name: string, fields: Partial<AgentConfig>) {
+    registerAgents(
+      new Map<string, AgentConfig>([
+        [name, { name, description: "d", extensions: true, skills: false, systemPrompt: "", promptMode: "replace", ...fields }],
+      ]),
+    );
+  }
+
+  beforeEach(() => {
+    loaders.length = 0;
+    loaderExtensions.length = 0;
+    createAgentSession.mockReset();
+    settingsManagerCreate.mockReset();
+    settingsManagerCreate.mockImplementation(() => ({ isProjectTrusted: () => true, getSessionDir: () => undefined }));
+    setRememberAgents(false);
+  });
+
+  afterEach(() => {
+    setRememberAgents(true);
+    registerAgents(new Map());
+  });
+
+  it("scopes the child's MCP tools to the agent's mcp__ entries", async () => {
+    agent("gh", { builtinToolNames: ["read"], mcpToolPatterns: ["mcp__github__*"] });
+    loaderExtensions.push({
+      path: "builtin:mcp",
+      tools: new Map([["mcp__github__issue", {}], ["mcp__slack__post", {}]]),
+    });
+    const fake = scopeSession([{ name: "read" }]);
+    const session = Object.assign(fake.session, { setSessionName: () => {}, bindExtensions: async () => {} });
+    createAgentSession.mockResolvedValue({ session });
+
+    await expect(
+      runAgent(ctx, "gh", "go", {
+        pi,
+        onSessionCreated: () => {
+          throw STOP;
+        },
+      }),
+    ).rejects.toBe(STOP);
+
+    const gate = (session as unknown as { agent: { beforeToolCall: (c: unknown) => Promise<unknown> } }).agent;
+    await expect(gate.beforeToolCall({ toolCall: { name: "mcp__slack__post" } })).resolves.toMatchObject({ block: true });
+    await expect(gate.beforeToolCall({ toolCall: { name: "mcp__github__issue" } })).resolves.toBeUndefined();
+  });
+
+  it("warns that mcp__ entries cannot match when the agent loads no extensions", async () => {
+    agent("noext", { builtinToolNames: ["read"], mcpToolPatterns: ["mcp__github__*"], extensions: false });
+    createAgentSession.mockRejectedValue(STOP);
+    const onToolActivity = vi.fn();
+
+    await expect(runAgent(ctx, "noext", "go", { pi, onToolActivity })).rejects.toBe(STOP);
+
+    expect(onToolActivity.mock.calls.map((c) => c[0].toolName)).toContain(
+      'tools-error:mcp__github__* requested by agent "noext" need extensions, but it loads none',
+    );
+  });
+
+  it("refuses an agent whose tools: list resolved to nothing", async () => {
+    agent("empty", { builtinToolNames: ["WebFetch"], extensions: false });
+
+    await expect(runAgent(ctx, "empty", "go", { pi })).rejects.toThrow(
+      /Agent 'empty' would be spawned with zero tools — refusing\. .*unrecognized \[WebFetch\]/,
+    );
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
+
+  it("does not refuse while an extension could still supply tools", async () => {
+    agent("later", { builtinToolNames: ["WebFetch"] });
+    loaderExtensions.push({ path: "builtin:mcp", tools: new Map() });
+    createAgentSession.mockRejectedValue(STOP);
+
+    await expect(runAgent(ctx, "later", "go", { pi })).rejects.toBe(STOP);
   });
 });
