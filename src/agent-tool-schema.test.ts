@@ -12,7 +12,7 @@
 
 import type {
 	ExtensionAPI,
-	ExtensionContext,
+	ExtensionToolContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
@@ -113,7 +113,7 @@ describe("nested Agent tool", () => {
 		cwd: process.cwd(),
 		model: undefined,
 		modelRegistry: undefined,
-	} as unknown as ExtensionContext;
+	} as unknown as ExtensionToolContext;
 
 	it("accepts a call with no subagent_type", () => {
 		const { tool } = nested(["general-purpose"]);

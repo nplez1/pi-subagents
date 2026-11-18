@@ -37,7 +37,7 @@ import {
   type TruncationResult,
   UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Editor, type EditorTheme, type MarkdownTheme, matchesKey, type SelectListTheme, Spacer, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, Editor, type EditorTheme, type MarkdownTheme, matchesKey, type SelectListTheme, Spacer, type TUI, type TuiMouseButton, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord } from "../types.js";
@@ -77,14 +77,19 @@ interface Expandable {
 }
 
 /**
- * Structural subset of pi-tui's `TuiMouseEvent`. The pi-tui version this package
- * typechecks against (0.84) predates mouse support; at runtime the loader aliases
- * pi-tui to pi's own copy (0.87+), so these fields are present even though the
- * typings are not.
+ * Structural subset of pi-tui's `TuiMouseEvent`. It is a subset rather than the
+ * real type so the fields pi fills in that this overlay never reads — absolute
+ * `screenX`/`screenY`, the modifier flags — do not have to be listed. pi ≥1.1
+ * publishes `TuiMouseEvent`, so the shape below is checked against the host
+ * rather than assumed.
  */
 export interface ViewerMouseEvent {
   type: string;
-  button: number;
+  /**
+   * pi ≥1.1 sends the button name; a host before that sent a bitmask, so both
+   * spellings are accepted and `isLeftButton` is the only thing that reads it.
+   */
+  button: TuiMouseButton | number;
   x: number;
   y: number;
   width: number;
@@ -95,6 +100,16 @@ export interface ViewerMouseEvent {
    * there the raw bytes reach `handleInput`, which parses them instead.
    */
   wheelDelta?: number;
+}
+
+/**
+ * A left click is the only click this overlay acts on. pi 1.5 names buttons
+ * (`"left"`, `"middle"`, `"right"`, `"none"`) — comparing the old bitmask form
+ * with `& 3` read `"right"` as NaN, i.e. as a left click, so a right click used
+ * to claim the event and toggle a block. Both spellings still work.
+ */
+function isLeftButton(button: TuiMouseButton | number): boolean {
+  return typeof button === "number" ? (button & 3) === 0 : button === "left";
 }
 
 /** One transcript component's slice of the rendered content lines. */
@@ -539,7 +554,7 @@ export class ConversationViewer implements Component {
       this.tui.requestRender();
       return { handled: true };
     }
-    if (event.type !== "click" || (event.button & 3) !== 0) return undefined;
+    if (event.type !== "click" || !isLeftButton(event.button)) return undefined;
     const innerW = this.lastInnerW;
     if (innerW <= 0) return undefined;
 

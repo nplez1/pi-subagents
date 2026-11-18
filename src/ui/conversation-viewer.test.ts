@@ -114,6 +114,22 @@ describe("ConversationViewer mouse routing", () => {
 		expect(child.handleMouse).not.toHaveBeenCalled();
 	});
 
+	it("reads pi 1.5's named buttons, so a right click is not a left click", () => {
+		const child = { handleMouse: vi.fn(() => ({ handled: true })) };
+		const { viewer } = makeViewer([{ component: child as never, start: 0, height: 2 }]);
+
+		// pi ≥1.1 sends "left"/"middle"/"right"/"none". The old `button & 3` check
+		// coerced every name to NaN — i.e. to 0 — so "right" claimed the click.
+		expect(viewer.handleMouse({ type: "click", button: "right", x: 5, y: 4, width: 60, height: 20 })).toBeUndefined();
+		expect(viewer.handleMouse({ type: "click", button: "middle", x: 5, y: 4, width: 60, height: 20 })).toBeUndefined();
+		expect(child.handleMouse).not.toHaveBeenCalled();
+
+		expect(viewer.handleMouse({ type: "click", button: "left", x: 5, y: 4, width: 60, height: 20 })).toEqual({
+			handled: true,
+		});
+		expect(child.handleMouse).toHaveBeenCalledTimes(1);
+	});
+
 	it("does nothing for a click outside the content viewport", () => {
 		const child = { handleMouse: vi.fn(() => ({ handled: true })) };
 		const { viewer } = makeViewer([{ component: child as never, start: 0, height: 2 }]);

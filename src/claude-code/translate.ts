@@ -31,6 +31,7 @@
 
 import type {
 	AssistantMessage,
+	JsonObject,
 	Message,
 	Model,
 	StopReason,
@@ -53,6 +54,16 @@ import {
 	isUserEvent,
 } from "./protocol.js";
 import { translateToolCall } from "./tools.js";
+
+/**
+ * Claude Code's tool input arrives as parsed JSON, but `tools.ts` types it as
+ * `Record<string, unknown>` because it rewrites keys generically. pi's `ToolCall`
+ * wants `JsonObject`, so the narrowing happens here, once, at the boundary it
+ * actually applies to.
+ */
+function asToolArguments(input: Record<string, unknown>): JsonObject {
+	return input as JsonObject;
+}
 
 /**
  * Usage delta as the translator reports it — a subset of the extension's
@@ -241,7 +252,7 @@ function toPiContent(
 				type: "toolCall",
 				id: block.id,
 				name: translated.name,
-				arguments: translated.arguments,
+				arguments: asToolArguments(translated.arguments),
 			};
 		}
 		case "server_tool_use":
@@ -251,7 +262,7 @@ function toPiContent(
 				type: "toolCall",
 				id: block.id ?? "",
 				name: translated.name,
-				arguments: translated.arguments,
+				arguments: asToolArguments(translated.arguments),
 			};
 		}
 		default:
