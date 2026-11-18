@@ -36,6 +36,33 @@ export interface PromptExtras {
 }
 
 /**
+ * The `cwd` section as pi renders it, appended after the preceding section.
+ * Character for character what pi emits, since it is matched against a rendered
+ * prompt.
+ */
+function cwdSection(cwd: string): string {
+  return `\n\n<cwd>\n${cwd.replace(/\\/g, "/")}\n</cwd>`;
+}
+
+/**
+ * Strip pi's `cwd` section from an already-rendered system prompt.
+ *
+ * Used by the mention clone, which hands pi the parent's rendered prompt through
+ * the loader's override. Every other section can be suppressed there, but the
+ * `cwd` section cannot: pi appends it after whatever the override returns, so a
+ * cloned session in the same directory would render it twice.
+ *
+ * The last occurrence is removed — a prompt that quotes a path containing
+ * `<cwd>` still ends with the real section — and a prompt without one is
+ * returned unchanged rather than throwing.
+ */
+export function withoutCwdSection(rendered: string, cwd: string): string {
+  const section = cwdSection(cwd);
+  const at = rendered.lastIndexOf(section);
+  return at < 0 ? rendered : rendered.slice(0, at) + rendered.slice(at + section.length);
+}
+
+/**
  * Build the system prompt for an agent from its config.
  *
  * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)
