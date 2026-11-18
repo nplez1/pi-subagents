@@ -1276,6 +1276,9 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      // The resumed run's own budget, counted afresh (#368).
+      maxTurns: opts.maxTurns,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -2001,18 +2004,29 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        // From the record's OWN type: resume ignores `subagent_type`, so
+        // `effectiveMaxTurns` above may describe another agent. Same precedence
+        // as a spawn — the agent file's `max_turns` is authoritative.
+        const resumeMaxTurns = normalizeMaxTurns(
+          getAgentConfig(existing.type)?.maxTurns ?? getDefaultMaxTurns(),
+        );
+        // Counted so the result card shows the resumed run's own `↻N≤M`.
+        const { state: resumeState, callbacks: resumeCallbacks } = createActivityTracker(resumeMaxTurns);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          maxTurns: resumeMaxTurns,
+          onTurnEnd: resumeCallbacks.onTurnEnd,
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildAgentDetails(detailBaseFor(record), record));
+          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildAgentDetails(detailBaseFor(record), record, resumeState));
         }
         return textResult(
           record.result?.trim() || "No output.",
-          buildAgentDetails(detailBaseFor(record), record),
+          buildAgentDetails(detailBaseFor(record), record, resumeState),
         );
       }
 

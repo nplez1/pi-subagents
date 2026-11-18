@@ -1227,12 +1227,18 @@ export async function resumeAgent(
   session: AgentSession,
   prompt: string,
   options: {
+    /** The agent's type, for its own `max_turns`. */
+    type: SubagentType;
+    /** Explicit limit for this run; resolved like a spawn's (see resolveEffectiveMaxTurns). */
+    maxTurns?: number;
+    /** Called at the end of each resumed turn with the count since the resume. */
+    onTurnEnd?: (turnCount: number) => void;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
-  } = {},
-): Promise<{ text: string; failure?: string }> {
+  },
+): Promise<{ text: string; failure?: string; aborted: boolean; steered: boolean }> {
   // A Claude Code session continues against the CLI by its own session id,
   // rather than through a pi session — there is no pi session behind it.
   if (isClaudeCodeSession(session)) {
@@ -1243,11 +1249,14 @@ export async function resumeAgent(
       const model = (session as { model?: { provider: string; id: string } }).model;
       throw new Error(claudeCodeDisabledMessage(model ? `${model.provider}/${model.id}` : "claude/*"));
     }
-    return resumeClaudeCodeAgent(session as ClaudeCodeSession, prompt, {
+    const continued = await resumeClaudeCodeAgent(session as ClaudeCodeSession, prompt, {
       onToolActivity: options.onToolActivity,
       onAssistantUsage: options.onAssistantUsage,
       signal: options.signal,
     });
+    // The CLI owns its own turn loop, so neither the limit nor its grace can be
+    // applied here; a continued conversation is never reported as aborted.
+    return { aborted: false, steered: false, ...continued };
   }
 
   // Boundary for the history fallback: the session already holds prior turns,
@@ -1257,8 +1266,28 @@ export async function resumeAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
+  // The spawn path's graceful limit, applied to a resumed run and counted afresh
+  // from the resume prompt (#368). Without it a resumed agent had no cap at all:
+  // a loop that outlived its first run could keep going indefinitely.
+  let turnCount = 0;
+  const maxTurns = resolveEffectiveMaxTurns(options.type, options.maxTurns);
+  let softLimitReached = false;
+  let aborted = false;
+
+  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "turn_end") {
+          turnCount++;
+          options.onTurnEnd?.(turnCount);
+          if (maxTurns != null) {
+            if (!softLimitReached && turnCount >= maxTurns) {
+              softLimitReached = true;
+              session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+            } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
+              aborted = true;
+              session.abort();
+            }
+          }
+        }
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
@@ -1274,11 +1303,11 @@ export async function resumeAgent(
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
         }
-      })
-    : () => {};
+      });
 
   try {
-    await session.prompt(prompt);
+    // Already aborted: not prompted, as in the spawn path.
+    if (options.signal?.aborted !== true) await session.prompt(prompt);
   } finally {
     collector.unsubscribe();
     unsubEvents();
@@ -1288,6 +1317,8 @@ export async function resumeAgent(
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     failure: finalTurnError(session, startLen),
+    aborted,
+    steered: softLimitReached,
   };
 }
 

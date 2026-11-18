@@ -425,7 +425,7 @@ describe("claude/* model specs", () => {
 		});
 		setClaudeCodeEnabled(false);
 		try {
-			await expect(resumeAgent(live as never, "hello")).rejects.toThrow(
+			await expect(resumeAgent(live as never, "hello", { type: "general-purpose" })).rejects.toThrow(
 				/Claude Code backend is disabled/,
 			);
 		} finally {
