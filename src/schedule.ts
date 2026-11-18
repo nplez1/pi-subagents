@@ -194,14 +194,13 @@ export class SubagentScheduler {
           const t = setTimeout(() => {
             this.executeJob(job.id);
             // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
-            store.update(job.id, { enabled: false });
-            const updated = store.get(job.id);
+            const updated = this.persist(job.id, { enabled: false });
             if (updated) this.emit({ type: "updated", job: updated });
           }, delay);
           this.intervals.set(job.id, t);
         } else {
           // Past timestamp — disable, mark error, never fire
-          store.update(job.id, { enabled: false, lastStatus: "error" });
+          this.persist(job.id, { enabled: false, lastStatus: "error" });
           this.emit({ type: "error", jobId: job.id, error: `Scheduled time ${job.schedule} is in the past` });
         }
       } else {
@@ -241,7 +240,7 @@ export class SubagentScheduler {
     const job = store.get(id);
     if (!job?.enabled) return;
 
-    store.update(id, { lastStatus: "running" });
+    this.persist(id, { lastStatus: "running" });
 
     // Resolve model at fire time — registry contents may have changed since the
     // job was created (auth added/removed). A stored explicit pin that no longer
@@ -299,7 +298,7 @@ export class SubagentScheduler {
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      store.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      this.persist(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
       this.emit({ type: "error", jobId: id, error });
       return;
     }
@@ -309,7 +308,7 @@ export class SubagentScheduler {
     const finalize = (status: "success" | "error") => {
       const next = this.getNextRun(id);
       const current = store.get(id);
-      store.update(id, {
+      this.persist(id, {
         lastRun: new Date().toISOString(),
         lastStatus: status,
         runCount: (current?.runCount ?? 0) + 1,
@@ -330,6 +329,21 @@ export class SubagentScheduler {
         finalize(failed ? "error" : "success");
       })
       .catch(() => finalize("error"));
+  }
+
+  /**
+   * Fire-time bookkeeping. A failed persist — the store lock is held by another
+   * pi, or the file went unreadable — becomes an error event rather than a throw
+   * out of a timer tick, where nothing would catch it. The run itself is
+   * unaffected, so the job keeps its schedule either way.
+   */
+  private persist(id: string, patch: Partial<ScheduledSubagent>): ScheduledSubagent | undefined {
+    try {
+      return this.store?.update(id, patch);
+    } catch (err) {
+      this.emit({ type: "error", jobId: id, error: err instanceof Error ? err.message : String(err) });
+      return undefined;
+    }
   }
 
   private emit(event: ScheduleChangeEvent): void {
