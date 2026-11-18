@@ -19,6 +19,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { applyAgentDefaults } from "./agent-defaults.js";
 import { buildAgentDetails } from "./agent-details.js";
+import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findAgentRecordEntry } from "./agent-record-entry.js";
 import { buildNewAgentFile, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, removeFrontmatterKeys, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import {
@@ -56,6 +57,7 @@ import {
   buildInvocationTags,
   describeActivity,
   fgPreservingNestedStyles,
+  formatAge,
   formatCost,
   formatDuration,
   formatMs,
@@ -522,12 +524,10 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
+    // Persist the final record: cross-extension history reconstruction reads it,
+    // and it is what `get_subagent_result` falls back to once the live record is
+    // evicted or a reload has emptied this activation's memory.
+    pi.appendEntry(AGENT_RECORD_ENTRY_TYPE, agentRecordEntryData(record));
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -693,6 +693,19 @@ export default function (pi: ExtensionAPI) {
     const resolved = manager.resolveMention(ref);
     return resolved?.kind === "live" ? resolved.record : undefined;
   };
+
+  /**
+   * `get_subagent_result`'s answer from a persisted record, once the live record
+   * is gone. The entry lives as long as the session file, so it states when the
+   * run finished — a days-old result must not read as current.
+   */
+  const formatSavedAgentRecord = (saved: AgentRecordEntryData): string =>
+    `Agent: ${saved.id}\n` +
+    `Type: ${getDisplayName(saved.type)} | Status: ${saved.status}${getStatusNote(saved.status)} | Duration: ${formatDuration(saved.startedAt, saved.completedAt)}\n` +
+    (saved.completedAt ? `Finished: ${new Date(saved.completedAt).toISOString().slice(0, 16)}Z (${formatAge(saved.completedAt)} ago)\n` : "") +
+    `Description: ${saved.description}\n` +
+    `(From the session's saved record: the live record has been cleaned up, so its stats and conversation are gone.)\n\n` +
+    (saved.status === "error" ? `Error: ${saved.error}${partialOutputSuffix(saved)}` : saved.result?.trim() || "No output.");
 
   const registryEntry = {
     waitForAll: () => manager.waitForAll(),
@@ -2777,9 +2790,20 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
+        // Evicted, or lost to a reload: answer from the record the session saved.
+        // An evicted handle still resolves to its id through its tombstone; after
+        // a reload there is no tombstone, so the saved entry's own handle and
+        // alias have to match.
+        const tombstone = manager.resolveMention(params.agent_id);
+        const savedId = tombstone?.kind === "tombstone" ? tombstone.entry.id : params.agent_id;
+        const saved = findAgentRecordEntry(ctx, savedId, tombstone === undefined);
+        if (saved) {
+          cancelNudge(saved.id);
+          return textResult(formatSavedAgentRecord(saved));
+        }
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
