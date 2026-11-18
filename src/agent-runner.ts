@@ -31,7 +31,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { EffectiveThinkingLevel, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -905,8 +905,7 @@ export async function runAgent(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
 
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  const thinkingLevel = resolveThinkingLevel(options, agentConfig, ctx);
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -1218,6 +1217,24 @@ export async function runAgent(
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };
+}
+
+/**
+ * The thinking level a run starts at: the caller's explicit option, then the
+ * agent file's own `thinking`, then the parent session's level (#306).
+ *
+ * Without that last step an unset level falls through to pi's global
+ * `defaultThinkingLevel`, which is not the level the user is working at: a
+ * `max`-thinking session would spawn agents at whatever the machine defaults to,
+ * and the fleet would silently run shallower than the conversation that started
+ * it.
+ */
+export function resolveThinkingLevel(
+  options: { thinkingLevel?: ThinkingLevel },
+  agentConfig: { thinking?: ThinkingLevel } | undefined,
+  ctx: { thinkingLevel?: EffectiveThinkingLevel },
+): EffectiveThinkingLevel | undefined {
+  return options.thinkingLevel ?? agentConfig?.thinking ?? ctx.thinkingLevel;
 }
 
 /**

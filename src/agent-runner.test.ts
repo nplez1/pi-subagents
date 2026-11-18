@@ -8,7 +8,7 @@
  * path and check the outcome it reports back to the record.
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { resumeAgent, setGraceTurns } from "./agent-runner.js";
+import { resolveThinkingLevel, resumeAgent, setGraceTurns } from "./agent-runner.js";
 
 type Listener = (event: unknown) => void;
 
@@ -157,5 +157,32 @@ describe("steerAgent", () => {
     const { steerAgent } = await import("./agent-runner.js");
     await steerAgent(session, "change of plan");
     expect(steered).toEqual(["change of plan"]);
+  });
+});
+
+describe("resolveThinkingLevel", () => {
+  it("prefers the caller, then the agent file, then the parent session", () => {
+    expect(
+      resolveThinkingLevel({ thinkingLevel: "low" }, { thinking: "high" }, { thinkingLevel: "max" }),
+    ).toBe("low");
+    expect(resolveThinkingLevel({}, { thinking: "high" }, { thinkingLevel: "max" })).toBe("high");
+  });
+
+  it("inherits the parent session's level when nothing else asks for one", () => {
+    // The bug (#306): an unset level used to fall through to pi's global
+    // default, so a max-thinking session spawned agents at whatever the machine
+    // defaults to.
+    expect(resolveThinkingLevel({}, undefined, { thinkingLevel: "max" })).toBe("max");
+    expect(resolveThinkingLevel({}, { thinking: undefined }, { thinkingLevel: "xhigh" })).toBe("xhigh");
+  });
+
+  it("keeps a parent that has thinking off, rather than guessing", () => {
+    expect(resolveThinkingLevel({}, undefined, { thinkingLevel: "off" })).toBe("off");
+  });
+
+  it("stays undefined when the session reports no level of its own", () => {
+    // Undefined still means "let pi resolve it from settings", which is right
+    // for a session that has no level and no parent to inherit one from.
+    expect(resolveThinkingLevel({}, undefined, {})).toBeUndefined();
   });
 });
