@@ -37,8 +37,9 @@ Current state: upstream **v0.26.1** is fetched as the `upstream` remote
   above-editor widget, which this fork replaced with `FleetList` (already
   disposed). `GroupJoinManager` holds no timers. The one interval in that class,
   `AgentManager.cleanupInterval`, is already `unref`'d and cleared in `dispose()`.
-- **`pi-advisor-subagent`, `pi-vcc`** — nothing upstream worth merging; see
-  `docs/upstream-audit-2026-11-18.md` in the parent repo.
+- **`pi-vcc`** — nothing upstream worth merging; see
+  `docs/upstream-audit-2026-11-18.md` in the parent repo. (`pi-advisor-subagent`
+  was in this list until 2026-11-18, when that plugin was removed outright.)
 - **Tier 3** (index.ts restructuring, fullscreen observer, workflow inspector,
   `/agents → Settings`) — ours are different implementations, not older ones.
 

@@ -63,11 +63,12 @@ const CLAUDE_CODE_PREFIX = `${CLAUDE_CODE_PROVIDER}/`;
  * it instead.
  *
  * The value is re-read from disk (mtime-guarded, so an unchanged file costs two
- * `stat`s and no parse) rather than captured once at extension start. The advisor
- * plugin reads the same two files on every call, and a machine whose backend was
- * switched off in `subagents.json` must be seen as off by BOTH the report and the
- * spawn — a startup-only copy would let a hand edit make the advisor refuse a
- * stage that runs, or promise one the spawn then refuses.
+ * `stat`s and no parse) rather than captured once at extension start. Every
+ * consumer — the `/subagents` report and each spawn — re-reads them, so a machine
+ * whose backend was switched off in `subagents.json` cannot have one of them
+ * believe the CLI is available while the other refuses it: a startup-only copy
+ * would let a hand edit leave the report promising a stage the spawn then turns
+ * down.
  */
 let claudeCodeSetting: boolean | undefined;
 

@@ -645,7 +645,7 @@ export default function (pi: ExtensionAPI) {
     // This funnel bypasses the Agent tool's `resolveAgentInvocationConfig`, so an
     // agent's configured default model/thinking (subagents.json
     // `agentOverrides`) is folded in here. A caller that passed a model keeps
-    // it; a caller that passed nothing (the advisor's RPC spawn, a mention)
+    // it; a caller that passed nothing (an extension's RPC spawn, a mention)
     // gets the default instead of inheriting the parent's model.
     const defaults = applyAgentDefaults(dispatch.type, options ?? {}, ctxRef as ExtensionContext);
     if (defaults.error) throw new Error(defaults.error);

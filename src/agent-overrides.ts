@@ -10,7 +10,7 @@
  *     neither the file nor the caller said anything, so `Agent({ model })` still
  *     wins. That is a different precedence slot, so it needs a different field.
  *   - Plugin-provided agents live in someone else's repo, often as symlinks
- *     (`~/.pi/agent/agents/rpiv-advisor.md` → a dotfiles checkout). Writing
+ *     (`~/.pi/agent/agents/<agent>.md` → a dotfiles checkout). Writing
  *     `enabled:` or `model:` into them would mutate an unrelated working tree.
  *     Settings are ours to write; agent files may not be.
  *

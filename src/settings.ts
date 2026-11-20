@@ -638,9 +638,9 @@ export function saveClaudeCodeSetting(
  * The switch as it can be READ without going through `isClaudeCodeEnabled` —
  * project over global, `undefined` when neither file sets one.
  *
- * Exists so the resolution path can pick up a hand edit without a restart: the
- * advisor reads the same two files, and the two must agree about a machine the
- * file says cannot run the CLI.
+ * Exists so the resolution path can pick up a hand edit without a restart, so a
+ * report and a spawn cannot disagree about a machine the file says cannot run the
+ * CLI.
  */
 export function readClaudeCodeSetting(cwd: string = process.cwd()): boolean | undefined {
   const project = readSettingsFile(projectPath(cwd)).claudeCode;

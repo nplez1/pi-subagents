@@ -155,8 +155,8 @@ describe("the claudeCode switch", () => {
 	});
 
 	it("re-reads the file, so a hand edit needs no restart", () => {
-		// pi-subagents and the advisor both read these files; a startup-only copy
-		// would let one report a stage the other refuses.
+		// A startup-only copy would let the report and the spawn disagree about
+		// whether the CLI may run.
 		saveClaudeCodeSetting(false, cwd);
 		expect(isClaudeCodeEnabled(cwd)).toBe(false);
 		// A hand edit — not through the settings API at all.

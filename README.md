@@ -556,11 +556,10 @@ Settings                                    ← max concurrency (background + fo
 Subagent defaults  scope: global | project
 ↑↓ select · ⏎ configure · space toggle · tab scope · esc close
 
-→ ✕◦ rpiv-advisor    inherit · inherit
+→ ✕◦ Designer        inherit · inherit
     • Explore         gpt-6-luna* · medium*
       general-purpose  inherit · inherit
-      rpiv-compressor  inherit · inherit
-    (4/12)
+    (3/12)
 
 Read-only design specialist for turning an explicit design request into an architecture…
 ```
@@ -583,7 +582,7 @@ A `*` marks a value that came from a `/subagents` default; source indicators mat
 4. the shipped default of a built-in agent — a model pinned in code rather than in a file (no built-in agent pins one today, so the model comes from slot 3 or 5)
 5. inherit the parent session's model / thinking level
 
-So the driving model can always override a configured default, while an authored file pin still cannot be overridden — clear it from `/subagents` if you want a default to take effect. Plugin-provided agents (for example an advisor plugin's `rpiv-advisor.md`) appear in the same list; their files are never edited by a Disable or a default change.
+So the driving model can always override a configured default, while an authored file pin still cannot be overridden — clear it from `/subagents` if you want a default to take effect. Plugin-provided agents (an agent `.md` shipped by a package) appear in the same list; their files are never edited by a Disable or a default change.
 
 ## Graceful Max Turns
 
@@ -700,12 +699,12 @@ On a machine that cannot run the CLI — no `claude` binary, or a policy that fo
 Or toggle `/agents` → Settings → Claude Code, which rewrites that key in whichever file already sets it (the global one when neither does) — it never copies the key into a project file, because a machine-scoped switch pinned per project would shadow the global value, and a committed project file would carry it to other machines. Any other settings change leaves the key alone rather than erasing it. Applied live: both the resolution path and the runner read the switch, so a hand-edited file or the menu takes effect on the next spawn. With the backend off:
 
 - `/subagents` no longer lists the `claude/*` rows, so there is nothing to pick by accident.
-- Every remaining `claude/*` spec is **refused by name**, wherever it comes from — an agent file's `model:` pin, a `/subagents` default, `Agent({ model: "claude/opus" })`, an already-resolved model object arriving over the extension RPC bridge, a resumed Claude Code conversation, a workflow `agent()` model, a scheduled job, or the [advisor](../pi-advisor-subagent) pipeline. The message names this switch and the way out.
+- Every remaining `claude/*` spec is **refused by name**, wherever it comes from — an agent file's `model:` pin, a `/subagents` default, `Agent({ model: "claude/opus" })`, an already-resolved model object arriving over the extension RPC bridge, a resumed Claude Code conversation, a workflow `agent()` model, or a scheduled job. The message names this switch and the way out.
 - It does **not** fall through to the registry. Skipping the spec would let `claude/sonnet` fuzzy-match whatever else answers to "sonnet" and run a model from a provider you never named; refusing is the only answer that cannot silently switch providers.
 
 A registry that defines a real provider called `claude` is untouched: that is an ordinary pi provider, not this backend, and `claude/opus` keeps resolving through it.
 
-The advisor plugin reads the same switch, from the same file, so a machine with the backend off reports an advisor still pointing at `claude/opus` as unusable (naming the switch) instead of claiming it works.
+The setting is also re-read from disk on every resolution rather than captured once at start-up, so a hand edit takes effect without a restart.
 
 **Testing.** `PI_SUBAGENTS_CLAUDE_LIVE=1 npx vitest run src/claude-code/claude-code.live.test.ts` exercises the real CLI; the default run uses a fake binary and needs no auth.
 
@@ -738,7 +737,7 @@ The `agentOverrides` map — `{ "Explore": { model, thinking, enabled } }` — i
 
 **Worktree isolation** (`worktreeIsolation`, default `true`): whether `isolation: "worktree"` may create a worktree at all. Toggle via `/agents → Settings → Worktree isolation`, or set `false` in `subagents.json` on a repo where a copy costs too much time or disk. Off, the `Agent` tool's `isolation` parameter is dropped from the schema entirely and the bullet describing it leaves the tool description with it — nothing to pass, and no context spent describing it — and worktrees are refused on every other path too (agent files, scheduled jobs, cross-extension RPC). The `/agents` agent-file generator stops offering the `isolation:` frontmatter field too, so a generated agent can't bake in a request that would be refused. A requested worktree is downgraded to a normal run rather than failing the call, since declining one is the point; there is deliberately no note on the result, which is exactly why the prose has to go when the parameter does. The refusal applies immediately; the parameter and its prose appear or disappear on the next pi session. See [Turning worktrees off](#turning-worktrees-off).
 
-**Claude Code backend** (`claudeCode`, default `true`): whether a `claude/*` model may select the [Claude Code backend](#claude-code-backend). Set `false` on a machine that cannot run the external `claude` CLI — the same Claude models are then reached through a provider pi serves instead (Copilot, Anthropic, Bedrock), chosen per agent in `/subagents`. Off, `/subagents` stops offering the `claude/*` rows, and any surviving spec is refused with a message naming this switch rather than being fuzzy-matched to a lookalike model from another provider. A registry that defines a real provider called `claude` is unaffected — that is an ordinary pi provider, not this backend. Toggle via `/agents → Settings → Claude Code`; applied live. Unlike the settings above it is **not** written with this snapshot — that would copy the merged value into the project file and freeze today's default there — so the toggle rewrites the key in the file that already sets it (global when neither does). The advisor pipeline (`rpiv-advisor` / `rpiv-compressor`) reads the same switch through this extension's settings events, so it reports a `claude/*` stage as unusable on such a machine instead of claiming it works.
+**Claude Code backend** (`claudeCode`, default `true`): whether a `claude/*` model may select the [Claude Code backend](#claude-code-backend). Set `false` on a machine that cannot run the external `claude` CLI — the same Claude models are then reached through a provider pi serves instead (Copilot, Anthropic, Bedrock), chosen per agent in `/subagents`. Off, `/subagents` stops offering the `claude/*` rows, and any surviving spec is refused with a message naming this switch rather than being fuzzy-matched to a lookalike model from another provider. A registry that defines a real provider called `claude` is unaffected — that is an ordinary pi provider, not this backend. Toggle via `/agents → Settings → Claude Code`; applied live. Unlike the settings above it is **not** written with this snapshot — that would copy the merged value into the project file and freeze today's default there — so the toggle rewrites the key in the file that already sets it (global when neither does).
 
 **Report usage to session** (`reportUsage`, default `false`): whether subagent spend is added to *this* session's own totals. Subagents run in their own pi sessions, so by default pi's footer, statusline and `/cost` count only what the main model spent — a session that delegated most of its work reads as nearly free. Turn it on and each `Agent` / `get_subagent_result` / `steer_subagent` result carries the spend accumulated since the last one, which pi folds into `getSessionStats()`; `/cost` attributes it to the **Tools/summaries** bucket. Toggle via `/agents → Settings → Report usage to session`; applied live.
 
