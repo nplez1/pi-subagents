@@ -155,6 +155,53 @@ function occupiesForegroundSlot(
   return !!record.blocking && isTopLevelAgent(record);
 }
 
+/** How long a stopped run gets to settle on its own before its caller stops waiting. */
+export const ABORT_GRACE_MS = 5_000;
+
+/** Error recorded on a stopped run whose child never settled within the grace window. */
+const ABANDONED_MESSAGE =
+  "Stopped. The agent did not respond to the stop, so the caller was released; it may still be winding down.";
+
+/**
+ * Awaits `run`, but a stop must not depend on the child honouring it.
+ *
+ * Resolves `{ settled: true, value }` when `run` settles. If `signal` aborts
+ * first, a cooperative child still has `graceMs` to finish, so its result,
+ * worktree cleanup and usage land as they normally do. Only a child still
+ * pending after that window is abandoned: resolves `{ settled: false }` and
+ * releases the caller. The run may settle later; keep a handle on `run` if its
+ * outcome is still needed. Rejects only when `run` rejects.
+ */
+export function settleOrAbandon<T>(
+  run: Promise<T>,
+  signal: AbortSignal | undefined,
+  graceMs: number = ABORT_GRACE_MS,
+): Promise<{ settled: true; value: T } | { settled: false }> {
+  if (signal === undefined) return run.then((value) => ({ settled: true as const, value }));
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      timer ??= setTimeout(() => resolve({ settled: false }), graceMs);
+    };
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    run.then(
+      (value) => {
+        finish();
+        resolve({ settled: true, value });
+      },
+      (error: unknown) => {
+        finish();
+        reject(error);
+      },
+    );
+  });
+}
+
 /** Which concurrency pool a spawn is charged to, if any. */
 type Pool = "background" | "foreground";
 
@@ -1104,7 +1151,14 @@ export class AgentManager {
     // undefined when it was aborted while queued, or stopped mid-copy, and so
     // never ran — the record is already terminal with a completedAt, which is
     // what the caller renders.
-    if (record.promise) await record.promise;
+    // Raced against the abort, not awaited bare: see settleOrAbandon.
+    if (record.promise) {
+      const outcome = await settleOrAbandon(record.promise, record.abortController?.signal);
+      if (!outcome.settled) {
+        record.error ??= ABANDONED_MESSAGE;
+        record.completedAt ??= Date.now();
+      }
+    }
 
     // A record that ended "error" without ever getting a promise never ran: the
     // same startup failure spawn() rethrows on the immediate path (#179). Keep
@@ -1181,15 +1235,23 @@ export class AgentManager {
       return record;
     }
 
-    // Foreground resume: run inline and return the settled record.
+    // Foreground resume: run inline and return the settled record. It gets its
+    // own controller, as a background run does, so stop_subagent and /agents stop
+    // reach it. The caller's signal (Esc) forwards to that controller without
+    // marking the record stopped, so an interrupted resume still ends "aborted".
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
 
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    if (signal?.aborted) abortController.abort();
+    else signal?.addEventListener("abort", () => abortController.abort(), { once: true });
+
     try {
-      const outcome = await resumeAgent(record.session, prompt, {
+      const run = resumeAgent(record.session, prompt, {
         type: record.type,
         maxTurns: options?.maxTurns,
         onTurnEnd: options?.onTurnEnd,
@@ -1207,13 +1269,26 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: abortController.signal,
       });
-      this.settleResume(record, outcome);
+      const outcome = await settleOrAbandon(run, abortController.signal);
+      if (outcome.settled) {
+        this.settleResume(record, outcome.value);
+      } else {
+        record.error ??= ABANDONED_MESSAGE;
+        record.completedAt ??= Date.now();
+        // Settle the record whenever the wedged run finally does. The status stays
+        // "stopped": settleResume never overwrites it.
+        run.then((late) => this.settleResume(record, late), () => {});
+      }
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      // Cast: an abort during the await may have set "stopped", which the
+      // narrowing from the assignment above does not know about.
+      if ((record.status as AgentRecord["status"]) !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
+      record.completedAt ??= Date.now();
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -1455,6 +1530,9 @@ export class AgentManager {
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
+    // Now, not when the run settles: a stopped parent's nested children would
+    // otherwise keep burning tokens for as long as the parent stays wedged.
+    this.abortOwnedChildren(id);
     return true;
   }
 

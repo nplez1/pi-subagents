@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
+import { settleOrAbandon } from "./agent-manager.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -394,7 +395,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         while (record.status === "queued") {
           await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }
-        if (record.promise) await abortable(record.promise, signal);
+        if (record.promise) await abortable(settleOrAbandon(record.promise, record.abortController?.signal), signal);
       }
       return textResult(formatRecord(record, "fetched"), record.status === "error");
     },
