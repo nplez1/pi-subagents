@@ -354,3 +354,36 @@ describe("seeing and stopping everything", () => {
     expect(await open.call("list")).not.toMatch(/cold one/);
   });
 });
+
+describe("the two invariants the rewrite has to keep", () => {
+  it("requires nothing at the schema level, so one verb's field cannot block another", async () => {
+    open = await harness();
+    const schema = open.tools.get("manage_schedules")!.parameters as { required?: string[] };
+
+    // `action` is the only schema-level requirement, and it has to stay the only
+    // one: TypeBox cannot say "require `schedule` only when action is create", so
+    // a schema that demanded any per-verb field would block the verbs that do not
+    // take it — `list` has no `id`, the bulk verbs have neither. Each verb checks
+    // its own fields at execute time, where the answer reaches the model as text
+    // it can act on rather than as a validation failure it never sees.
+    expect(schema.required ?? []).toEqual(["action"]);
+
+    const result = await open.tools.get("manage_schedules")!.execute("call-2", {});
+    expect(result.content[0].text).toMatch(/action/i);
+  });
+
+  it("says a self-paced live loop is awaiting a wakeup instead of inventing a time", async () => {
+    open = await harness();
+    await open.call("create", { backend: "live", schedule: "5m", prompt: "live one" });
+    // Self-paced mode has no cadence to render — the model picks each delay at
+    // the end of a turn — so any countdown printed here would be a fiction, and
+    // a caller reading one would think the loop was armed when it is waiting.
+    open.live.set("live9", { id: "live9", prompt: "paced", mode: "dynamic", runs: 0, paused: false });
+
+    const listed = await open.call("list");
+
+    expect(listed).toMatch(/\[live\].*paced/);
+    expect(listed).toMatch(/self-paced/);
+    expect(listed).toMatch(/awaiting wakeup/);
+  });
+});
