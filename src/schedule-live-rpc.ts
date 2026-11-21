@@ -53,22 +53,37 @@ export interface LiveEventBus {
 export interface LiveLoopView {
 	id: string;
 	prompt: string;
-	/** `fixed` is interval-armed; `dynamic` self-paces via `ScheduleWakeup`. */
-	mode: "fixed" | "dynamic";
+	/** `fixed` is interval-armed; `dynamic` self-paces via `ScheduleWakeup`; `once` fires a single time. */
+	mode: "fixed" | "dynamic" | "once";
 	/** Fixed loops only. */
 	intervalMs?: number;
 	/** Epoch ms of the next fire; absent while a dynamic loop awaits a wakeup. */
 	nextAt?: number;
+	/** One-shot loops only: the instant it is due. */
+	fireAt?: number;
 	runs: number;
 	/** Paused loops keep their id and prompt but arm nothing. */
 	paused: boolean;
+	/** How many fires stop it; absent when it repeats until cancelled. */
+	maxRuns?: number;
+	/** Epoch ms after which it must not fire again. */
+	until?: number;
+	/** When the last fire started. */
+	lastRunAt?: number;
+	/** What the last fire's turn ended as, so a failing loop is visible. */
+	lastOutcome?: "ok" | "error";
+	lastError?: string;
 }
 
 /** What `create` answers with, so the caller can report the id and the cadence. */
 export interface LiveCreateResult {
 	id: string;
-	intervalMs: number;
+	/** Present for an interval loop; absent for a one-shot. */
+	intervalMs?: number;
 	nextAt?: number;
+	/** Present so the caller can tell a one-shot from a repeat in its report. */
+	mode?: "fixed" | "dynamic" | "once";
+	fireAt?: number;
 }
 
 /** Reply envelope shared with `/loop`'s RPC layer. */
@@ -132,11 +147,13 @@ export function callLiveRpc<T>(
  */
 export async function createLiveLoop(
 	bus: LiveEventBus,
-	input: { schedule: string; prompt: string },
+	input: { schedule: string; prompt: string; maxRuns?: number; until?: string },
 ): Promise<LiveCreateResult> {
 	const data = await callLiveRpc<LiveCreateResult>(bus, LIVE_CREATE, {
 		schedule: input.schedule,
 		prompt: input.prompt,
+		...(input.maxRuns !== undefined ? { maxRuns: input.maxRuns } : {}),
+		...(input.until !== undefined ? { until: input.until } : {}),
 	});
 	if (!data?.id) throw new Error("The /loop extension accepted the request but returned no loop id.");
 	return data;
@@ -160,6 +177,10 @@ export interface LiveLoopPatch {
 	prompt?: string;
 	/** Pause (`true`) or resume (`false`). */
 	paused?: boolean;
+	/** `0` clears the bound; a positive number stops it after that many fires. */
+	maxRuns?: number;
+	/** ISO stop time; an empty string clears it. */
+	until?: string;
 }
 
 /**
@@ -177,6 +198,8 @@ export async function updateLiveLoop(
 		...(patch.schedule !== undefined ? { schedule: patch.schedule } : {}),
 		...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
 		...(patch.paused !== undefined ? { paused: patch.paused } : {}),
+		...(patch.maxRuns !== undefined ? { maxRuns: patch.maxRuns } : {}),
+		...(patch.until !== undefined ? { until: patch.until } : {}),
 	});
 	if (!data?.job) throw new Error(`The /loop extension accepted the update but returned no loop "${patch.jobId}".`);
 	return data;

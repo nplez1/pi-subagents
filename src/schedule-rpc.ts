@@ -114,6 +114,14 @@ export interface ScheduleCreateInput {
 	max_turns?: number;
 	isolated?: boolean;
 	isolation?: ScheduledSubagent["isolation"];
+	/** Disable after this many fires. */
+	maxRuns?: number;
+	/** ISO timestamp the job must not fire at or after. */
+	until?: string;
+	/** IANA zone a cron expression is read in; refused for other types. */
+	timezone?: string;
+	/** Who armed it. Stamped by the tool layer, never by a model. */
+	origin?: ScheduledSubagent["origin"];
 }
 
 /** One job as a caller sees it: the stored row plus its live next run. */
@@ -136,6 +144,14 @@ export interface ScheduledJobView {
 	lastStatus?: ScheduledSubagent["lastStatus"];
 	/** From `getNextRun` — the armed timer's answer, not the stored snapshot. */
 	nextRun?: string;
+	/** How many fires stop the job; absent when it repeats until cancelled. */
+	maxRuns?: number;
+	/** ISO stop time; absent when it has none. */
+	until?: string;
+	/** The zone a cron expression is read in. */
+	timezone?: string;
+	/** Who armed it, so a listing can attribute it. */
+	origin?: ScheduledSubagent["origin"];
 }
 
 /** Default agent type for a scheduled job created without one. */
@@ -180,6 +196,10 @@ export function toJobView(
 		// fired before is a stale countdown. Reporting it made a paused job read
 		// as "next in 4m" in both `list` and the footer.
 		nextRun: job.enabled ? (nextRun ?? job.nextRun) : undefined,
+		maxRuns: job.maxRuns,
+		until: job.until,
+		timezone: job.timezone,
+		origin: job.origin,
 	};
 }
 
@@ -234,6 +254,10 @@ export function createSchedule(
 		max_turns: checked.max_turns,
 		isolated: input.isolated,
 		isolation: input.isolation,
+		maxRuns: input.maxRuns,
+		until: input.until,
+		timezone: input.timezone,
+		origin: input.origin,
 	});
 
 	return { id: job.id, name: job.name, nextRun: scheduler.getNextRun(job.id) };
@@ -345,6 +369,28 @@ export function updateSchedule(
 		changed.push(input.enabled ? "resumed" : "paused");
 	}
 
+	// A bound is removable as well as settable: `maxRuns: 0` and an empty `until`
+	// both mean "no bound", because a job armed with one and then told to keep
+	// going is a real request, and leaving no way to say it would force a cancel
+	// and a re-create that loses the job's id and history.
+	if (input.maxRuns !== undefined && input.maxRuns !== current.maxRuns) {
+		patch.maxRuns = input.maxRuns === 0 ? undefined : input.maxRuns;
+		changed.push(input.maxRuns === 0 ? "maxRuns removed" : `maxRuns ${input.maxRuns}`);
+	}
+
+	if (typeof input.until === "string") {
+		const until = input.until.trim() ? new Date(input.until).toISOString() : undefined;
+		if (until !== current.until) {
+			patch.until = until;
+			changed.push(until === undefined ? "until removed" : `until ${until}`);
+		}
+	}
+
+	if (typeof input.timezone === "string" && input.timezone.trim() && input.timezone.trim() !== current.timezone) {
+		patch.timezone = input.timezone.trim();
+		changed.push(`timezone ${patch.timezone}`);
+	}
+
 	if (changed.length === 0) {
 		throw new Error(
 			`Nothing changed for job "${id}". Pass at least one field that differs from what it already has.`,
@@ -355,7 +401,7 @@ export function updateSchedule(
 	// typo would restart the interval from now and move every later fire, which is
 	// not what "fix the wording" means.
 	const updated = scheduler.updateJob(id, patch, {
-		rearm: "schedule" in patch || "enabled" in patch,
+		rearm: "schedule" in patch || "enabled" in patch || "timezone" in patch,
 	});
 	if (!updated) throw new Error(`No scheduled job with id "${id}".`);
 	return { id, changed, job: toJobView(updated, scheduler.getNextRun(id)) };
@@ -389,6 +435,12 @@ export interface ScheduleUpdateInput {
 	thinking?: ScheduledSubagent["thinking"];
 	max_turns?: number;
 	enabled?: boolean;
+	/** `0` clears the bound; a positive number disables after that many fires. */
+	maxRuns?: number;
+	/** ISO stop time; an empty string clears it. */
+	until?: string;
+	/** IANA zone a cron expression is read in. */
+	timezone?: string;
 }
 
 /** Re-exported so a consumer can type the event stream it mirrors. */

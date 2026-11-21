@@ -348,6 +348,26 @@ export interface EnvInfo {
 }
 
 /**
+ * Where a scheduled job came from.
+ *
+ * Recorded on every job so two things stay answerable that the store's own
+ * session scoping cannot answer once a second writer exists: a listing can say
+ * who owns an entry, and a bulk operation (`pause_all` / `cancel_all`) can
+ * refuse to reach outside the session that created it. Depth and `agentId` are
+ * 0/absent for everything the top-level session arms today — scheduling tools
+ * are deliberately withheld from subagents — and exist so that decision can be
+ * revisited without a migration or an unattributable store.
+ */
+export interface JobOrigin {
+  /** Session id of the session that armed the job. */
+  sessionId: string;
+  /** 0 = the top-level session; >0 = armed from inside a subagent. */
+  depth: number;
+  /** Agent id when a subagent armed it; absent at the top level. */
+  agentId?: string;
+}
+
+/**
  * A subagent spawn registered to fire on a schedule.
  *
  * Stored at `<cwd>/.pi/subagent-schedules/<sessionId>.json`. Session-scoped:
@@ -373,6 +393,22 @@ export interface ScheduledSubagent {
   isolated?: boolean;
   isolation?: IsolationMode;
 
+  // bounds — how a repeating job stops without a parent turn to cancel it
+  /**
+   * Disable the job once this many fires have completed. Unset means "keep going
+   * until cancelled or its session ends".
+   */
+  maxRuns?: number;
+  /** ISO timestamp after which the job must not fire again. */
+  until?: string;
+  /**
+   * IANA zone a **cron** expression is interpreted in. Meaningless for interval
+   * and one-shot schedules, which are absolute durations from a known instant.
+   * Always stored explicitly when a cron job is created, so a zone the machine
+   * happened to have does not silently follow it to another one.
+   */
+  timezone?: string;
+
   // state
   enabled: boolean;
   /** ISO timestamp. */
@@ -382,6 +418,8 @@ export interface ScheduledSubagent {
   /** Refreshed on every fire and on store load. */
   nextRun?: string;
   runCount: number;
+  /** Who armed it. Absent on rows written before this field existed. */
+  origin?: JobOrigin;
 }
 
 export interface ScheduleStoreData {

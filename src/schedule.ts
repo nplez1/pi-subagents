@@ -24,7 +24,7 @@ import { resolveSpawnType } from "./agent-types.js";
 import { applyAgentDefaults } from "./agent-defaults.js";
 import { resolvePinnedModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
-import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import type { IsolationMode, JobOrigin, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -55,12 +55,30 @@ export interface NewJobInput {
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
+  /** Disable after this many fires. */
+  maxRuns?: number;
+  /** ISO timestamp the job must not fire at or after. */
+  until?: string;
+  /** IANA zone for a cron expression; refused for other schedule types. */
+  timezone?: string;
+  /** Who armed it, so a listing and a bulk operation can attribute it. */
+  origin?: JobOrigin;
 }
 
 export class SubagentScheduler {
   private jobs = new Map<string, Cron>();
   /** Ids with a fire that has not returned yet — `runNow`'s re-entrancy guard. */
   private inFlight = new Set<string>();
+  /**
+   * Ids whose fire is still *running*, as opposed to still being started.
+   *
+   * `inFlight` only covers the synchronous start (`executeJob` returns as soon as
+   * the child is spawned), so it cannot answer "is this job busy" for the next
+   * tick. Without this set an interval shorter than a run stacks concurrent
+   * subagents on one prompt, and scheduled fires bypass the concurrency queue, so
+   * nothing downstream would throttle them either.
+   */
+  private running = new Set<string>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private store: ScheduleStore | undefined;
   private pi: ExtensionAPI | undefined;
@@ -122,6 +140,10 @@ export class SubagentScheduler {
       schedule: detected.normalized,
       scheduleType: detected.type,
       intervalMs: detected.intervalMs,
+      maxRuns: SubagentScheduler.validateMaxRuns(input.maxRuns),
+      until: SubagentScheduler.validateUntil(input.until),
+      timezone: SubagentScheduler.resolveTimezone(detected.type, input.timezone),
+      origin: input.origin,
       subagent_type: input.subagent_type,
       prompt: input.prompt,
       model: input.model,
@@ -193,7 +215,7 @@ export class SubagentScheduler {
     const store = this.requireStore();
     const updated = store.update(id, patch);
     if (!updated) return undefined;
-    const timingChanged = "enabled" in patch || "schedule" in patch || "scheduleType" in patch;
+    const timingChanged = "enabled" in patch || "schedule" in patch || "scheduleType" in patch || "timezone" in patch;
     if (options.rearm === false && !timingChanged) {
       const settled = store.get(id) ?? updated;
       this.emit({ type: "updated", job: settled });
@@ -308,7 +330,10 @@ export class SubagentScheduler {
         }
       } else {
         // The tick ignores the outcome; `runNow` is the caller that reads it.
-        const cron = new Cron(job.schedule, () => {
+        // The zone is passed explicitly: a cron expression names a wall-clock
+        // time, and omitting the option would let croner read it in whatever zone
+        // the machine happens to be in.
+        const cron = new Cron(job.schedule, job.timezone ? { timezone: job.timezone } : {}, () => {
           this.executeJob(job.id);
         });
         this.jobs.set(job.id, cron);
@@ -350,6 +375,27 @@ export class SubagentScheduler {
     }
     const job = store.get(id);
     if (!job?.enabled) return { ok: false, error: `Job "${id}" is paused.` };
+
+    // Bounds before anything else: a job that has used up its fires or passed its
+    // stop time must not start another one, even with its timer still armed.
+    if (job.maxRuns !== undefined && job.runCount >= job.maxRuns) {
+      this.retire(id, `it has completed its ${job.maxRuns} run${job.maxRuns === 1 ? "" : "s"}`);
+      return { ok: false, error: `Job "${id}" is done: it has completed its ${job.maxRuns} run(s).` };
+    }
+    if (job.until !== undefined && Date.now() >= new Date(job.until).getTime()) {
+      this.retire(id, `it passed its stop time (${job.until})`);
+      return { ok: false, error: `Job "${id}" passed its stop time ${job.until} and was disabled.` };
+    }
+
+    // A fire that is still running is skipped rather than stacked. Scheduled
+    // fires bypass the concurrency queue by design, so an interval shorter than
+    // a run would otherwise put several subagents on the same prompt at once.
+    if (this.running.has(id)) {
+      return {
+        ok: false,
+        error: `Job "${id}" is still running from its last fire, so this fire was skipped; it will fire again on its own schedule.`,
+      };
+    }
 
     this.persist(id, { lastStatus: "running" });
 
@@ -414,17 +460,37 @@ export class SubagentScheduler {
       return { ok: false, error };
     }
 
+    this.running.add(id);
     this.emit({ type: "fired", jobId: id, agentId, name: job.name });
 
     const finalize = (status: "success" | "error") => {
+      this.running.delete(id);
       const next = this.getNextRun(id);
       const current = store.get(id);
+      const runCount = (current?.runCount ?? 0) + 1;
+      // A bound reached by *this* fire is applied now, not left for a tick to
+      // notice: the fire that just finished is the one that decided there would
+      // be no more, and waiting would let another spawn through first.
+      const exhausted = current?.maxRuns !== undefined && runCount >= current.maxRuns;
+      const until = current?.until;
+      const pastUntil =
+        until !== undefined && (next === undefined || new Date(next).getTime() >= new Date(until).getTime());
+      const stopping = exhausted || pastUntil;
       this.persist(id, {
         lastRun: new Date().toISOString(),
         lastStatus: status,
-        runCount: (current?.runCount ?? 0) + 1,
+        runCount,
         nextRun: next,
+        ...(stopping ? { enabled: false } : {}),
       });
+      if (stopping) {
+        const why = exhausted
+          ? `completed its ${current?.maxRuns} run${current?.maxRuns === 1 ? "" : "s"}`
+          : `reached its stop time (${until})`;
+        const settled = store.get(id);
+        this.emit({ type: "error", jobId: id, error: `Job "${id}" was disabled: it ${why}.` });
+        if (settled) this.emit({ type: "updated", job: settled });
+      }
     };
 
     // AgentManager's promise resolves either way (its .catch returns ""), so we
@@ -450,6 +516,17 @@ export class SubagentScheduler {
    * out of a timer tick, where nothing would catch it. The run itself is
    * unaffected, so the job keeps its schedule either way.
    */
+  /**
+   * Disable a job that has no work left in it and say so on the bus, so a
+   * consumer mirroring the store stops showing it as armed. The row itself
+   * survives as the record of what ran; only `removeJob` forgets it.
+   */
+  private retire(id: string, reason: string): void {
+    const updated = this.persist(id, { enabled: false });
+    this.emit({ type: "error", jobId: id, error: `Job "${id}" was disabled: ${reason}.` });
+    if (updated) this.emit({ type: "updated", job: updated });
+  }
+
   private persist(id: string, patch: Partial<ScheduledSubagent>): ScheduledSubagent | undefined {
     try {
       return this.store?.update(id, patch);
@@ -504,7 +581,7 @@ export class SubagentScheduler {
   }
 
   /** 6-field cron — 'second minute hour dom month dow'. */
-  static validateCronExpression(expr: string): { valid: boolean; error?: string } {
+  static validateCronExpression(expr: string, timezone?: string): { valid: boolean; error?: string } {
     const fields = expr.trim().split(/\s+/);
     if (fields.length !== 6) {
       return {
@@ -514,11 +591,69 @@ export class SubagentScheduler {
     }
     try {
       // Croner validates by construction.
-      new Cron(expr, () => {});
+      new Cron(expr, timezone ? { timezone } : {}, () => {});
       return { valid: true };
     } catch (e) {
       return { valid: false, error: e instanceof Error ? e.message : "Invalid cron expression" };
     }
+  }
+
+  /**
+   * The zone a cron expression is read in.
+   *
+   * A cron expression names a wall-clock time and carries no instant of its own —
+   * "9am" is 9am *somewhere* — so the zone has to belong to the job, not to
+   * whatever clock reads it later. Omitted, it defaults to this machine's
+   * resolved zone **written down**: leaving the default implicit is what makes a
+   * job silently fire at a different wall-clock time after a move, a travel day,
+   * or a DST shift on another machine.
+   *
+   * Interval and one-shot schedules are durations from a known instant, so a zone
+   * would be a field nothing reads. That is refused rather than dropped: a caller
+   * that passed one believed it did something.
+   */
+  static resolveTimezone(
+    scheduleType: ScheduledSubagent["scheduleType"],
+    requested?: string,
+  ): string | undefined {
+    if (scheduleType !== "cron") {
+      if (requested) {
+        throw new Error(
+          `A timezone only applies to a cron schedule, so "${requested}" would do nothing for a ${scheduleType} schedule. Drop it, or use a cron expression to name a wall-clock time.`,
+        );
+      }
+      return undefined;
+    }
+    const zone = (requested ?? "").trim() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      // Throws RangeError for an unknown zone — validation without a table to go stale.
+      new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    } catch {
+      throw new Error(
+        `Unknown timezone "${zone}". Use an IANA zone such as "America/Los_Angeles" or "Europe/London".`,
+      );
+    }
+    return zone;
+  }
+
+  /** A fire count bound must be a positive whole number, or absent. */
+  static validateMaxRuns(value: number | undefined): number | undefined {
+    if (value === undefined) return undefined;
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`maxRuns must be a whole number of at least 1, got ${value}.`);
+    }
+    return value;
+  }
+
+  /** A stop time must be a real, future instant — a past one would never fire. */
+  static validateUntil(value: string | undefined): string | undefined {
+    if (value === undefined) return undefined;
+    const at = new Date(value).getTime();
+    if (Number.isNaN(at)) throw new Error(`until must be an ISO timestamp, got "${value}".`);
+    if (at <= Date.now()) {
+      throw new Error(`until ${new Date(at).toISOString()} is in the past, so the job would never fire.`);
+    }
+    return new Date(at).toISOString();
   }
 
   /** "+10s"/"+5m"/"+1h"/"+2d" → ISO timestamp. */

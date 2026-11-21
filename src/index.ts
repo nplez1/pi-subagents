@@ -3061,6 +3061,44 @@ Terse command-style prompts produce shallow, generic work.
     return `last: ${job.lastStatus}${when}`;
   }
 
+  /**
+   * The bounds a job will stop on.
+   *
+   * A job with no bound repeats until cancelled or its session ends, which is a
+   * fact worth showing: "every 5m" and "every 5m, 3 runs left" are different
+   * commitments, and only one of them stops on its own.
+   */
+  function boundsLabel(job: {
+    maxRuns?: number;
+    /** ISO for a cold row, epoch ms for a live loop — both render the same way. */
+    until?: string | number;
+    timezone?: string;
+    scheduleType?: string;
+  }): string | undefined {
+    const parts: string[] = [];
+    if (job.maxRuns !== undefined) parts.push(`max ${job.maxRuns} run${job.maxRuns === 1 ? "" : "s"}`);
+    if (job.until !== undefined) {
+      parts.push(`until ${typeof job.until === "number" ? new Date(job.until).toISOString() : job.until}`);
+    }
+    if (job.timezone && job.scheduleType === "cron") parts.push(job.timezone);
+    return parts.length > 0 ? parts.join(" · ") : undefined;
+  }
+
+  /**
+   * Who is arming this job — stamped here, never taken from the model.
+   *
+   * The store is session-scoped, so every row belongs to this session and depth
+   * is 0: scheduling tools are deliberately withheld from subagents. The field
+   * exists so a listing can attribute work and a bulk verb can refuse to cross
+   * into another session's rows if that decision is ever revisited — ownership
+   * cannot be retrofitted onto a store that never recorded it.
+   */
+  function jobOrigin(ctx: ExtensionContext | undefined): ScheduledSubagent["origin"] {
+    const sessionId = ctx?.sessionManager?.getSessionId?.();
+    if (!sessionId) return undefined;
+    return { sessionId, depth: 0 };
+  }
+
   function describeColdJob(job: ScheduledJobView): string {
     const cadence = job.scheduleType === "interval" ? `every ${cadenceLabel(job.intervalMs)}` : job.schedule;
     const nextAt = job.nextRun ? Date.parse(job.nextRun) : NaN;
@@ -3073,13 +3111,17 @@ Terse command-style prompts produce shallow, generic work.
       job.prompt,
       job.runCount,
       coldState(job),
-      [config, lastOutcome(job)].filter(Boolean).join(" · "),
+      [config, boundsLabel(job), lastOutcome(job)].filter(Boolean).join(" · "),
     );
   }
 
   function describeLiveLoop(job: LiveLoopView): string {
     const cadence =
-      job.mode === "fixed" && job.intervalMs ? `every ${cadenceLabel(job.intervalMs)}` : "self-paced";
+      job.mode === "once"
+        ? "one-shot"
+        : job.mode === "fixed" && job.intervalMs
+          ? `every ${cadenceLabel(job.intervalMs)}`
+          : "self-paced";
     return describeScheduled(
       job.id,
       "live",
@@ -3088,6 +3130,12 @@ Terse command-style prompts produce shallow, generic work.
       job.prompt,
       job.runs,
       job.paused ? "paused" : undefined,
+      [
+        boundsLabel({ ...job }),
+        job.lastOutcome ? `last: ${job.lastOutcome}${job.lastError ? ` (${job.lastError})` : ""}` : undefined,
+      ]
+        .filter(Boolean)
+        .join(" · ") || undefined,
     );
   }
 
@@ -3209,7 +3257,7 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   /** Cold jobs carry knobs a live loop has no analogue for. */
-  const COLD_ONLY_FIELDS = ["name", "subagent_type", "model", "thinking", "max_turns"] as const;
+  const COLD_ONLY_FIELDS = ["name", "subagent_type", "model", "thinking", "max_turns", "timezone"] as const;
 
   /** The first cold-only field the caller actually supplied, if any. */
   function coldOnlyFieldsSupplied(params: Record<string, unknown>): string | undefined {
@@ -3244,17 +3292,29 @@ Terse command-style prompts produce shallow, generic work.
     );
   }
 
-  const scheduleActions = ["create", "list", "update", "run", "pause", "resume", "cancel"] as const;
+  const scheduleActions = [
+    "create",
+    "list",
+    "get",
+    "update",
+    "run",
+    "pause",
+    "resume",
+    "cancel",
+    "pause_all",
+    "cancel_all",
+  ] as const;
 
   registerToolReportingUsage(defineTool({
     name: SUBAGENT_TOOL_NAMES.SCHEDULES,
     label: "Manage Schedules",
     description:
-      "Create, inspect, change, pause, resume, trigger and cancel recurring or delayed work — this is the only way to do any of it; never ask the user to type a command for it. " +
+      "Create, inspect, change, pause, resume, trigger and cancel recurring or delayed work — one job, or every job at once — this is the only way to do any of it; never ask the user to type a command for it. " +
       "A job runs in one of two homes, chosen with `backend` at create time and shown as [cold] or [live] in every listing. " +
       "`cold` (default) is a job in the subagent scheduler: each fire spawns a fresh agent, adds nothing to this conversation, and its result arrives as a notification. " +
       "`live` is a loop that re-enters THIS conversation on each fire, inheriting its model and tools, and spends the main context every time — use it only when the repeat has to happen here. " +
-      "`schedule` is an interval (\"25m\", \"2h\", \"1d\") in both homes; 6-field cron and one-shot forms (\"+10m\", ISO) exist on cold only. " +
+      "`schedule` is an interval (\"25m\", \"2h\", \"1d\") in both homes, and both also take a one-shot (\"+10m\" or an ISO timestamp) that fires once and stops; 6-field cron exists on cold only. " +
+      "Give a repeating job a bound with `maxRuns` or `until` whenever it should not run forever: an unbounded job repeats until it is cancelled, and one nobody remembers keeps spending tokens. " +
       "Every action except create and list needs the `id` a create or list returned. Jobs are session-scoped: they survive /resume and never outlive the session.",
     promptSnippet: "Create, list, change, pause, resume, run now, or cancel scheduled work (cold subagent job or live loop)",
     promptGuidelines: [
@@ -3315,11 +3375,31 @@ Terse command-style prompts produce shallow, generic work.
       max_turns: Type.Optional(
         Type.Number({ description: "Cold jobs only: turn ceiling per fire. Omit for the agent type's own limit." }),
       ),
+      maxRuns: Type.Optional(
+        Type.Number({
+          description:
+            "Stop after this many fires. Omit for a job that repeats until cancelled. Pass 0 on update to clear a bound it already has.",
+        }),
+      ),
+      until: Type.Optional(
+        Type.String({
+          description:
+            "ISO timestamp after which the job must not fire again, e.g. \"2026-11-22T09:00:00Z\". Pass an empty string on update to clear it.",
+        }),
+      ),
+      timezone: Type.Optional(
+        Type.String({
+          description:
+            'Cold jobs only, and cron only: the IANA zone a cron expression is read in ("America/Los_Angeles"). Defaults to this machine\'s zone, recorded explicitly so the job does not silently move with the machine.',
+        }),
+      ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       const bus = pi.events;
       const id = typeof params.id === "string" ? params.id.trim() : "";
-      const needsId = ["update", "run", "pause", "resume", "cancel"];
+      // `get` names one job; the bulk verbs deliberately take no id, because
+      // "stop all of them" is the request that has no single id to name.
+      const needsId = ["get", "update", "run", "pause", "resume", "cancel"];
 
       if (needsId.includes(params.action) && !id) {
         return textResult(
@@ -3341,6 +3421,13 @@ Terse command-style prompts produce shallow, generic work.
         return textResult([...body, ...notes].join("\n"));
       }
 
+      // ---- get: one job, without dumping the roster into context ----
+      if (params.action === "get") {
+        const where = await findScheduled(ctx, id);
+        if (!where) return textResult(missingJob(id));
+        return textResult(where.kind === "cold" ? describeColdJob(where.job) : describeLiveLoop(where.job));
+      }
+
       // ---- create ----
       if (params.action === "create") {
         const schedule = typeof params.schedule === "string" ? params.schedule.trim() : "";
@@ -3359,10 +3446,23 @@ Terse command-style prompts produce shallow, generic work.
           const coldOnly = coldOnlyFieldsSupplied(params);
           if (coldOnly) return textResult(coldOnlyFieldsRefusal(coldOnly, "create"));
           try {
-            const created = await createLiveLoop(bus, { schedule, prompt });
+            const created = await createLiveLoop(bus, {
+              schedule,
+              prompt,
+              maxRuns: params.maxRuns,
+              until: params.until,
+            });
+            const cadence =
+              created.mode === "once"
+                ? `once${created.fireAt ? `, at ${new Date(created.fireAt).toISOString()}` : ""}`
+                : `every ${cadenceLabel(created.intervalMs)}`;
+            const shape =
+              created.mode === "once"
+                ? `It fires into this conversation once, then ends. `
+                : `It re-enters this conversation on each fire, so every tick spends the main context. First fire as soon as this turn ends. `;
             return textResult(
-              `Armed live loop ${created.id}: "${briefPrompt(prompt)}", every ${cadenceLabel(created.intervalMs)}. ` +
-                `It re-enters this conversation on each fire, so every tick spends the main context. First fire as soon as this turn ends. ` +
+              `Armed live loop ${created.id}: "${briefPrompt(prompt)}", ${cadence}. ` +
+                shape +
                 `Manage it with manage_schedules { action: "update" | "run" | "pause" | "cancel", id: "${created.id}" }.`,
             );
           } catch (err) {
@@ -3400,6 +3500,10 @@ Terse command-style prompts produce shallow, generic work.
             model: params.model,
             thinking: params.thinking as ScheduledSubagent["thinking"],
             max_turns: params.max_turns,
+            maxRuns: params.maxRuns,
+            until: params.until,
+            timezone: params.timezone,
+            origin: jobOrigin(ctx),
           });
           const view = listSchedules(scheduler).jobs.find((job) => job.id === created.id);
           const cadence = view
@@ -3456,6 +3560,25 @@ Terse command-style prompts produce shallow, generic work.
               thinking: params.thinking as ScheduledSubagent["thinking"],
               max_turns: params.max_turns,
               enabled: paused === undefined ? undefined : !paused,
+              // Validated here because `updateJob` takes an already-validated
+              // patch: a bound or zone that create would refuse must not slip in
+              // through the update path.
+              maxRuns: params.maxRuns,
+              until:
+                typeof params.until === "string"
+                  ? params.until.trim()
+                    ? SubagentScheduler.validateUntil(params.until)
+                    : ""
+                  : undefined,
+              timezone:
+                typeof params.timezone === "string" && params.timezone.trim()
+                  ? SubagentScheduler.resolveTimezone(
+                      typeof params.schedule === "string" && params.schedule.trim()
+                        ? scheduler.normalizeSchedule(params.schedule).scheduleType
+                        : where.job.scheduleType,
+                      params.timezone,
+                    )
+                  : undefined,
             });
             const job = result.job;
             const state = coldState(job) ?? "armed";
@@ -3478,6 +3601,8 @@ Terse command-style prompts produce shallow, generic work.
             schedule: params.schedule,
             prompt: params.prompt,
             paused,
+            maxRuns: params.maxRuns,
+            until: params.until,
           });
           return textResult(`Updated live loop ${id} (${result.changed.join(", ")}). It is now: ${describeLiveLoop(result.job)}`);
         } catch (err) {
@@ -3513,6 +3638,65 @@ Terse command-style prompts produce shallow, generic work.
         } catch (err) {
           return textResult(`run failed for ${id} — ${err instanceof Error ? err.message : String(err)}`);
         }
+      }
+
+      // ---- bulk: pause_all / cancel_all ----
+      //
+      // One verb rather than a loop of single calls: "stop everything" is the
+      // request a caller makes when it does not know what is running, and asking
+      // it to list first and then cancel N ids is how a job survives to keep
+      // spending tokens. `backend` narrows it to one home when that is meant.
+      if (params.action === "pause_all" || params.action === "cancel_all") {
+        const cancelling = params.action === "cancel_all";
+        const done: string[] = [];
+        const skipped: string[] = [];
+        const here = ctx?.sessionManager?.getSessionId?.();
+
+        for (const job of params.backend === "live" ? [] : coldJobsFor(ctx)) {
+          // Ownership is checked, not assumed: the store is session-scoped today,
+          // so this never fires, and it is exactly the guard that keeps a bulk
+          // verb honest if schedules are ever shared across sessions.
+          if (here && job.origin && job.origin.sessionId !== here) {
+            skipped.push(`cold ${job.id} (armed by another session)`);
+            continue;
+          }
+          if (cancelling) {
+            const store = scheduler.isActive() ? undefined : passiveStore(ctx);
+            if (store ? store.remove(job.id) : removeSchedule(scheduler, job.id)) done.push(`cold ${job.id}`);
+            else skipped.push(`cold ${job.id} (the store would not release it)`);
+            continue;
+          }
+          if (!scheduler.isActive()) {
+            skipped.push(`cold ${job.id} (scheduling is off, so only cancel is available)`);
+            continue;
+          }
+          try {
+            updateSchedule(scheduler, { jobId: job.id, enabled: false });
+            done.push(`cold ${job.id}`);
+          } catch (err) {
+            skipped.push(`cold ${job.id} (${err instanceof Error ? err.message : String(err)})`);
+          }
+        }
+
+        if (params.backend !== "cold" && !liveBackendAbsent) {
+          try {
+            for (const job of await listLiveLoops(pi.events)) {
+              if (cancelling) await cancelLiveLoop(pi.events, job.id);
+              else await updateLiveLoop(pi.events, { jobId: job.id, paused: true });
+              done.push(`live ${job.id}`);
+            }
+          } catch (err) {
+            if (isLiveBackendAbsent(err)) liveBackendAbsent = true;
+            else skipped.push(`live (${err instanceof Error ? err.message : String(err)})`);
+          }
+        }
+
+        const verb = cancelling ? "Cancelled" : "Paused";
+        const summary =
+          done.length > 0
+            ? `${verb} ${done.length} job${done.length === 1 ? "" : "s"}: ${done.join(", ")}.`
+            : `Nothing was ${cancelling ? "cancelled" : "paused"} — this session has no scheduled work${params.backend ? ` in the ${params.backend} backend` : ""}.`;
+        return textResult([summary, ...skipped.map((note) => `Skipped ${note}`)].join("\n"));
       }
 
       // ---- cancel: gone from both homes ----
