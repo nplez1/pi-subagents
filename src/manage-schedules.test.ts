@@ -296,3 +296,61 @@ describe("arguments", () => {
     }
   });
 });
+
+describe("seeing and stopping everything", () => {
+  it("answers `get` with one job instead of the whole roster", async () => {
+    open = await harness();
+    const id = /Scheduled cold job (\S+):/.exec(
+      await open.call("create", { schedule: "25m", prompt: "Still alive." }),
+    )?.[1] as string;
+    await open.call("create", { schedule: "1h", prompt: "Something else." });
+
+    const got = await open.call("get", { id });
+
+    expect(got).toMatch(new RegExp(id));
+    expect(got).toMatch(/Still alive\./);
+    // Paying for the roster is the cost `get` exists to avoid.
+    expect(got).not.toMatch(/Something else\./);
+  });
+
+  it("names a real job when `get` is handed an id that holds nothing", async () => {
+    open = await harness();
+    await open.call("create", { schedule: "25m", prompt: "Still alive." });
+
+    const got = await open.call("get", { id: "nope" });
+
+    expect(got).toMatch(/"nope"/);
+    // An id that names nothing has to answer with the way to find one.
+    expect(got).toMatch(/action: "list"/);
+  });
+
+  it("pauses every job in one call, across both homes", async () => {
+    open = await harness();
+    const cold = /Scheduled cold job (\S+):/.exec(
+      await open.call("create", { schedule: "25m", prompt: "cold one" }),
+    )?.[1] as string;
+    await open.call("create", { backend: "live", schedule: "5m", prompt: "live one" });
+
+    const summary = await open.call("pause_all");
+
+    // "Stop everything" is what a caller asks when it does not know what is
+    // running, so it cannot require a list first and then N single calls.
+    expect(summary).toMatch(/Paused 2 jobs/);
+    expect(summary).toMatch(/cold /);
+    expect(summary).toMatch(/live live1/);
+    expect(await open.call("get", { id: cold })).toMatch(/paused/i);
+  });
+
+  it("narrows cancel_all to one home when that is what was meant", async () => {
+    open = await harness();
+    await open.call("create", { schedule: "25m", prompt: "cold one" });
+    await open.call("create", { backend: "live", schedule: "5m", prompt: "live one" });
+
+    const summary = await open.call("cancel_all", { backend: "cold" });
+
+    expect(summary).toMatch(/Cancelled 1 job/);
+    expect(summary).not.toMatch(/live live1/);
+    expect(await open.call("list")).toMatch(/\[live\]/);
+    expect(await open.call("list")).not.toMatch(/cold one/);
+  });
+});

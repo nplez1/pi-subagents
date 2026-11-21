@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Each agent is notified as soon as it finishes
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
-- **Manage schedules** — the `manage_schedules` tool creates, lists, re-times, pauses, resumes, fires and cancels recurring or delayed work: `create` / `list` / `update` / `run` / `pause` / `resume` / `cancel`. A job is either a cold subagent job (fresh agent per fire, cron / interval / one-shot, PID-locked session-scoped persistence) or a live loop owned by pi-config's `/loop` (each fire re-enters the conversation), and every verb works on both. It is the only scheduling door the model has — the `Agent` tool's old `schedule` param is gone
+- **Manage schedules** — the `manage_schedules` tool creates, lists, inspects, re-times, pauses, resumes, fires and cancels recurring or delayed work: `create` / `list` / `get` / `update` / `run` / `pause` / `resume` / `cancel` / `pause_all` / `cancel_all`. A job is either a cold subagent job (fresh agent per fire, cron / interval / one-shot, PID-locked session-scoped persistence) or a live loop owned by pi-config's `/loop` (each fire re-enters the conversation), and every verb works on both. It is the only scheduling door the model has — the `Agent` tool's old `schedule` param is gone
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
 ## Install
@@ -81,13 +81,16 @@ command typed by a human:
 
 | action | what it does |
 | --- | --- |
-| `create` | arm a job: `schedule` + `prompt`, plus `backend` (`cold` by default, `live` for a loop that re-enters this conversation) |
-| `list` | every job in the session, both homes, with cadence, next run, run count, paused state, agent and prompt |
-| `update` | change the cadence, the prompt, the name, the agent type, the model, the thinking level or the turn cap |
+| `create` | arm a job: `schedule` + `prompt`, plus `backend` (`cold` by default, `live` for a loop that re-enters this conversation) and, for cold, `maxRuns` / `until` / `timezone` |
+| `list` | every job in the session, both homes, with cadence, next run, run count, paused state, bounds, agent and prompt |
+| `get` | one job by id — the same view as a `list` row, without paying for the roster |
+| `update` | change the cadence, the prompt, the name, the agent type, the model, the thinking level, the turn cap, or the bounds (`maxRuns`, `until`, `timezone`) |
 | `run` | fire it now, leaving its own schedule armed |
 | `pause` | keep the job and its history, but arm nothing |
 | `resume` | let it fire on its own cadence again (use `run` to fire it now) |
 | `cancel` | remove it for good |
+| `pause_all` | hold every job in the session without listing them first, optionally narrowed with `backend` |
+| `cancel_all` | remove every job in the session, optionally narrowed with `backend` |
 
 ```
 manage_schedules({
@@ -97,16 +100,25 @@ manage_schedules({
 })
 
 manage_schedules({ action: "list" })
+manage_schedules({ action: "get", id: "V1StGXR8" })
 manage_schedules({ action: "update", id: "V1StGXR8", schedule: "1h" })
 manage_schedules({ action: "cancel", id: "V1StGXR8" })
+manage_schedules({ action: "cancel_all", backend: "cold" })
 ```
 
-Schedule formats (both homes accept the interval forms; the rest are cold-only):
+Schedule formats — the interval forms work in both homes, a live loop also takes a one-shot, and
+only cron is cold-only:
 
 - **Interval** — `"30s"`, `"5m"`, `"1h"`, `"2d"`. Fires repeatedly at that interval.
-- **Cron** — 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes.
+- **Cron** — cold only. 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes. Read in the job's own `timezone`.
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
+
+A live loop refuses cron by name rather than rounding it into something else: a wall-clock
+expression spanning days would fire into a transcript nobody is watching, and the cold home already
+serves that shape properly. A one-shot live loop is the shape that was missing from that home — "in
+an hour, follow up here, in this conversation" previously had to go cold, where the fire arrives in a
+different conversation.
 
 Two execution homes, chosen with `backend` at create time and tagged `[cold]` / `[live]` in every
 listing:
@@ -133,6 +145,19 @@ loops (`/loop`) are unaffected throughout, because they are not this extension's
 Behaviour worth knowing:
 - A cold fire runs in the background and bypasses the `maxConcurrent` queue, so a 5-minute interval
   cannot be deferred behind long-running manual agents.
+- **A fire that is still running is skipped, not stacked.** Scheduled fires bypass the concurrency
+  queue by design, so an interval shorter than a run would otherwise put several subagents on one
+  prompt at once. The guard spans the child's run, not just its start.
+- **A repeating job can be given a bound**: `maxRuns` (stop after N fires) and/or `until` (stop at an
+  instant), on create or update, and both clearable (`maxRuns: 0`, empty `until`) — "keep going" is a
+  real request, and forcing a cancel-and-recreate would lose the id and the history. A bound reached
+  by a fire is applied by that fire rather than noticed by a later tick, so the row is already
+  disabled when the caller looks. Without one, a job repeats until someone remembers to cancel it.
+- **A cron expression records the zone it is read in.** Left implicit it followed the machine that
+  armed it, so "9am Monday" moved with a laptop and slipped by an hour across a DST change. The zone
+  is taken from `timezone` or defaulted to this machine's resolved zone and written down explicitly;
+  an unknown zone is refused by name, and a zone on an interval or one-shot schedule is refused
+  rather than dropped, because it could only ever be a field nothing reads.
 - `run` on a cold job keeps its timer armed (`also run now`, not `instead`), refuses while a previous
   fire of that job is still running, and reports a fire that failed synchronously as a failure rather
   than as a run that started.
@@ -140,6 +165,8 @@ Behaviour worth knowing:
   job's schedule. Changing the cadence or the paused state does.
 - A one-shot that has fired is `done`, not `paused`: it cannot be resumed, and `list` says so rather
   than inviting a resume that would silently fail.
+- Every job records its last fire's outcome, so a job failing every time is not indistinguishable from
+  a healthy one in `list` or `get`.
 - A cold switch that is off does not hide its jobs: they stay listed, cancellable, and inert until the
   user turns scheduling back on.
 - A paused job's timer is disarmed and its row and history stay; resuming arms it to fire at the next
@@ -520,16 +547,20 @@ Send a steering message to a running agent. The message interrupts after the cur
 
 ### `manage_schedules`
 
-The model's only door to scheduled work: create, list, update, run, pause, resume, cancel. See
-[Scheduling](#scheduling) for the verbs and the two execution homes.
+The model's only door to scheduled work: create, list, get, update, run, pause, resume, cancel, and the
+bulk `pause_all` / `cancel_all`. See [Scheduling](#scheduling) for the verbs and the two execution
+homes.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `action` | string | yes | `create`, `list`, `update`, `run`, `pause`, `resume` or `cancel` |
-| `id` | string | for everything but `create`/`list` | The id `create` or `list` returned |
-| `schedule` | string | to create | Interval (`25m`), or a cold-only 6-field cron / `+10m` / ISO one-shot |
+| `action` | string | yes | `create`, `list`, `get`, `update`, `run`, `pause`, `resume`, `cancel`, `pause_all` or `cancel_all` |
+| `id` | string | for every single-job verb | The id `create` or `list` returned |
+| `schedule` | string | to create | Interval (`25m`) in both homes; a one-shot (`+10m` / ISO) in both; 6-field cron cold only |
 | `prompt` | string | to create | What each fire is asked to do |
-| `backend` | string | no | `cold` (default) or `live` (a loop that re-enters this conversation) |
+| `backend` | string | no | `cold` (default) or `live` (a loop that re-enters this conversation); on the bulk verbs it narrows to one home |
+| `maxRuns` | number | no | Stop after this many fires. `0` clears an existing bound |
+| `until` | string | no | ISO instant after which it must not fire. `""` clears an existing stop time |
+| `timezone` | string | no | IANA zone a cron expression is read in, e.g. `America/Los_Angeles`. Defaults to this machine's zone, recorded on the job |
 | `name`, `subagent_type`, `model`, `thinking`, `max_turns` | — | no | Cold jobs only: what each fire runs as |
 
 ## Commands
