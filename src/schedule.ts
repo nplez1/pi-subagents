@@ -59,6 +59,8 @@ export interface NewJobInput {
 
 export class SubagentScheduler {
   private jobs = new Map<string, Cron>();
+  /** Ids with a fire that has not returned yet — `runNow`'s re-entrancy guard. */
+  private inFlight = new Set<string>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private store: ScheduleStore | undefined;
   private pi: ExtensionAPI | undefined;
@@ -102,6 +104,11 @@ export class SubagentScheduler {
     return this.store?.list() ?? [];
   }
 
+  /** Whether a job name is taken, excluding one id — `addJob`'s own rule, exposed. */
+  hasName(name: string, exceptId?: string): boolean {
+    return this.store?.hasName(name, exceptId) ?? false;
+  }
+
   /**
    * Build a `ScheduledSubagent` from user input. Validates the schedule
    * format and tags `scheduleType`. Throws on invalid input.
@@ -128,6 +135,25 @@ export class SubagentScheduler {
     };
   }
 
+  /**
+   * Validate and normalize a schedule string without creating anything.
+   *
+   * The same parser `addJob` uses, exposed so an update cannot accept something
+   * a create would refuse, or normalize it differently.
+   */
+  normalizeSchedule(schedule: string): {
+    schedule: string;
+    scheduleType: ScheduledSubagent["scheduleType"];
+    intervalMs?: number;
+  } {
+    const detected = SubagentScheduler.detectSchedule(schedule);
+    return {
+      schedule: detected.normalized,
+      scheduleType: detected.type,
+      intervalMs: detected.intervalMs,
+    };
+  }
+
   /** Add a job, persist, and arm if enabled. Returns the stored job. */
   addJob(input: NewJobInput): ScheduledSubagent {
     const store = this.requireStore();
@@ -150,15 +176,37 @@ export class SubagentScheduler {
     return ok;
   }
 
-  /** Toggle / mutate a job. Re-arms based on the new `enabled` state. */
-  updateJob(id: string, patch: Partial<ScheduledSubagent>): ScheduledSubagent | undefined {
+  /**
+   * Toggle / mutate a job.
+   *
+   * Re-arming is opt-out rather than always-on: unscheduling and rescheduling a
+   * 25-minute job to fix a typo in its prompt would restart the interval from
+   * now, silently moving every later fire. `rearm: false` leaves the armed timer
+   * untouched; an `enabled` or `schedule` change forces it regardless, since
+   * those are exactly what a timer cannot absorb.
+   */
+  updateJob(
+    id: string,
+    patch: Partial<ScheduledSubagent>,
+    options: { rearm?: boolean } = {},
+  ): ScheduledSubagent | undefined {
     const store = this.requireStore();
     const updated = store.update(id, patch);
     if (!updated) return undefined;
+    const timingChanged = "enabled" in patch || "schedule" in patch || "scheduleType" in patch;
+    if (options.rearm === false && !timingChanged) {
+      const settled = store.get(id) ?? updated;
+      this.emit({ type: "updated", job: settled });
+      return settled;
+    }
     this.unscheduleJob(id);
     if (updated.enabled) this.scheduleJob(updated);
-    this.emit({ type: "updated", job: updated });
-    return updated;
+    // Read back: `scheduleJob` can persist a correction (a past one-shot is
+    // disabled there), and returning the pre-arm row would describe a job the
+    // store no longer holds.
+    const settled = store.get(id) ?? updated;
+    this.emit({ type: "updated", job: settled });
+    return settled;
   }
 
   /** Next-run time as ISO, or undefined if not currently armed. */
@@ -178,6 +226,55 @@ export class SubagentScheduler {
     return undefined;
   }
 
+  /** One job as stored, or undefined when the id is unknown. */
+  getJob(id: string): ScheduledSubagent | undefined {
+    return this.store?.get(id);
+  }
+
+  /**
+   * Fire a job now, out of step with its own timer.
+   *
+   * The timer is left armed: this is "also run now", not "run instead of the
+   * schedule", so a caller that fires a 25m job at 3:00 still gets the 3:25 fire.
+   * A paused job refuses rather than firing — paused means paused, and a caller
+   * that wanted it to run could have resumed it in the same call — and so does a
+   * job still running from its last fire, which is the one case where "run now"
+   * would start a second subagent on the same prompt.
+   *
+   * Returned as a result rather than a boolean because every refusal has a
+   * different answer for the caller, and "did not fire" alone tells it nothing.
+   */
+  runNow(id: string): { ok: true; job: ScheduledSubagent } | { ok: false; error: string } {
+    const store = this.requireStore();
+    const job = store.get(id);
+    if (!job) return { ok: false, error: `No scheduled job with id "${id}".` };
+    if (!job.enabled) {
+      return {
+        ok: false,
+        error: `Job "${id}" is paused. Use manage_schedules { action: "resume", id: "${id}" } if it should run again.`,
+      };
+    }
+    // In-memory, not the persisted `lastStatus`: a job whose host crashed
+    // mid-fire, or whose fire hung, would otherwise refuse `run` forever, since
+    // nothing ever resets a persisted "running".
+    if (this.inFlight.has(id)) {
+      return {
+        ok: false,
+        error: `Job "${id}" is still running from its last fire; it will fire again on its own schedule.`,
+      };
+    }
+    this.inFlight.add(id);
+    try {
+      // A synchronous fire failure (an unresolvable model, a refused agent type)
+      // comes back here rather than being reported as a run that started.
+      const fired = this.executeJob(id);
+      if (!fired.ok) return fired;
+      return { ok: true, job };
+    } finally {
+      this.inFlight.delete(id);
+    }
+  }
+
   // ── Scheduling primitives ────────────────────────────────────────────
 
   private scheduleJob(job: ScheduledSubagent): void {
@@ -185,7 +282,9 @@ export class SubagentScheduler {
     if (!store) return;
     try {
       if (job.scheduleType === "interval" && job.intervalMs) {
-        const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
+        const t = setInterval(() => {
+          this.executeJob(job.id);
+        }, job.intervalMs);
         this.intervals.set(job.id, t);
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
@@ -199,12 +298,19 @@ export class SubagentScheduler {
           }, delay);
           this.intervals.set(job.id, t);
         } else {
-          // Past timestamp — disable, mark error, never fire
-          this.persist(job.id, { enabled: false, lastStatus: "error" });
+          // Past timestamp — disable, mark error, never fire. The `updated` event
+          // matters as much as the error one: a consumer mirroring the store
+          // learns the job is now disabled, where an error event alone leaves it
+          // rendering a job that is armed and will never fire.
+          const disabled = this.persist(job.id, { enabled: false, lastStatus: "error" });
           this.emit({ type: "error", jobId: job.id, error: `Scheduled time ${job.schedule} is in the past` });
+          if (disabled) this.emit({ type: "updated", job: disabled });
         }
       } else {
-        const cron = new Cron(job.schedule, () => this.executeJob(job.id));
+        // The tick ignores the outcome; `runNow` is the caller that reads it.
+        const cron = new Cron(job.schedule, () => {
+          this.executeJob(job.id);
+        });
         this.jobs.set(job.id, cron);
       }
     } catch (err) {
@@ -231,14 +337,19 @@ export class SubagentScheduler {
    * queue), persist completion. Fire-and-forget: the timer tick returns
    * immediately so other jobs keep firing.
    */
-  private executeJob(id: string): void {
+  private executeJob(id: string): { ok: true; agentId: string } | { ok: false; error: string } {
     const store = this.store;
     const pi = this.pi;
     const ctx = this.ctx;
     const manager = this.manager;
-    if (!store || !pi || !ctx || !manager) return;
+    // A timer tick ignores the result; `runNow` reports it, because "started" and
+    // "tried and failed synchronously" are the two things a caller must not have
+    // to guess between.
+    if (!store || !pi || !ctx || !manager) {
+      return { ok: false, error: "Scheduler not started — no active session." };
+    }
     const job = store.get(id);
-    if (!job?.enabled) return;
+    if (!job?.enabled) return { ok: false, error: `Job "${id}" is paused.` };
 
     this.persist(id, { lastStatus: "running" });
 
@@ -261,9 +372,9 @@ export class SubagentScheduler {
       // fire-time failure.
       const dispatch = resolveSpawnType(job.subagent_type);
       if (!dispatch.ok) throw new Error(dispatch.message);
-      // The job's own model/thinking (captured from the Agent call) win; where it
-      // has neither, the agent's configured default applies — the same precedence
-      // the Agent tool uses, so a scheduled run matches an on-demand one.
+      // The job's own model/thinking (whatever the create call pinned) win; where
+      // it has neither, the agent's configured default applies — the same
+      // precedence an on-demand spawn uses, so a scheduled run matches it.
       const defaults = applyAgentDefaults(
         dispatch.type,
         { model: resolvedModel, thinkingLevel: job.thinking },
@@ -300,7 +411,7 @@ export class SubagentScheduler {
       const error = err instanceof Error ? err.message : String(err);
       this.persist(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
       this.emit({ type: "error", jobId: id, error });
-      return;
+      return { ok: false, error };
     }
 
     this.emit({ type: "fired", jobId: id, agentId, name: job.name });
@@ -329,6 +440,8 @@ export class SubagentScheduler {
         finalize(failed ? "error" : "success");
       })
       .catch(() => finalize("error"));
+
+    return { ok: true, agentId };
   }
 
   /**

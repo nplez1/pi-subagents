@@ -64,6 +64,34 @@ function fakeScheduler(
 			return created;
 		},
 		removeJob: (id: string) => jobs.delete(id),
+		getJob: (id: string) => jobs.get(id),
+		hasName: (name: string, exceptId?: string) =>
+			[...jobs.values()].some((j) => j.name === name && j.id !== exceptId),
+		updateJob: (id: string, patch: Partial<ScheduledSubagent>, _options?: { rearm?: boolean }) => {
+			const current = jobs.get(id);
+			if (!current) return undefined;
+			const updated = { ...current, ...patch };
+			jobs.set(id, updated);
+			return updated;
+		},
+		// The real scheduler delegates to its static parser; the fake only needs
+		// the shape, so an interval token is enough for these cases.
+		normalizeSchedule: (schedule: string) => {
+			const match = /^(\d+)([smhd])$/.exec(schedule.trim());
+			if (!match) throw new Error(`Invalid schedule "${schedule}".`);
+			const unit: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+			return {
+				schedule: schedule.trim(),
+				scheduleType: "interval" as const,
+				intervalMs: Number(match[1]) * unit[match[2]],
+			};
+		},
+		runNow: (id: string) => {
+			const current = jobs.get(id);
+			if (!current) return { ok: false as const, error: `No scheduled job with id "${id}".` };
+			if (!current.enabled) return { ok: false as const, error: `Job "${id}" is paused.` };
+			return { ok: true as const, job: current };
+		},
 		getNextRun: (id: string) =>
 			jobs.has(id) ? "2026-01-01T00:01:00.000Z" : undefined,
 	};

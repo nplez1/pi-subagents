@@ -2,10 +2,11 @@
  * schedule-menu.ts — `/agents → Scheduled jobs` submenu.
  *
  * Minimal v1 surface: list scheduled jobs, select one to inspect details +
- * confirm cancellation. No create wizard (the `Agent` tool's `schedule` param
- * is the canonical creation path), no toggle/cleanup (cancel is enough for
- * "I scheduled something dumb, get rid of it"). Add management surfaces here
- * if real demand emerges.
+ * confirm cancellation. This is the *user's* view of cold jobs only — creation
+ * and the rest of the lifecycle live on `manage_schedules`, which is the model's
+ * one door, and `/loop --cold`, which is the user's: one command, one tool, one
+ * menu per audience rather than three overlapping ones. Add management surfaces
+ * here if real demand emerges.
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";

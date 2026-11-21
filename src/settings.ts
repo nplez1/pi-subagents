@@ -64,12 +64,17 @@ export interface SubagentsSettings {
    */
   backgroundByDefault?: boolean;
   /**
-   * Master switch for the schedule subagent feature. Defaults to `true`.
-   * When `false`: the `Agent` tool's `schedule` param + its guideline are
-   * stripped from the tool spec at registration (zero LLM-context cost), the
-   * scheduler doesn't bind to the session, and the `/agents → Scheduled jobs`
-   * menu entry is hidden. Schema-level removal applies at extension load
-   * (next pi session); runtime menu/runtime-fire short-circuit is immediate.
+   * Master switch for the subagent scheduler. Defaults to `true`.
+   * When `false`: the scheduler doesn't bind to the session, the `/agents →
+   * Scheduled jobs` menu entry is hidden, and `manage_schedules` refuses to arm
+   * a cold job (a `live` loop, which `/loop` owns, is unaffected). Runtime
+   * short-circuit is immediate.
+   *
+   * It no longer changes any tool schema: the `Agent` tool's `schedule` param
+   * was retired rather than gated, and `manage_schedules` is registered either
+   * way — a model must be able to *list* and *cancel* cold work even with the
+   * scheduler off, and a session that cannot explain "nothing is scheduled"
+   * is worse than one that can.
    */
   schedulingEnabled?: boolean;
   /**

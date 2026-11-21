@@ -5,6 +5,8 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   stop_subagent        — LLM-callable: stop a running agent, or a whole workflow run (wf_ id)
+ *   manage_schedules     — LLM-callable: create/list/update/pause/resume/run/cancel scheduled work
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -21,7 +23,7 @@ import { applyAgentDefaults } from "./agent-defaults.js";
 import { buildAgentDetails } from "./agent-details.js";
 import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findAgentRecordEntry } from "./agent-record-entry.js";
 import { buildNewAgentFile, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, removeFrontmatterKeys, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, settleOrAbandon } from "./agent-manager.js";
 import {
   type AgentOverride,
   agentOverridesEqual,
@@ -37,6 +39,7 @@ import { CLAUDE_CODE_MODEL_ALIASES, CLAUDE_CODE_PROVIDER, getClaudeCodeSessionSe
 import { claudeProviderSessionId } from "./claude-code/session.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { formatSpan } from "./duration.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -47,9 +50,27 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import {
+  createSchedule,
+  listSchedules,
+  removeSchedule,
+  runSchedule,
+  type ScheduledJobView,
+  toJobView,
+  updateSchedule,
+} from "./schedule-rpc.js";
+import {
+  cancelLiveLoop,
+  createLiveLoop,
+  isLiveBackendAbsent,
+  listLiveLoops,
+  type LiveLoopView,
+  runLiveLoop,
+  updateLiveLoop,
+} from "./schedule-live-rpc.js";
 import { applyAndEmitLoaded, loadSettings, persistToastFor, readAgentOverridesForScope, readClaudeCodeSetting, saveClaudeCodeSetting, type SubagentsSettings, saveAgentOverridesForScope, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type ThinkingLevel, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type ScheduledSubagent, type ThinkingLevel, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -766,6 +787,9 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    // A live backend that was missing in the last activation may be loaded in
+    // this one, so the memo is per-session, not per-process.
+    liveBackendAbsent = false;
     // Trust is only answerable once a session exists, and the initial load ran
     // before that: redo it now so a declined project's agent files never register.
     if (ctx.isProjectTrusted() === false) reloadCustomAgents();
@@ -1155,12 +1179,12 @@ export default function (pi: ExtensionAPI) {
   function getBackgroundByDefault(): boolean { return backgroundByDefault; }
   function setBackgroundByDefault(b: boolean) { backgroundByDefault = b; }
 
-  // Master switch for the schedule subagent feature. Defaults to enabled.
-  // Read once at extension init (before tool registration) so the Agent tool's
-  // param schema reflects the persisted setting. Runtime toggles via /agents
-  // → Settings short-circuit the menu entry + the execute-time addJob path
-  // immediately, but the schema-level removal only takes effect on next
-  // extension load (next pi session). Documented in CHANGELOG/README.
+  // Master switch for the subagent scheduler. Defaults to enabled.
+  // Runtime toggles short-circuit the `/agents → Scheduled jobs` menu entry, the
+  // scheduler binding and `manage_schedules`' cold-create path immediately.
+  // Deliberately NOT a tool-schema switch: the Agent tool's `schedule` param was
+  // retired outright, and `manage_schedules` registers either way so a model can
+  // still list and cancel whatever the store holds when the scheduler is off.
   let schedulingEnabled = true;
   function isSchedulingEnabled(): boolean { return schedulingEnabled; }
   function setSchedulingEnabled(b: boolean) { schedulingEnabled = b; }
@@ -1404,33 +1428,17 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Agent tool ----
 
-  // Schedule param + its guideline are gated on `schedulingEnabled` (read once
-  // at registration; flipping the setting later requires next pi session for
-  // the schema to update). Defining the shape once and spreading it via Partial
-  // preserves Type.Object's inference when present and produces a
-  // `schedule`-free schema when absent — zero LLM-context cost in disabled mode.
-  const scheduleParamShape = {
-    schedule: Type.Optional(
-      Type.String({
-        description:
-          'Opt-in only — fire later instead of now. Omit to run immediately (the default, almost always correct). ' +
-          'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h"), one-shot ("+10m" or ISO). ' +
-          'Forces run_in_background; incompatible with inherit_context and resume. Returns job ID.',
-      }),
-    ),
-  };
-  const scheduleParam: Partial<typeof scheduleParamShape> =
-    isSchedulingEnabled() ? scheduleParamShape : {};
+  // There is deliberately no `schedule` parameter here. Scheduling used to have
+  // two model-facing doors — this one and `manage_schedules` — and the louder
+  // guideline decided where a job landed, so a job created from a turn could end
+  // up somewhere the user was not looking. `manage_schedules` is now the only
+  // one, which also means it can list and cancel what it created. A caller that
+  // wants work to fire later calls it instead of this tool.
 
-  const scheduleGuideline = isSchedulingEnabled()
-    ? `\n- Use \`schedule\` only when the user explicitly asked for scheduled / recurring / delayed execution (e.g. "every Monday", "in an hour"). Don't auto-schedule from vague intent like "monitor X" — run once now or ask.`
-    : "";
-
-  // Same trade as scheduleParam/scheduleGuideline above: `isolationParam` drops
-  // the field from the schema when the project set `worktreeIsolation: false`,
-  // so the prose has to go with it. Left in, it would teach the model to pass a
-  // parameter that isn't declared — accepted (TypeBox sets no
-  // `additionalProperties: false`) and then silently dropped by the resolver.
+  // Same trade as the retired `schedule` param made, and `isolationParam` still
+  // makes: drop the field and its prose together. Left in, the prose would teach
+  // the model to pass a parameter that isn't declared — accepted (TypeBox sets
+  // no `additionalProperties: false`) and then silently dropped by the resolver.
   // With no per-result note by design, the model would have every reason to go
   // on reporting a `pi-agent-*` branch that was never created.
   const isolationGuideline = isWorktreeIsolationEnabled()
@@ -1493,11 +1501,12 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
+- Use stop_subagent to stop an agent that is hung, looping, or no longer needed — or a whole workflow run by its \`wf_\` ID. It acts immediately; do not ask the user to kill it.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
 - Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
+- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}
 
 ## Writing the prompt
 
@@ -1522,7 +1531,6 @@ Terse command-style prompts produce shallow, generic work.
       compactTypeList: buildCompactTypeListText,
       agentDir: getAgentDir,
       isolationGuideline: () => isolationGuideline,
-      scheduleGuideline: () => scheduleGuideline,
     };
     // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
     return template.replace(/\{\{(\w+)\}\}/g, (raw, name: string) => {
@@ -1624,7 +1632,6 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
       ...isolationParam(isWorktreeIsolationEnabled()),
-      ...scheduleParam,
     }),
 
     // ---- Custom rendering: Claude Code style ----
@@ -1920,47 +1927,17 @@ Terse command-style prompts produce shallow, generic work.
         };
       };
 
-      // ---- Schedule: register a job, don't spawn now ----
-      if (params.schedule) {
-        if (!isSchedulingEnabled()) {
-          return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
-        }
-        if (params.resume) {
-          return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
-        }
-        if (params.inherit_context) {
-          return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
-        }
-        if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
-        }
-        if (!scheduler.isActive()) {
-          return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
-        }
-        try {
-          const job = scheduler.addJob({
-            name: params.description as string,
-            description: params.description as string,
-            schedule: params.schedule as string,
-            // The caller's own name, not the substitute — the scheduler re-resolves
-            // at fire time, and the original is what a user edits.
-            subagent_type: requestedType,
-            prompt: params.prompt as string,
-            model: params.model as string | undefined,
-            thinking: thinking,
-            max_turns: effectiveMaxTurns,
-            isolated: isolated,
-            isolation: isolation,
-          });
-          const next = scheduler.getNextRun(job.id);
-          return textResult(
-            `${fallbackNote}Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
-            `Next run: ${next ?? "(unknown)"}. ` +
-            `Manage via /agents → Scheduled jobs.`,
-          );
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
+      // ---- Schedule: retired ----
+      //
+      // `params.schedule` is no longer declared, but a stale caller (an old agent
+      // file, a saved prompt, a pi that cached the schema) can still send it, and
+      // TypeBox does not reject unknown keys. Silence there would spawn an agent
+      // NOW while the caller believed it scheduled one, so this answers where the
+      // door moved instead.
+      if ((params as { schedule?: unknown }).schedule !== undefined) {
+        return textResult(
+          "The Agent tool no longer takes `schedule`. Call manage_schedules { action: \"create\", schedule, prompt } instead — it arms the job itself, and can list, update, pause, run and cancel it afterwards.",
+        );
       }
 
       // Resume existing agent
@@ -1987,7 +1964,7 @@ Terse command-style prompts produce shallow, generic work.
           if (existing.status === "running" || existing.status === "queued") {
             return textResult(
               `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+              `Use steer_subagent to send it a message mid-run, stop_subagent to stop it, or get_subagent_result to wait for it.`,
             );
           }
 
@@ -2008,7 +1985,7 @@ Terse command-style prompts produce shallow, generic work.
             (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
             `\nYou will be notified when this agent completes.\n` +
-            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages, or stop_subagent to stop it.`,
             { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
           );
         }
@@ -2123,7 +2100,7 @@ Terse command-style prompts produce shallow, generic work.
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages, or stop_subagent to stop it.\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
@@ -2617,6 +2594,7 @@ Terse command-style prompts produce shallow, generic work.
           text:
             `Workflow "${meta.name}" started in the background.\n` +
             `Task ID: ${runId}\n` +
+            `Stop it with stop_subagent (id ${runId}) if it hangs or is no longer needed.\n` +
             (task.scriptPath ? `Script: ${task.scriptPath}\n` : "") +
             (task.resumedFrom !== undefined
               ? `Resuming ${task.resumedFrom}: ${task.replay?.length ?? 0} recorded call(s) available to replay.\n`
@@ -2842,7 +2820,7 @@ Terse command-style prompts produce shallow, generic work.
             signal,
           );
         }
-        if (record.promise) await abortable(record.promise, signal);
+        if (record.promise) await abortable(settleOrAbandon(record.promise, record.abortController?.signal), signal);
       }
 
       const displayName = getDisplayName(record.type);
@@ -2943,6 +2921,625 @@ Terse command-style prompts produce shallow, generic work.
         );
       } catch (err) {
         return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  }));
+
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description:
+      "Stop a running agent, or a whole workflow run. Use it when an agent or workflow is hung, stuck, looping, or no longer needed — " +
+      "it acts immediately and does not wait on the agent to cooperate. Pass an agent ID or handle to stop that one agent; " +
+      "pass a workflow run ID (`wf_…`) to stop the entire run and every agent in it. " +
+      "Stopping a single workflow agent makes its agent() call return null, and the script carries on; stopping a run ends it as killed. " +
+      "Files and branches the agent already saved are kept.",
+    promptSnippet: "Stop a hung or unwanted agent, or a whole workflow run (wf_ id)",
+    parameters: Type.Object({
+      id: Type.String({
+        description: "An agent ID or handle (e.g. `@auth-audit`) to stop one agent, or a workflow run ID starting with `wf_` to stop the whole run.",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const ref = params.id.trim();
+
+      if (ref.startsWith("wf_")) {
+        const task = workflowTasks.get(ref);
+        if (!task) return textResult(`Workflow not found: "${ref}". It may have been cleaned up.`);
+        if (task.status !== "running" && task.status !== "paused") {
+          return textResult(`Workflow "${ref}" is not running (status: ${task.status}).`);
+        }
+        if (task.abortController.signal.aborted) return textResult(`Workflow "${ref}" is already stopping.`);
+        // The same signal the /agents dialog's stop uses: the runtime terminates
+        // the script and stops every running agent, without waiting on any of them.
+        task.abortController.abort();
+        return textResult(`Stopped workflow ${ref}. Its running agents were stopped, and no new ones will start.`);
+      }
+
+      const record = resolveAgentRef(ref);
+      if (!record) return textResult(`Agent not found: "${ref}". It may have been cleaned up.`);
+      // A nested child belongs to its parent agent, which holds the only handle on
+      // it. Stopping it from the top level would reach past that owner.
+      if (record.parentAgentId !== undefined) {
+        return textResult(`Agent "${ref}" is nested under agent ${record.parentAgentId}. Stop that parent instead.`);
+      }
+      if (record.status !== "running" && record.status !== "queued") {
+        return textResult(`Agent "${ref}" is not running (status: ${record.status}). Nothing to stop.`);
+      }
+      if (!manager.abort(record.id)) return textResult(`Could not stop agent "${ref}".`);
+      const inWorkflow = record.workflowId !== undefined
+        ? ` It is part of workflow ${record.workflowId}: its agent() call returned null and the run continues. To stop the whole run, use stop_subagent with "${record.workflowId}".`
+        : "";
+      return textResult(`Stopped agent ${record.id}.${inWorkflow}`);
+    },
+  }));
+
+  // ---- manage_schedules tool ----
+
+  /**
+   * The model's ONE door to recurring and delayed work.
+   *
+   * Why it exists in this shape: `/loop` gives the *user* a command, and the
+   * model had no counterpart. Asked to "check the deploy every 20 minutes", a
+   * model either scheduled nothing or told the user to type `/loop` — a command
+   * it cannot run from a reply, so the work simply never happened. The Agent
+   * tool's `schedule` parameter was a second, quieter door into the cold
+   * scheduler; it is gone, and every verb below lives on this tool instead.
+   *
+   * Two execution homes, one surface (the same split `/loop` and `/loop --cold`
+   * have for the user):
+   *
+   *   cold (default)  a row in this extension's scheduler. Each fire spawns a
+   *                   fresh subagent, so nothing is added to this transcript.
+   *   live            a loop in /loop's own table. Each fire re-enters THIS
+   *                   conversation with its model and tools intact, and pays for
+   *                   the transcript every time.
+   *
+   * Every verb works on both homes, because a caller that can arm a job but not
+   * re-time, pause, fire or cancel it has half a door — and half a door is what
+   * makes a model narrate commands at the user instead of acting.
+   */
+
+  /** `25m` for a cadence; a whole-minute span drops the zero seconds. */
+  function cadenceLabel(ms: number | undefined): string {
+    if (ms === 0) return "0s";
+    if (!ms || !Number.isFinite(ms) || ms < 0) return "unscheduled";
+    const span = formatSpan(ms, "seconds");
+    if (span.endsWith("m00s")) return span.slice(0, -3);
+    if (span.endsWith("h00m")) return span.slice(0, -3);
+    return span;
+  }
+
+  /** A prompt as one short line: this is a roster, not a transcript. */
+  function briefPrompt(prompt: string, max = 60): string {
+    const single = prompt.replace(/\s+/g, " ").trim();
+    return single.length > max ? `${single.slice(0, max - 1)}…` : single;
+  }
+
+  /** `next in 4m30s`, or the honest alternative when nothing is armed. */
+  function nextIn(epochMs: number | undefined, fallback: string): string {
+    if (epochMs === undefined || !Number.isFinite(epochMs)) return fallback;
+    return `next in ${cadenceLabel(Math.max(0, epochMs - Date.now()))}`;
+  }
+
+  /** One line per job, tagged with the home it runs in. */
+  function describeScheduled(
+    id: string,
+    kind: "cold" | "live",
+    cadence: string,
+    next: string,
+    prompt: string,
+    runs: number,
+    state: string | undefined,
+    extra?: string,
+  ): string {
+    const label = state ? ` · ${state}` : "";
+    const more = extra ? ` · ${extra}` : "";
+    return `◷ ${id} · [${kind}] ${cadence} · ${next} · runs ${runs}${more}${label} · "${briefPrompt(prompt)}"`;
+  }
+
+  /**
+   * A cold job's state word.
+   *
+   * A spent one-shot is disabled, but calling it "paused" is wrong twice over: it
+   * was never held, and `resume` cannot bring it back. Naming it `done` is the
+   * difference between a caller that understands the job and one that reports a
+   * failure it did not cause.
+   */
+  function coldState(job: ScheduledJobView): string | undefined {
+    if (job.scheduleType === "once" && !job.enabled) return "done";
+    return job.enabled ? undefined : "paused";
+  }
+
+  /** `last: error 3m ago` — the fact a failed fire leaves behind. */
+  function lastOutcome(job: ScheduledJobView): string | undefined {
+    if (!job.lastStatus) return undefined;
+    const at = job.lastRun ? Date.parse(job.lastRun) : NaN;
+    const when = Number.isFinite(at) ? ` ${formatSpan(Math.max(0, Date.now() - at), "seconds")} ago` : "";
+    return `last: ${job.lastStatus}${when}`;
+  }
+
+  function describeColdJob(job: ScheduledJobView): string {
+    const cadence = job.scheduleType === "interval" ? `every ${cadenceLabel(job.intervalMs)}` : job.schedule;
+    const nextAt = job.nextRun ? Date.parse(job.nextRun) : NaN;
+    const config = [job.subagent_type, job.model, job.thinking].filter(Boolean).join(" ");
+    return describeScheduled(
+      job.id,
+      "cold",
+      cadence,
+      nextIn(Number.isFinite(nextAt) ? nextAt : undefined, "unscheduled"),
+      job.prompt,
+      job.runCount,
+      coldState(job),
+      [config, lastOutcome(job)].filter(Boolean).join(" · "),
+    );
+  }
+
+  function describeLiveLoop(job: LiveLoopView): string {
+    const cadence =
+      job.mode === "fixed" && job.intervalMs ? `every ${cadenceLabel(job.intervalMs)}` : "self-paced";
+    return describeScheduled(
+      job.id,
+      "live",
+      cadence,
+      nextIn(job.nextAt, job.paused ? "paused" : "awaiting wakeup"),
+      job.prompt,
+      job.runs,
+      job.paused ? "paused" : undefined,
+    );
+  }
+
+  /**
+   * `scopeModels` for a model this tool is about to *store*.
+   *
+   * The policy belongs at arming time for the same reason it belongs on a spawn:
+   * this is a caller-supplied choice, so an out-of-scope one is refused rather
+   * than run three hours later in the dark. The retired `Agent`+`schedule` path
+   * got this check for free — it ran after the Agent tool's shared validation —
+   * and dropping it here would have been a quiet hole in the same policy.
+   *
+   * A spec the registry cannot resolve is left alone: auth can arrive between
+   * arming a job and its fire, and the scheduler already reports an unresolvable
+   * pin as a failed fire rather than silently substituting a model.
+   */
+  function scheduledModelRefusal(
+    ctx: ExtensionContext,
+    input: string | undefined,
+    agentLabel: string,
+  ): string | undefined {
+    if (!input || !isScopeModelsEnabled()) return undefined;
+    const resolved = resolveModel(input, ctx.modelRegistry);
+    if (typeof resolved === "string") return undefined;
+    const verdict = checkModelScope({
+      model: resolved,
+      cwd: ctx.cwd,
+      modelRegistry: ctx.modelRegistry,
+      callerSupplied: true,
+      agentLabel,
+      modelInput: input,
+    });
+    if (verdict.kind === "error") return verdict.message;
+    if (verdict.kind === "warn") ctx.ui.notify(verdict.message, "warning");
+    return undefined;
+  }
+
+  /**
+   * The scheduler's store, read directly, when the scheduler itself is off.
+   *
+   * `schedulingEnabled: false` stops the scheduler; it does not delete the store.
+   * Reading only through `scheduler` therefore answered "no cold job exists"
+   * while the user's jobs sat on disk — and `cancel`, the verb a caller reaches
+   * for precisely when things are off, said the id was unknown. A stopped
+   * scheduler is read through the same file it would have bound to.
+   */
+  function passiveStore(ctx: ExtensionContext | undefined): ScheduleStore | undefined {
+    if (scheduler.isActive() || !ctx) return undefined;
+    try {
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+      if (!sessionId) return undefined;
+      return new ScheduleStore(resolveStorePath(ctx.cwd, sessionId));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every cold job in this session, whether or not the scheduler is running. */
+  function coldJobsFor(ctx: ExtensionContext | undefined): ScheduledJobView[] {
+    if (scheduler.isActive()) return listSchedules(scheduler).jobs;
+    const store = passiveStore(ctx);
+    if (!store) return [];
+    return store.list().map((job) => toJobView(job, undefined));
+  }
+
+  /**
+   * A `/loop` that answered "not loaded" once will not load later in this
+   * session, so the 4-second timeout is paid once rather than on every verb.
+   */
+  let liveBackendAbsent = false;
+
+  /** Read every scheduled job in this session, from both homes. */
+  async function readScheduled(ctx: ExtensionContext | undefined): Promise<{ lines: string[]; notes: string[] }> {
+    const lines: string[] = [];
+    const notes: string[] = [];
+    const cold = coldJobsFor(ctx);
+    for (const job of cold) lines.push(describeColdJob(job));
+    if (!scheduler.isActive()) {
+      notes.push(
+        cold.length > 0
+          ? `Scheduling is off in this session (/agents → Settings → Scheduling): these ${cold.length} cold job(s) are held on disk and will not fire. They can still be cancelled here.`
+          : "Scheduling is off in this session, and its store holds no cold jobs.",
+      );
+    }
+    if (!liveBackendAbsent) {
+      try {
+        for (const job of await listLiveLoops(pi.events)) lines.push(describeLiveLoop(job));
+      } catch (err) {
+        if (isLiveBackendAbsent(err)) {
+          liveBackendAbsent = true;
+          notes.push("The /loop extension is not loaded in this session, so no live loop exists to list.");
+        } else {
+          notes.push(`Live loops could not be read: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    return { lines, notes };
+  }
+
+  type ScheduledLocation =
+    | { kind: "cold"; job: ScheduledJobView; passive: boolean }
+    | { kind: "live"; job: LiveLoopView };
+
+  /** Resolve an id to the home that owns it, or explain that neither does. */
+  async function findScheduled(
+    ctx: ExtensionContext | undefined,
+    id: string,
+  ): Promise<ScheduledLocation | undefined> {
+    const cold = coldJobsFor(ctx).find((job) => job.id === id);
+    if (cold) return { kind: "cold", job: cold, passive: !scheduler.isActive() };
+    if (liveBackendAbsent) return undefined;
+    try {
+      const live = (await listLiveLoops(pi.events)).find((job) => job.id === id);
+      if (live) return { kind: "live", job: live };
+    } catch (err) {
+      if (isLiveBackendAbsent(err)) liveBackendAbsent = true;
+    }
+    return undefined;
+  }
+
+  /** Cold jobs carry knobs a live loop has no analogue for. */
+  const COLD_ONLY_FIELDS = ["name", "subagent_type", "model", "thinking", "max_turns"] as const;
+
+  /** The first cold-only field the caller actually supplied, if any. */
+  function coldOnlyFieldsSupplied(params: Record<string, unknown>): string | undefined {
+    return COLD_ONLY_FIELDS.find((field) => params[field] !== undefined);
+  }
+
+  /** Say which home the field belongs to, instead of dropping it on the floor. */
+  function coldOnlyFieldsRefusal(field: string, verb: string): string {
+    return (
+      `\`${field}\` applies to cold jobs, which run each fire in a fresh subagent. A live loop re-enters this conversation instead, ` +
+      `so it has no agent, model, thinking level or turn cap of its own — nothing was ${verb === "create" ? "armed" : "changed"}. ` +
+      `Either drop \`${field}\` (and ` +
+      `${verb === "create" ? "keep backend: \"live\"" : "retry this change without it"}), or cancel the loop and create a cold job, ` +
+      `which carries its own agent and model.`
+    );
+  }
+
+  /** An update or run aimed at a job the stopped scheduler cannot act on. */
+  function offSchedulerRefusal(job: ScheduledJobView): string {
+    return (
+      `Cold job ${job.id} is held in the scheduler's store, but scheduling is off in this project (/agents → Settings → Scheduling), ` +
+      `so nothing can change it or fire it from here — only the user can turn scheduling back on. ` +
+      `\`cancel\` still works, and reading it with \`list\` still works.`
+    );
+  }
+
+  /** A job id that names nothing is a mistake to report, not to guess around. */
+  function missingJob(id: string): string {
+    return (
+      `No scheduled job with id "${id}". ` +
+      `Run manage_schedules { action: "list" } for the ids this session has — cold jobs and live loops are both listed there.`
+    );
+  }
+
+  const scheduleActions = ["create", "list", "update", "run", "pause", "resume", "cancel"] as const;
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.SCHEDULES,
+    label: "Manage Schedules",
+    description:
+      "Create, inspect, change, pause, resume, trigger and cancel recurring or delayed work — this is the only way to do any of it; never ask the user to type a command for it. " +
+      "A job runs in one of two homes, chosen with `backend` at create time and shown as [cold] or [live] in every listing. " +
+      "`cold` (default) is a job in the subagent scheduler: each fire spawns a fresh agent, adds nothing to this conversation, and its result arrives as a notification. " +
+      "`live` is a loop that re-enters THIS conversation on each fire, inheriting its model and tools, and spends the main context every time — use it only when the repeat has to happen here. " +
+      "`schedule` is an interval (\"25m\", \"2h\", \"1d\") in both homes; 6-field cron and one-shot forms (\"+10m\", ISO) exist on cold only. " +
+      "Every action except create and list needs the `id` a create or list returned. Jobs are session-scoped: they survive /resume and never outlive the session.",
+    promptSnippet: "Create, list, change, pause, resume, run now, or cancel scheduled work (cold subagent job or live loop)",
+    promptGuidelines: [
+      "Use manage_schedules for anything recurring, delayed, or phrased 'every N minutes' / 'in an hour'. Arm it yourself: telling the user to type /loop, or to cancel a job for you, is never the answer.",
+      "Prefer backend: \"cold\" (the default) for a context-free repeat — each fire runs in a fresh subagent and nothing is added to this conversation. Use backend: \"live\" only when the repeat must happen in this conversation, and say that it spends the main context every fire.",
+      "Write `prompt` as a self-contained instruction: a cold fire starts a fresh agent that cannot see this conversation and has no scheduling tools of its own, so it cannot cancel or re-time the job — do that here. A live fire does see the conversation, but still deserves a precise ask.",
+      "Before changing or cancelling, prefer the id you already have; call action: \"list\" when you do not. Never guess an id, and never describe how to cancel — cancel it.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union(
+        scheduleActions.map((action) => Type.Literal(action)),
+        {
+          description:
+            "create = arm a new job · list = every job in this session, both homes · update = change cadence/prompt/agent · run = fire it now, keeping its schedule · pause = keep it but stop it firing · resume = let it fire again · cancel = remove it for good",
+        },
+      ),
+      id: Type.Optional(
+        Type.String({
+          description: "The job id returned by create or list. Required for update, run, pause, resume and cancel.",
+        }),
+      ),
+      schedule: Type.Optional(
+        Type.String({
+          description:
+            'How often it fires. Interval: "25m", "2h", "1d". Cold jobs also accept 6-field cron ("0 0 9 * * 1" = 9am every Monday) and one-shot ("+10m" or an ISO timestamp). Required to create; optional in update.',
+        }),
+      ),
+      prompt: Type.Optional(
+        Type.String({
+          description:
+            "What each fire is asked to do. Required to create; optional in update. Write it as a self-contained instruction — a cold fire has no memory of this conversation.",
+        }),
+      ),
+      backend: Type.Optional(
+        Type.Union([Type.Literal("cold"), Type.Literal("live")], {
+          description:
+            'Where it runs. "cold" (default) = a fresh subagent per fire, cheap in this conversation. "live" = re-enters this conversation each fire, inheriting model and tools and spending the main context. Chosen at create time; an existing job keeps the home it was created in.',
+        }),
+      ),
+      name: Type.Optional(
+        Type.String({ description: "Cold jobs only: a short label for the job. Defaults to the prompt." }),
+      ),
+      subagent_type: Type.Optional(
+        Type.String({ description: "Cold jobs only: which agent type each fire runs as. Omit for the general-purpose default." }),
+      ),
+      model: Type.Optional(
+        Type.String({ description: "Cold jobs only: model for each fire (\"provider/modelId\" or a fuzzy name). Omit to inherit." }),
+      ),
+      thinking: Type.Optional(
+        // Enum rather than a free string: the scheduler validates on the way in,
+        // and advertising the values a caller may actually pass is cheaper for
+        // everyone than a rejection after the fact.
+        Type.Union(
+          (["minimal", "low", "medium", "high", "xhigh", "max"] as const).map((level) => Type.Literal(level)),
+          { description: "Cold jobs only: thinking level for each fire. Omit to inherit the agent type's default." },
+        ),
+      ),
+      max_turns: Type.Optional(
+        Type.Number({ description: "Cold jobs only: turn ceiling per fire. Omit for the agent type's own limit." }),
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const bus = pi.events;
+      const id = typeof params.id === "string" ? params.id.trim() : "";
+      const needsId = ["update", "run", "pause", "resume", "cancel"];
+
+      if (needsId.includes(params.action) && !id) {
+        return textResult(
+          `\`id\` is required to ${params.action}. Run manage_schedules { action: "list" } to see the ids this session has.`,
+        );
+      }
+
+      // ---- list ----
+      if (params.action === "list") {
+        const { lines, notes } = await readScheduled(ctx);
+        const body = lines.length > 0
+          ? [
+              `Scheduled work in this session (${lines.length}):`,
+              ...lines,
+              "",
+              `Change one with manage_schedules { action: "update", id } · fire it early with "run" · hold it with "pause" · remove it with "cancel".`,
+            ]
+          : ["Nothing is scheduled in this session."];
+        return textResult([...body, ...notes].join("\n"));
+      }
+
+      // ---- create ----
+      if (params.action === "create") {
+        const schedule = typeof params.schedule === "string" ? params.schedule.trim() : "";
+        const prompt = typeof params.prompt === "string" ? params.prompt.trim() : "";
+        if (!schedule) {
+          return textResult('`schedule` is required to create a job — an interval like "25m", or a cold-only cron / one-shot form.');
+        }
+        if (!prompt) {
+          return textResult("`prompt` is required to create a job — it is what every fire will be asked to do.");
+        }
+
+        const backend = params.backend ?? "cold";
+
+        if (backend === "live") {
+          if (!bus) return textResult("A live loop needs an event bus, and this session has none. Use backend: \"cold\".");
+          const coldOnly = coldOnlyFieldsSupplied(params);
+          if (coldOnly) return textResult(coldOnlyFieldsRefusal(coldOnly, "create"));
+          try {
+            const created = await createLiveLoop(bus, { schedule, prompt });
+            return textResult(
+              `Armed live loop ${created.id}: "${briefPrompt(prompt)}", every ${cadenceLabel(created.intervalMs)}. ` +
+                `It re-enters this conversation on each fire, so every tick spends the main context. First fire as soon as this turn ends. ` +
+                `Manage it with manage_schedules { action: "update" | "run" | "pause" | "cancel", id: "${created.id}" }.`,
+            );
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            if (isLiveBackendAbsent(err)) {
+              liveBackendAbsent = true;
+              return textResult(
+                `Nothing was armed: this session has no live backend (/loop is not loaded). Retry the same request with backend: "cold", which needs no live loop.`,
+              );
+            }
+            return textResult(`Nothing was armed — ${reason}`);
+          }
+        }
+
+        // Cold: the scheduler owns the timer, so it has to be live before we ask.
+        if (!isSchedulingEnabled()) {
+          return textResult(
+            "Scheduling is off in this project (/agents → Settings → Scheduling) and only the user can turn it back on, so no cold job can be armed. " +
+              "A live loop would run in this conversation instead and spend the main context on every fire: ask the user which they want rather than switching silently.",
+          );
+        }
+        if (!scheduler.isActive()) {
+          return textResult(
+            "The scheduler is not active in this session yet. Retry once the session has finished starting, or use backend: \"live\" for a loop that runs in this conversation.",
+          );
+        }
+        const refusedModel = scheduledModelRefusal(ctx, params.model, params.subagent_type ?? "scheduled job");
+        if (refusedModel) return textResult(refusedModel);
+        try {
+          const created = createSchedule(scheduler, {
+            name: params.name,
+            schedule,
+            prompt,
+            subagent_type: params.subagent_type,
+            model: params.model,
+            thinking: params.thinking as ScheduledSubagent["thinking"],
+            max_turns: params.max_turns,
+          });
+          const view = listSchedules(scheduler).jobs.find((job) => job.id === created.id);
+          const cadence = view
+            ? view.scheduleType === "interval"
+              ? `every ${cadenceLabel(view.intervalMs)}`
+              : view.schedule
+            : schedule;
+          return textResult(
+            `Scheduled cold job ${created.id}: "${briefPrompt(prompt)}" ${cadence}. ` +
+              `First run ${created.nextRun ?? "pending"}; the result of each fire arrives in this conversation as a notification. ` +
+              `Manage it with manage_schedules { action: "update" | "run" | "pause" | "cancel", id: "${created.id}" }.`,
+          );
+        } catch (err) {
+          return textResult(`Nothing was scheduled — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // ---- update / pause / resume ----
+      if (params.action === "update" || params.action === "pause" || params.action === "resume") {
+        const paused = params.action === "pause" ? true : params.action === "resume" ? false : undefined;
+        const where = await findScheduled(ctx, id);
+        if (!where) return textResult(missingJob(id));
+
+        try {
+          if (where.kind === "cold") {
+            // The scheduler is off: its rows are readable but inert, so say which
+            // verb still works rather than reporting a failure the caller caused.
+            if (where.passive) return textResult(offSchedulerRefusal(where.job));
+
+            const already = paused !== undefined && paused === !where.job.enabled;
+            if (already) return textResult(`Job ${id} is already ${paused ? "paused" : "armed"} — nothing changed. ${describeColdJob(where.job)}`);
+
+            if (params.action === "resume" && where.job.scheduleType === "once" && where.job.lastStatus) {
+              const spent = describeColdJob(where.job);
+              return textResult(
+                `Job ${id} is a one-shot that already fired, so there is nothing to resume: ${spent}. ` +
+                  `Create a new job for one more run, or an interval job if it should repeat.`,
+              );
+            }
+
+            const refusedModel = scheduledModelRefusal(
+              ctx,
+              params.model,
+              params.subagent_type ?? where.job.subagent_type,
+            );
+            if (refusedModel) return textResult(refusedModel);
+            const result = updateSchedule(scheduler, {
+              jobId: id,
+              schedule: params.schedule,
+              prompt: params.prompt,
+              name: params.name,
+              subagent_type: params.subagent_type,
+              model: params.model,
+              thinking: params.thinking as ScheduledSubagent["thinking"],
+              max_turns: params.max_turns,
+              enabled: paused === undefined ? undefined : !paused,
+            });
+            const job = result.job;
+            const state = coldState(job) ?? "armed";
+            return textResult(
+              `Updated cold job ${result.id} (${result.changed.join(", ")}). It is now ${state}: ${describeColdJob(job)}`,
+            );
+          }
+
+          // Live: a loop re-enters this conversation, so the cold-only knobs have
+          // nothing to act on. Silently dropping them reads as "applied".
+          const coldOnly = coldOnlyFieldsSupplied(params);
+          if (coldOnly) return textResult(coldOnlyFieldsRefusal(coldOnly, params.action));
+
+          const already = paused !== undefined && paused === where.job.paused;
+          if (already) return textResult(`Live loop ${id} is already ${paused ? "paused" : "running"} — nothing changed. ${describeLiveLoop(where.job)}`);
+
+          if (!bus) return textResult("A live loop needs an event bus, and this session has none.");
+          const result = await updateLiveLoop(bus, {
+            jobId: id,
+            schedule: params.schedule,
+            prompt: params.prompt,
+            paused,
+          });
+          return textResult(`Updated live loop ${id} (${result.changed.join(", ")}). It is now: ${describeLiveLoop(result.job)}`);
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          // A refusal is a real answer, not a crash: say what the store said.
+          return textResult(`${params.action} failed for ${id} — ${reason}`);
+        }
+      }
+
+      // ---- run: fire now, keep the schedule ----
+      if (params.action === "run") {
+        const where = await findScheduled(ctx, id);
+        if (!where) return textResult(missingJob(id));
+        try {
+          if (where.kind === "cold") {
+            if (where.passive) return textResult(offSchedulerRefusal(where.job));
+            const result = runSchedule(scheduler, id);
+            const nextAt = result.job.nextRun ? Date.parse(result.job.nextRun) : NaN;
+            return textResult(
+              `Fired cold job ${id} now. It started in a fresh subagent; its result will arrive here when it finishes, and the job stays armed (${nextIn(
+                Number.isFinite(nextAt) ? nextAt : undefined,
+                "its own schedule is unchanged",
+              )}).`,
+            );
+          }
+          if (!bus) return textResult("A live loop needs an event bus, and this session has none.");
+          const result = await runLiveLoop(bus, id);
+          return textResult(
+            `Queued live loop ${id} to fire as soon as this turn ends (a loop never steers the turn that triggered it). It is an extra fire: the armed slot still fires too — ${describeLiveLoop(
+              result.job,
+            )}`,
+          );
+        } catch (err) {
+          return textResult(`run failed for ${id} — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // ---- cancel: gone from both homes ----
+      const where = await findScheduled(ctx, id);
+      if (!where) return textResult(missingJob(id));
+      try {
+        if (where.kind === "cold") {
+          if (where.passive) {
+            // The scheduler is off, so there is no timer to disarm — but the row
+            // is still the job, and cancelling it is exactly what a caller wants
+            // when it can no longer do anything else with it.
+            const store = passiveStore(ctx);
+            if (!store?.remove(id)) {
+              return textResult(`Cold job ${id} could not be removed from the scheduler's store.\n${offSchedulerRefusal(where.job)}`);
+            }
+            return textResult(
+              `Cancelled cold job ${id} (it was held in the store with scheduling off, so nothing was firing anyway).`,
+            );
+          }
+          removeSchedule(scheduler, id);
+          return textResult(`Cancelled cold job ${id}. Its timer is disarmed and it will not fire again.`);
+        }
+        if (!bus) return textResult("A live loop needs an event bus, and this session has none.");
+        await cancelLiveLoop(bus, id);
+        return textResult(`Cancelled live loop ${id}. It will not fire again in this session.`);
+      } catch (err) {
+        return textResult(`cancel failed for ${id} — ${err instanceof Error ? err.message : String(err)}`);
       }
     },
   }));
@@ -4088,7 +4685,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "schedulingEnabled",
           label: "Scheduling",
-          description: "Schedule subagent feature (off removes `schedule` param from Agent tool spec on next pi session)",
+          description: "Scheduled subagent jobs (off stops the scheduler and hides them from manage_schedules; live /loop loops are unaffected)",
           currentValue: isSchedulingEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -4274,11 +4871,25 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ctx.ui.notify(`Scheduling already ${enabled ? "enabled" : "disabled"}.`, "info");
         } else {
           setSchedulingEnabled(enabled);
-          if (!enabled) scheduler.stop();  // immediate kill — outstanding fires stop ticking
-          notifyApplied(
-            ctx,
-            `Scheduling ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
-          );
+          if (enabled) {
+            // Bind immediately. Without this the scheduler only ever started on
+            // `session_start`, so switching scheduling back on left `create`
+            // answering "retry once the session has started" — advice that could
+            // never come true until the next restart.
+            if (!scheduler.isActive()) startScheduler(ctx);
+            notifyApplied(
+              ctx,
+              scheduler.isActive()
+                ? "Scheduling enabled. Armed jobs are firing again."
+                : "Scheduling enabled, but no session is bound yet — it starts with the next session.",
+            );
+          } else {
+            scheduler.stop();  // immediate kill — outstanding fires stop ticking
+            notifyApplied(
+              ctx,
+              "Scheduling disabled. Its jobs are kept and still listed and cancellable, but nothing fires.",
+            );
+          }
         }
       } else if (id === "workflowsEnabled") {
         const enabled = value === "on";

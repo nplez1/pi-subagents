@@ -43,13 +43,15 @@ const isolationParamShape = {
  * for a project whose model passes `"worktree"` on *every* call, so a
  * per-result "isolation was disabled" note would be noise on every result and
  * would keep raising the salience of a capability that isn't there. With no
- * field there is nothing to pass, nothing to drop, and nothing to explain — the
- * same trade `scheduleParam` makes for disabled scheduling, at zero LLM-context
- * cost. The resolver gate and the `agent-manager` check still cover the paths a
- * schema can't reach: agent files, the scheduler, and cross-extension RPC.
+ * field there is nothing to pass, nothing to drop, and nothing to explain, at
+ * zero LLM-context cost. The resolver gate and the `agent-manager` check still
+ * cover the paths a schema can't reach: agent files, the scheduler, and
+ * cross-extension RPC.
  *
- * Like `scheduleParam`, this is read once at tool registration — flipping the
- * setting needs a new pi session for the schema to change.
+ * Read once at tool registration — flipping the setting needs a new pi session
+ * for the schema to change. (`schedulingEnabled` used to have the same contract;
+ * it no longer touches a schema at all, since the `schedule` param it gated was
+ * retired in favour of `manage_schedules`.)
  */
 export function isolationParam(enabled: boolean): Partial<typeof isolationParamShape> {
   return enabled ? isolationParamShape : {};
@@ -62,11 +64,11 @@ interface AgentInvocationParams {
   inherit_context?: boolean;
   isolated?: boolean;
   /**
-   * Untyped on purpose. Both tool schemas now build this field conditionally
-   * and spread it, which erases TypeBox's literal inference to `unknown` (the
-   * `schedule` param has the same shape). The resolver below narrows by
-   * comparison rather than trusting the declaration, which also makes it safe
-   * for the cross-extension RPC path, where options arrive unvalidated.
+   * Untyped on purpose. The tool schema builds this field conditionally and
+   * spreads it, which erases TypeBox's literal inference to `unknown`. The
+   * resolver below narrows by comparison rather than trusting the declaration,
+   * which also makes it safe for the cross-extension RPC path, where options
+   * arrive unvalidated.
    */
   isolation?: unknown;
 }

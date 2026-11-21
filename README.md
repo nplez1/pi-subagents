@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Each agent is notified as soon as it finishes
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
-- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same immediate `subagent-notification` delivery as manual background completions; manage via `/agents → Scheduled jobs`
+- **Manage schedules** — the `manage_schedules` tool creates, lists, re-times, pauses, resumes, fires and cancels recurring or delayed work: `create` / `list` / `update` / `run` / `pause` / `resume` / `cancel`. A job is either a cold subagent job (fresh agent per fire, cron / interval / one-shot, PID-locked session-scoped persistence) or a live loop owned by pi-config's `/loop` (each fire re-enters the conversation), and every verb works on both. It is the only scheduling door the model has — the `Agent` tool's old `schedule` param is gone
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
 ## Install
@@ -76,34 +76,74 @@ Agents run in the background by default: the call returns an ID immediately and 
 
 ### Scheduling
 
-Add a `schedule` field to register the agent to fire later instead of running now:
+One tool, `manage_schedules`, and one verb per intent — nothing about scheduled work needs a
+command typed by a human:
+
+| action | what it does |
+| --- | --- |
+| `create` | arm a job: `schedule` + `prompt`, plus `backend` (`cold` by default, `live` for a loop that re-enters this conversation) |
+| `list` | every job in the session, both homes, with cadence, next run, run count, paused state, agent and prompt |
+| `update` | change the cadence, the prompt, the name, the agent type, the model, the thinking level or the turn cap |
+| `run` | fire it now, leaving its own schedule armed |
+| `pause` | keep the job and its history, but arm nothing |
+| `resume` | let it fire on its own cadence again (use `run` to fire it now) |
+| `cancel` | remove it for good |
 
 ```
-Agent({
-  subagent_type: "Explore",
-  prompt: "Look at recent commits and summarize what changed since last week",
-  description: "Weekly commit review",
-  schedule: "0 0 9 * * 1",   // 9am every Monday (6-field cron)
+manage_schedules({
+  action: "create",
+  schedule: "25m",
+  prompt: "Reply exactly: Still alive.",
 })
+
+manage_schedules({ action: "list" })
+manage_schedules({ action: "update", id: "V1StGXR8", schedule: "1h" })
+manage_schedules({ action: "cancel", id: "V1StGXR8" })
 ```
 
-Schedule formats:
+Schedule formats (both homes accept the interval forms; the rest are cold-only):
 
+- **Interval** — `"30s"`, `"5m"`, `"1h"`, `"2d"`. Fires repeatedly at that interval.
 - **Cron** — 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes.
-- **Interval** — `"5m"`, `"1h"`, `"30s"`, `"2d"`. Fires repeatedly at that interval.
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
 
-When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same immediate `subagent-notification` delivery as a manually-spawned background agent — your parent agent reasons about the result the same way.
+Two execution homes, chosen with `backend` at create time and tagged `[cold]` / `[live]` in every
+listing:
 
-Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
+- **`cold` (default)** — a row in this extension's scheduler. Each fire spawns a fresh subagent, so
+  nothing is added to the conversation, and the result arrives through the same immediate
+  `subagent-notification` delivery as a manually-spawned background agent. The fire has no scheduling
+  tools of its own, so a job cannot cancel or re-time itself — that stays with the caller.
+- **`live`** — a loop in `/loop`'s own table (pi-config). Each fire re-enters **this** conversation
+  with its model and tools intact, and pays for the transcript every time. That extension refuses a
+  live job cleanly, naming `/loop`, when it is not loaded.
 
-**Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.
+Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`, and nothing outlives
+the session. Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking
+for cross-instance safety; `/agents → Scheduled jobs` is the interactive view of the cold ones.
 
-Restrictions:
-- `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
-- `run_in_background: false` is refused — scheduled jobs always run in the background. Omitting it, or passing `true`, is fine.
-- Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
+**Disable the scheduler**: `/agents → Settings → Scheduling → disabled` stops the scheduler, hides the
+menu entry, and makes `manage_schedules` refuse to create or re-time a cold job. `list`, `cancel`,
+`pause` and `resume` keep working through the scheduler's own store, so a model can still see and clear
+what is held there — the store outlives the scheduler, and answering "nothing scheduled" while the
+user's jobs sit on disk is worse than useless. Turning it back on binds a scheduler immediately; live
+loops (`/loop`) are unaffected throughout, because they are not this extension's.
+
+Behaviour worth knowing:
+- A cold fire runs in the background and bypasses the `maxConcurrent` queue, so a 5-minute interval
+  cannot be deferred behind long-running manual agents.
+- `run` on a cold job keeps its timer armed (`also run now`, not `instead`), refuses while a previous
+  fire of that job is still running, and reports a fire that failed synchronously as a failure rather
+  than as a run that started.
+- Editing a prompt, name or model does not re-arm the timer, so a typo fix cannot move a 25-minute
+  job's schedule. Changing the cadence or the paused state does.
+- A one-shot that has fired is `done`, not `paused`: it cannot be resumed, and `list` says so rather
+  than inviting a resume that would silently fail.
+- A cold switch that is off does not hide its jobs: they stay listed, cancellable, and inert until the
+  user turns scheduling back on.
+- A paused job's timer is disarmed and its row and history stay; resuming arms it to fire at the next
+  idle window rather than one interval out.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
 
 ## UI
@@ -478,6 +518,20 @@ Send a steering message to a running agent. The message interrupts after the cur
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
 
+### `manage_schedules`
+
+The model's only door to scheduled work: create, list, update, run, pause, resume, cancel. See
+[Scheduling](#scheduling) for the verbs and the two execution homes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | yes | `create`, `list`, `update`, `run`, `pause`, `resume` or `cancel` |
+| `id` | string | for everything but `create`/`list` | The id `create` or `list` returned |
+| `schedule` | string | to create | Interval (`25m`), or a cold-only 6-field cron / `+10m` / ISO one-shot |
+| `prompt` | string | to create | What each fire is asked to do |
+| `backend` | string | no | `cold` (default) or `live` (a loop that re-enters this conversation) |
+| `name`, `subagent_type`, `model`, `thinking`, `max_turns` | — | no | Cold jobs only: what each fire runs as |
+
 ## Commands
 
 | Command | Description |
@@ -793,7 +847,7 @@ Launch an autonomous agent. Available types:
 Custom agents live in .pi/agents/ or {{agentDir}}/agents/.
 ```
 
-Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{isolationGuideline}}` and `{{scheduleGuideline}}` (each expands with its own leading newline + `- ` bullet when the matching feature is on — place them directly after your last rule line; empty when [worktree isolation](#turning-worktrees-off) / scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
+Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}` and `{{isolationGuideline}}` (expands with its own leading newline + `- ` bullet when [worktree isolation](#turning-worktrees-off) is on — place it directly after your last rule line; empty when it is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
 
 **Starting point:** copy [`examples/agent-tool-description.md`](examples/agent-tool-description.md) — it reproduces the default full description exactly (a CI test keeps it in sync), so you can trim from a known-good baseline instead of writing from scratch.
 
