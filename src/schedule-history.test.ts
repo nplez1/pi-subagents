@@ -23,7 +23,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function harness(outcome: { status: string; result?: string; error?: string }) {
+function harness(outcome: { status: string; result?: string; error?: string }, opts: { startup?: "never" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "pi-schedule-history-"));
   dirs.push(dir);
   const store = new ScheduleStore(join(dir, "schedules.json"));
@@ -32,7 +32,7 @@ function harness(outcome: { status: string; result?: string; error?: string }) {
   const events: Array<{ type: string; error?: string }> = [];
   const manager = {
     spawn: () => `agent-${++spawned}`,
-    awaitStartup: async () => {},
+    awaitStartup: opts.startup === "never" ? () => new Promise(() => {}) : async () => {},
     getRecord: () => ({ ...outcome, promise: Promise.resolve() }),
   };
   const pi = { events: { emit: (_: string, event: any) => events.push(event), on: () => () => {} } } as any;
@@ -185,6 +185,28 @@ describe("a bound means the same thing at create as at update", () => {
 
     expect(h.store.get(job.id)?.enabled).toBe(false);
     expect(h.scheduler.getNextRun(job.id)).toBeUndefined();
+    h.scheduler.stop();
+  });
+});
+
+describe("a late tick that is refused because the last fire is still running", () => {
+  it("counts every slot it ran past, and its own", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
+    vi.setSystemTime(Date.parse("2030-01-01T00:00:00Z"));
+    const h = harness({ status: "completed" }, { startup: "never" });
+    const job = h.add({ schedule: "1h" });
+
+    // This fire starts and never finishes, so the timer's next tick is refused.
+    vi.advanceTimersByTime(3_600_000);
+    expect(h.store.get(job.id)?.skipped).toBeUndefined();
+
+    // The refused tick lands at 06:30. The 02:00 slot it would have stood in for
+    // went unfired, and so did the four after it.
+    vi.setSystemTime(Date.parse("2030-01-01T05:30:00Z"));
+    vi.advanceTimersByTime(3_600_000);
+    vi.useRealTimers();
+
+    expect(h.store.get(job.id)?.skipped).toBe(5);
     h.scheduler.stop();
   });
 });

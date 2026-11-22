@@ -3530,7 +3530,7 @@ Terse command-style prompts produce shallow, generic work.
           });
           return textResult(describePreview(schedule, preview));
         } catch (err) {
-          return textResult(`create would refuse "${schedule}" — ${err instanceof Error ? err.message : String(err)}`);
+          return textResult(`create would refuse it — ${err instanceof Error ? err.message : String(err)}`);
         }
       }
 
@@ -3567,9 +3567,14 @@ Terse command-style prompts produce shallow, generic work.
               created.mode === "once"
                 ? `It fires into this conversation once, then ends. `
                 : `It re-enters this conversation on each fire, so every tick spends the main context. First fire as soon as this turn ends. `;
+            const unbounded =
+              created.mode !== "once" && !(params.maxRuns ?? 0) && !`${params.until ?? ""}`.trim()
+                ? "Unbounded, so it expires 7 days after create — give it maxRuns or until to run longer. "
+                : "";
             return textResult(
               `Armed live loop ${created.id}: "${briefPrompt(prompt)}", ${cadence}. ` +
                 shape +
+                unbounded +
                 `Manage it with manage_schedules { action: "update" | "run" | "pause" | "cancel", id: "${created.id}" }.`,
             );
           } catch (err) {
@@ -3620,9 +3625,16 @@ Terse command-style prompts produce shallow, generic work.
               : view.schedule
             : schedule;
           const firstAt = created.nextRun ? Date.parse(created.nextRun) : NaN;
+          // Said out loud because a cold job has no TTL of its own: unbounded here
+          // means it keeps firing until someone cancels it.
+          const unbounded =
+            view && view.scheduleType !== "once" && view.maxRuns === undefined && view.until === undefined
+              ? "It has no bound, so it repeats until you cancel it. "
+              : "";
           return textResult(
             `Scheduled cold job ${created.id}: "${briefPrompt(prompt)}" ${cadence}. ` +
               `First run ${Number.isFinite(firstAt) ? `${clockLabel(firstAt)} (${created.nextRun})` : "pending"}; the result of each fire arrives in this conversation as a notification. ` +
+              unbounded +
               `Manage it with manage_schedules { action: "update" | "run" | "pause" | "cancel", id: "${created.id}" }.`,
           );
         } catch (err) {

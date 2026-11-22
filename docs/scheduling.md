@@ -68,12 +68,14 @@ job, create a new one in the other home and cancel the old one.
   - *Live*: the cadence stays on its original phase — after a late fire the next one is the next slot
     of the original rhythm, not "one interval after the late fire", so "every 2h" does not drift.
   - *Cold interval*: Node timers stop while the machine sleeps, so the interval resumes from the late
-    fire's phase. The lateness and skipped slots are recorded; the phase is not restored.
+    fire's phase. The lateness and skipped slots are recorded; the phase is not restored. A forward
+    wall-clock correction counts as lateness too: from inside the timer, an NTP jump and a sleep look
+    the same.
   - *Cold cron*: croner schedules against the wall clock, so a slept-through slot is simply missed and
     the next matching time fires. It is not counted.
   - *Cold, still running*: a timer tick that finds the previous fire still running is skipped (scheduled
-    fires bypass the concurrency queue, so stacking would put several agents on one prompt). It counts
-    as a skipped slot.
+    fires bypass the concurrency queue, so stacking would put several agents on one prompt). Its own slot
+    is counted, and so is every slot it arrived past — nothing fired in their place.
 - **A closed session fires nothing.** On `/resume`, a live interval lands back on its phase, counts the
   slots that passed while closed, and says so once; it does not fire a burst. A live one-shot comes back
   at its own instant, and fires once at the first idle moment if that instant passed while closed. A cold

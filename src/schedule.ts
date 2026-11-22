@@ -443,8 +443,9 @@ export class SubagentScheduler {
     // a run would otherwise put several subagents on the same prompt at once.
     if (this.running.has(id)) {
       // Counted, not just refused: a slot that passed without a fire is the same
-      // fact whether the machine slept through it or the last run overran it.
-      if (trigger.timer) this.persist(id, { skipped: (job.skipped ?? 0) + 1 });
+      // fact whether the machine slept through it or the last run overran it, and
+      // nothing stood in for any of them — its own slot is skipped too.
+      if (trigger.timer) this.persist(id, { skipped: (job.skipped ?? 0) + (late?.skipped ?? 0) + 1 });
       return {
         ok: false,
         error: `Job "${id}" is still running from its last fire, so this fire was skipped; it will fire again on its own schedule.`,
