@@ -13,7 +13,7 @@ actually happens, what survives what, the bounds, and the gotchas. The short ver
 | action | needs | what it does |
 | --- | --- | --- |
 | `create` | `schedule`, `prompt` | arm a job; `backend` picks the home (`cold` by default) |
-| `preview` | `schedule` | the next fire times `create` would produce, with `backend` / `timezone` / `maxRuns` / `until` applied. **Arms nothing.** Reports what `create` would refuse, word for word |
+| `preview` | `schedule` | the next fire times `create` would produce, with `backend` / `timezone` / `maxRuns` / `until` applied. **Arms nothing.** Refuses what `create` would refuse |
 | `list` | — | every job in the session, both homes, one line each |
 | `get` | `id` | one job, plus its failure policy and its last 10 fires (when, outcome, how late, slots skipped, the head of what it answered) |
 | `update` | `id` + any field | change cadence, prompt, bounds, failure policy, and for cold the agent/model/thinking/turn cap/name/zone. Values the job already has are a no-op (`already has those values — nothing changed`), not an error; an update naming no field is refused |
@@ -85,14 +85,16 @@ job, create a new one in the other home and cancel the old one.
 - `maxRuns` (stop after N fires) and `until` (no fire at or after an instant) work in both homes, on
   create or update; `maxRuns: 0` and `until: ""` clear them. A bound reached by a fire is applied by
   that fire. **Bound every repeating job that should not run forever.**
-- **Live TTL**: an *unbounded* live loop expires 7 days after it was created (one final fire, then
-  gone). A live loop with `maxRuns` or `until` has its own end and is exempt. Clearing the last bound
-  starts a fresh 7 days. Cold jobs have no TTL.
+- **Live TTL**: an *unbounded* live loop stops 7 days after it was created — it is removed at the mark,
+  and only a fire already waiting for the session when the mark passes still lands. A live loop with
+  `maxRuns` or `until` has its own end and is exempt. Clearing the last bound starts a fresh 7 days.
+  Cold jobs have no TTL.
 - **Failure policy** (both homes): after `pauseAfterFailures` failed fires in a row (default **3**;
   `0` never), the job pauses itself and says why (`paused after 3 failed fires in a row`). It is paused,
   not cancelled — read `get` for what went wrong, fix it, then `resume`, which resets the count. A cold
   fire fails when its agent ends in error/aborted/stopped or cannot be spawned; a live fire fails when
-  any turn of it ends with `error` or `aborted`.
+  any turn of it ends with `error` or `aborted`. A manual `run` that fails counts toward the streak, and
+  a live fire interrupted with Esc ends `aborted`, so three interrupted fires also pause the loop.
 
 ## What survives what
 

@@ -173,8 +173,9 @@ export class SubagentScheduler {
       schedule: detected.normalized,
       scheduleType: detected.type,
       intervalMs: detected.intervalMs,
-      maxRuns: SubagentScheduler.validateMaxRuns(input.maxRuns),
-      until: SubagentScheduler.validateUntil(input.until),
+      // `0` and `""` mean "no bound" at create too, so create, update and preview agree.
+      maxRuns: SubagentScheduler.validateMaxRuns(input.maxRuns === 0 ? undefined : input.maxRuns),
+      until: SubagentScheduler.validateUntil(input.until?.trim() ? input.until : undefined),
       timezone: SubagentScheduler.resolveTimezone(detected.type, input.timezone),
       pauseAfterFailures: SubagentScheduler.validatePauseAfterFailures(input.pauseAfterFailures),
       origin: input.origin,
@@ -641,6 +642,8 @@ export class SubagentScheduler {
       ...(tripped ? { enabled: false, pausedReason } : {}),
     });
     if (!tripped) return;
+    // Disarm too: a paused cron job would otherwise keep reporting croner's next run.
+    this.unscheduleJob(id);
     this.emit({
       type: "error",
       jobId: id,

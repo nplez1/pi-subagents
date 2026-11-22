@@ -164,3 +164,27 @@ describe("a late interval fire", () => {
     h.scheduler.stop();
   });
 });
+
+describe("a bound means the same thing at create as at update", () => {
+  it("reads `maxRuns: 0` and a blank `until` as no bound", () => {
+    const h = harness({ status: "completed" });
+    const job = h.add({ maxRuns: 0, until: "" });
+    const stored = h.store.get(job.id);
+    expect(stored?.maxRuns).toBeUndefined();
+    expect(stored?.until).toBeUndefined();
+    h.scheduler.stop();
+  });
+
+  it("stops reporting a next run once a cron job has paused itself", async () => {
+    const h = harness({ status: "error", error: "boom" });
+    const job = h.add({ schedule: "0 0 9 * * 1", pauseAfterFailures: 1 });
+    expect(h.scheduler.getNextRun(job.id)).toBeTruthy();
+
+    h.scheduler.runNow(job.id);
+    await h.settle();
+
+    expect(h.store.get(job.id)?.enabled).toBe(false);
+    expect(h.scheduler.getNextRun(job.id)).toBeUndefined();
+    h.scheduler.stop();
+  });
+});

@@ -390,9 +390,12 @@ export function updateSchedule(
 	// both mean "no bound", because a job armed with one and then told to keep
 	// going is a real request, and leaving no way to say it would force a cancel
 	// and a re-create that loses the job's id and history.
-	if (input.maxRuns !== undefined && input.maxRuns !== current.maxRuns) {
-		patch.maxRuns = input.maxRuns === 0 ? undefined : input.maxRuns;
-		changed.push(input.maxRuns === 0 ? "maxRuns removed" : `maxRuns ${input.maxRuns}`);
+	if (input.maxRuns !== undefined) {
+		const next = input.maxRuns === 0 ? undefined : input.maxRuns;
+		if (next !== current.maxRuns) {
+			patch.maxRuns = next;
+			changed.push(next === undefined ? "maxRuns removed" : `maxRuns ${next}`);
+		}
 	}
 
 	if (typeof input.until === "string") {
