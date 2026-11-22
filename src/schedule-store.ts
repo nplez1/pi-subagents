@@ -11,10 +11,12 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { ScheduledSubagent, ScheduleStoreData } from "./types.js";
 
 const LOCK_MAX_RETRIES = 100;
+/** The directory `resolveStorePath` puts stores in — the only one this file will mark ignored. */
+const STORE_DIR_NAME = "subagent-schedules";
 
 function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -56,7 +58,7 @@ function releaseLock(lockPath: string): void {
 
 /** Resolve the storage path for a session-scoped store. */
 export function resolveStorePath(cwd: string, sessionId: string): string {
-  return join(cwd, ".pi", "subagent-schedules", `${sessionId}.json`);
+  return join(cwd, ".pi", STORE_DIR_NAME, `${sessionId}.json`);
 }
 
 export class ScheduleStore {
@@ -70,9 +72,26 @@ export class ScheduleStore {
     this.load();
   }
 
-  /** Create the backing directory lazily — only when we're about to persist. */
+  /**
+   * Create the backing directory lazily — only when we're about to persist.
+   *
+   * The directory sits under the session's cwd, which is usually somebody's
+   * repository, and that repository has no reason to list it in its own
+   * `.gitignore`. A self-ignoring folder keeps per-session state out of a
+   * `git add -A` without editing every repo pi is ever run in.
+   */
   private ensureDir(): void {
-    mkdirSync(dirname(this.filePath), { recursive: true });
+    const dir = dirname(this.filePath);
+    mkdirSync(dir, { recursive: true });
+    const ignore = join(dir, ".gitignore");
+    // Only the store's own directory: a `*` ignore anywhere else would hide a repo.
+    if (basename(dir) === STORE_DIR_NAME && !existsSync(ignore)) {
+      try {
+        writeFileSync(ignore, "# pi-subagents per-session schedule state\n*\n");
+      } catch {
+        // An unwritable ignore file is not worth failing a schedule write over.
+      }
+    }
   }
 
   /** Load from disk into the in-memory cache. Silent on parse errors. */

@@ -49,6 +49,7 @@ import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
+import { clockLabel, describePreview, previewSchedule } from "./schedule-preview.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import {
   createSchedule,
@@ -3018,10 +3019,62 @@ Terse command-style prompts produce shallow, generic work.
     return single.length > max ? `${single.slice(0, max - 1)}…` : single;
   }
 
-  /** `next in 4m30s`, or the honest alternative when nothing is armed. */
+  /** `next in 4m30s (14:05 PST)`, or the honest alternative when nothing is armed. */
   function nextIn(epochMs: number | undefined, fallback: string): string {
     if (epochMs === undefined || !Number.isFinite(epochMs)) return fallback;
-    return `next in ${cadenceLabel(Math.max(0, epochMs - Date.now()))}`;
+    return `next in ${cadenceLabel(Math.max(0, epochMs - Date.now()))} (${clockLabel(epochMs)})`;
+  }
+
+  /** `skipped 2 · failing ×1` — the facts a healthy-looking `runs` count hides. */
+  function healthLabel(job: { skipped?: number; failureStreak?: number; paused?: boolean }): string | undefined {
+    const parts: string[] = [];
+    if (job.skipped) parts.push(`skipped ${job.skipped}`);
+    if (job.failureStreak && !job.paused) parts.push(`failing ×${job.failureStreak}`);
+    return parts.length > 0 ? parts.join(" · ") : undefined;
+  }
+
+  /**
+   * The fire log `get` appends: when, how it went, how late, and what it said.
+   *
+   * This is what answers "what did my every-2h job find?" after the
+   * notification has scrolled away — the roster says it ran, this says what ran.
+   */
+  function historyLines(
+    records: ReadonlyArray<{
+      at: number;
+      outcome: string;
+      error?: string;
+      manual?: boolean;
+      lateMs?: number;
+      skipped?: number;
+      summary?: string;
+      agentId?: string;
+    }>,
+    policy: { pauseAfterFailures?: number; failureStreak?: number },
+  ): string[] {
+    const lines: string[] = [];
+    const limit = policy.pauseAfterFailures;
+    if (limit !== undefined) {
+      lines.push(
+        limit === 0
+          ? "Failure policy: never pauses on failure."
+          : `Failure policy: pauses after ${limit} failed fire${limit === 1 ? "" : "s"} in a row (current streak ${policy.failureStreak ?? 0}).`,
+      );
+    }
+    if (records.length === 0) return [...lines, "No fires yet."];
+    lines.push(`Last ${records.length} fire${records.length === 1 ? "" : "s"}, newest last:`);
+    for (const record of records) {
+      const facts = [
+        record.outcome,
+        record.manual ? "manual" : undefined,
+        record.lateMs ? `late ${formatSpan(record.lateMs, "seconds")}` : undefined,
+        record.skipped ? `${record.skipped} slot${record.skipped === 1 ? "" : "s"} skipped` : undefined,
+        record.error,
+        record.agentId ? `agent ${record.agentId}` : undefined,
+      ].filter(Boolean);
+      lines.push(`  ${clockLabel(record.at)} · ${facts.join(" · ")}${record.summary ? ` — "${record.summary}"` : ""}`);
+    }
+    return lines;
   }
 
   /** One line per job, tagged with the home it runs in. */
@@ -3050,7 +3103,7 @@ Terse command-style prompts produce shallow, generic work.
    */
   function coldState(job: ScheduledJobView): string | undefined {
     if (job.scheduleType === "once" && !job.enabled) return "done";
-    return job.enabled ? undefined : "paused";
+    return job.enabled ? undefined : (job.pausedReason ?? "paused");
   }
 
   /** `last: error 3m ago` — the fact a failed fire leaves behind. */
@@ -3111,7 +3164,7 @@ Terse command-style prompts produce shallow, generic work.
       job.prompt,
       job.runCount,
       coldState(job),
-      [config, boundsLabel(job), lastOutcome(job)].filter(Boolean).join(" · "),
+      [config, boundsLabel(job), lastOutcome(job), healthLabel({ ...job, paused: !job.enabled })].filter(Boolean).join(" · "),
     );
   }
 
@@ -3122,17 +3175,25 @@ Terse command-style prompts produce shallow, generic work.
         : job.mode === "fixed" && job.intervalMs
           ? `every ${cadenceLabel(job.intervalMs)}`
           : "self-paced";
+    // A held fire is the state worth naming: "next in 0s" for minutes reads as a
+    // stuck timer, when the truth is that this session has not gone idle.
+    const next =
+      job.waitingForIdle && !job.paused
+        ? `due ${cadenceLabel(Math.max(0, Date.now() - (job.dueSince ?? Date.now())))} ago, waiting for this session to go idle`
+        : nextIn(job.nextAt, job.paused ? "paused" : "awaiting wakeup");
     return describeScheduled(
       job.id,
       "live",
       cadence,
-      nextIn(job.nextAt, job.paused ? "paused" : "awaiting wakeup"),
+      next,
       job.prompt,
       job.runs,
-      job.paused ? "paused" : undefined,
+      job.paused ? (job.pausedReason ?? "paused") : undefined,
       [
         boundsLabel({ ...job }),
         job.lastOutcome ? `last: ${job.lastOutcome}${job.lastError ? ` (${job.lastError})` : ""}` : undefined,
+        healthLabel(job),
+        job.expiresAt !== undefined ? `expires ${clockLabel(job.expiresAt)}` : undefined,
       ]
         .filter(Boolean)
         .join(" · ") || undefined,
@@ -3294,6 +3355,7 @@ Terse command-style prompts produce shallow, generic work.
 
   const scheduleActions = [
     "create",
+    "preview",
     "list",
     "get",
     "update",
@@ -3314,8 +3376,10 @@ Terse command-style prompts produce shallow, generic work.
       "`cold` (default) is a job in the subagent scheduler: each fire spawns a fresh agent, adds nothing to this conversation, and its result arrives as a notification. " +
       "`live` is a loop that re-enters THIS conversation on each fire, inheriting its model and tools, and spends the main context every time — use it only when the repeat has to happen here. " +
       "`schedule` is an interval (\"25m\", \"2h\", \"1d\") in both homes, and both also take a one-shot (\"+10m\" or an ISO timestamp) that fires once and stops; 6-field cron exists on cold only. " +
-      "Give a repeating job a bound with `maxRuns` or `until` whenever it should not run forever: an unbounded job repeats until it is cancelled, and one nobody remembers keeps spending tokens. " +
-      "Every action except create and list needs the `id` a create or list returned. Jobs are session-scoped: they survive /resume and never outlive the session.",
+      "Give a repeating job a bound with `maxRuns` or `until` whenever it should not run forever: an unbounded job repeats until it is cancelled (an unbounded live loop also expires after 7 days), and one nobody remembers keeps spending tokens. " +
+      "A job pauses itself after `pauseAfterFailures` (default 3) failed fires in a row. Missed slots are never replayed: a late fire is one fire, and the slots it ran past are counted as skipped. " +
+      "`preview` shows the next fire times a schedule would produce without arming anything — use it before creating a cron job. `get` shows one job with its recent fires and what each one said. " +
+      "Every action except create, preview and list needs the `id` a create or list returned. Jobs are session-scoped: they survive /resume and never outlive the session.",
     promptSnippet: "Create, list, change, pause, resume, run now, or cancel scheduled work (cold subagent job or live loop)",
     promptGuidelines: [
       "Use manage_schedules for anything recurring, delayed, or phrased 'every N minutes' / 'in an hour'. Arm it yourself: telling the user to type /loop, or to cancel a job for you, is never the answer.",
@@ -3328,7 +3392,7 @@ Terse command-style prompts produce shallow, generic work.
         scheduleActions.map((action) => Type.Literal(action)),
         {
           description:
-            "create = arm a new job · list = every job in this session, both homes · update = change cadence/prompt/agent · run = fire it now, keeping its schedule · pause = keep it but stop it firing · resume = let it fire again · cancel = remove it for good",
+            "create = arm a new job · preview = the next fire times for `schedule` (+ backend/timezone/bounds), arming nothing · list = every job in this session, both homes · get = one job and its recent fires · update = change cadence/prompt/agent/bounds (values it already has are a no-op, not an error) · run = fire it now, keeping its schedule · pause = keep it but stop it firing · resume = let it fire again · cancel = remove it for good (the same as /loop stop for a live loop) · pause_all / cancel_all = every job, optionally narrowed by backend",
         },
       ),
       id: Type.Optional(
@@ -3339,7 +3403,7 @@ Terse command-style prompts produce shallow, generic work.
       schedule: Type.Optional(
         Type.String({
           description:
-            'How often it fires. Interval: "25m", "2h", "1d". Cold jobs also accept 6-field cron ("0 0 9 * * 1" = 9am every Monday) and one-shot ("+10m" or an ISO timestamp). Required to create; optional in update.',
+            'How often it fires. Interval: "25m", "2h", "1d" (live floors it at 1m). One-shot in both homes: "+10m" or an ISO timestamp (give an offset, e.g. "2026-11-21T18:30:00-08:00"; one without is read in this machine\'s zone). Cold jobs also accept 6-field cron ("0 0 9 * * 1" = 9am every Monday). Required to create and preview; optional in update.',
         }),
       ),
       prompt: Type.Optional(
@@ -3351,7 +3415,7 @@ Terse command-style prompts produce shallow, generic work.
       backend: Type.Optional(
         Type.Union([Type.Literal("cold"), Type.Literal("live")], {
           description:
-            'Where it runs. "cold" (default) = a fresh subagent per fire, cheap in this conversation. "live" = re-enters this conversation each fire, inheriting model and tools and spending the main context. Chosen at create time; an existing job keeps the home it was created in.',
+            'Where it runs. "cold" (default) = a fresh subagent per fire, cheap in this conversation. "live" = re-enters this conversation each fire, inheriting model and tools and spending the main context. Chosen at create time; an existing job keeps the home it was created in (update refuses a different one — create a new job and cancel the old). On preview it picks whose rules apply; on pause_all / cancel_all it narrows to one home.',
         }),
       ),
       name: Type.Optional(
@@ -3393,6 +3457,12 @@ Terse command-style prompts produce shallow, generic work.
             'Cold jobs only, and cron only: the IANA zone a cron expression is read in ("America/Los_Angeles"). Defaults to this machine\'s zone, recorded explicitly so the job does not silently move with the machine.',
         }),
       ),
+      pauseAfterFailures: Type.Optional(
+        Type.Number({
+          description:
+            "Both homes: pause the job after this many failed fires in a row, so a broken job stops spending tokens. Omit for the default of 3; 0 never pauses. A resume resets the count.",
+        }),
+      ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       const bus = pi.events;
@@ -3425,7 +3495,43 @@ Terse command-style prompts produce shallow, generic work.
       if (params.action === "get") {
         const where = await findScheduled(ctx, id);
         if (!where) return textResult(missingJob(id));
-        return textResult(where.kind === "cold" ? describeColdJob(where.job) : describeLiveLoop(where.job));
+        if (where.kind === "cold") {
+          const job = where.job;
+          return textResult(
+            [
+              describeColdJob(job),
+              ...historyLines(
+                (job.history ?? []).map((record) => ({
+                  ...record,
+                  at: Date.parse(record.at),
+                  outcome: record.status === "success" ? "ok" : "error",
+                })),
+                job,
+              ),
+            ].join("\n"),
+          );
+        }
+        return textResult(
+          [describeLiveLoop(where.job), ...(where.job.history ? historyLines(where.job.history, where.job) : [])].join("\n"),
+        );
+      }
+
+      // ---- preview: what a schedule means, before anything is armed ----
+      if (params.action === "preview") {
+        const schedule = typeof params.schedule === "string" ? params.schedule.trim() : "";
+        if (!schedule) return textResult("`schedule` is required to preview — the string you would pass to create.");
+        try {
+          const preview = previewSchedule({
+            schedule,
+            backend: params.backend,
+            timezone: params.timezone,
+            until: params.until,
+            maxRuns: params.maxRuns,
+          });
+          return textResult(describePreview(schedule, preview));
+        } catch (err) {
+          return textResult(`create would refuse "${schedule}" — ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       // ---- create ----
@@ -3451,10 +3557,11 @@ Terse command-style prompts produce shallow, generic work.
               prompt,
               maxRuns: params.maxRuns,
               until: params.until,
+              pauseAfterFailures: params.pauseAfterFailures,
             });
             const cadence =
               created.mode === "once"
-                ? `once${created.fireAt ? `, at ${new Date(created.fireAt).toISOString()}` : ""}`
+                ? `once${created.fireAt ? `, at ${clockLabel(created.fireAt)} (${new Date(created.fireAt).toISOString()})` : ""}`
                 : `every ${cadenceLabel(created.intervalMs)}`;
             const shape =
               created.mode === "once"
@@ -3503,6 +3610,7 @@ Terse command-style prompts produce shallow, generic work.
             maxRuns: params.maxRuns,
             until: params.until,
             timezone: params.timezone,
+            pauseAfterFailures: params.pauseAfterFailures,
             origin: jobOrigin(ctx),
           });
           const view = listSchedules(scheduler).jobs.find((job) => job.id === created.id);
@@ -3511,9 +3619,10 @@ Terse command-style prompts produce shallow, generic work.
               ? `every ${cadenceLabel(view.intervalMs)}`
               : view.schedule
             : schedule;
+          const firstAt = created.nextRun ? Date.parse(created.nextRun) : NaN;
           return textResult(
             `Scheduled cold job ${created.id}: "${briefPrompt(prompt)}" ${cadence}. ` +
-              `First run ${created.nextRun ?? "pending"}; the result of each fire arrives in this conversation as a notification. ` +
+              `First run ${Number.isFinite(firstAt) ? `${clockLabel(firstAt)} (${created.nextRun})` : "pending"}; the result of each fire arrives in this conversation as a notification. ` +
               `Manage it with manage_schedules { action: "update" | "run" | "pause" | "cancel", id: "${created.id}" }.`,
           );
         } catch (err) {
@@ -3526,6 +3635,17 @@ Terse command-style prompts produce shallow, generic work.
         const paused = params.action === "pause" ? true : params.action === "resume" ? false : undefined;
         const where = await findScheduled(ctx, id);
         if (!where) return textResult(missingJob(id));
+
+        // A home is chosen at create and never moved: the two keep different
+        // state (a cold row has an agent and a store, a live loop has this
+        // transcript), so a "move" is really a new job. Saying so beats ignoring
+        // the field, which reads as "moved" while the job stays where it was.
+        if (params.backend && params.backend !== where.kind) {
+          return textResult(
+            `Job ${id} lives in the ${where.kind} backend, and a job keeps the home it was created in — nothing was changed. ` +
+              `To move it, create a new job with backend: "${params.backend}" and the same schedule and prompt, then cancel ${id}.`,
+          );
+        }
 
         try {
           if (where.kind === "cold") {
@@ -3560,6 +3680,7 @@ Terse command-style prompts produce shallow, generic work.
               thinking: params.thinking as ScheduledSubagent["thinking"],
               max_turns: params.max_turns,
               enabled: paused === undefined ? undefined : !paused,
+              pauseAfterFailures: params.pauseAfterFailures,
               // Validated here because `updateJob` takes an already-validated
               // patch: a bound or zone that create would refuse must not slip in
               // through the update path.
@@ -3582,6 +3703,9 @@ Terse command-style prompts produce shallow, generic work.
             });
             const job = result.job;
             const state = coldState(job) ?? "armed";
+            if (result.changed.length === 0) {
+              return textResult(`Cold job ${result.id} already has those values — nothing changed. ${describeColdJob(job)}`);
+            }
             return textResult(
               `Updated cold job ${result.id} (${result.changed.join(", ")}). It is now ${state}: ${describeColdJob(job)}`,
             );
@@ -3603,7 +3727,11 @@ Terse command-style prompts produce shallow, generic work.
             paused,
             maxRuns: params.maxRuns,
             until: params.until,
+            pauseAfterFailures: params.pauseAfterFailures,
           });
+          if (result.changed.length === 0) {
+            return textResult(`Live loop ${id} already has those values — nothing changed. ${describeLiveLoop(result.job)}`);
+          }
           return textResult(`Updated live loop ${id} (${result.changed.join(", ")}). It is now: ${describeLiveLoop(result.job)}`);
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);

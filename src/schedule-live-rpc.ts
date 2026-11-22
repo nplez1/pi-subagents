@@ -73,6 +73,33 @@ export interface LiveLoopView {
 	/** What the last fire's turn ended as, so a failing loop is visible. */
 	lastOutcome?: "ok" | "error";
 	lastError?: string;
+	/** Set when the loop paused itself (the failure policy), not when a caller paused it. */
+	pausedReason?: string;
+	/** Epoch ms of the 7-day TTL; absent for a loop with `maxRuns` or `until`, which ends on its own. */
+	expiresAt?: number;
+	/** Due, but held until this session goes idle — a live fire never steers a turn in flight. */
+	waitingForIdle?: boolean;
+	/** When the held fire came due. */
+	dueSince?: number;
+	/** Slots that passed without a fire (asleep, busy, or session closed). Absent from an older /loop. */
+	skipped?: number;
+	/** Effective failure policy: failed fires in a row before it pauses itself; `0` never. */
+	pauseAfterFailures?: number;
+	failureStreak?: number;
+	/** The last few fires, newest last. Absent from an older /loop. */
+	history?: LiveFireRecord[];
+}
+
+/** One live fire, as `/loop` records it. */
+export interface LiveFireRecord {
+	at: number;
+	outcome: "running" | "ok" | "error" | "unknown";
+	error?: string;
+	manual?: boolean;
+	lateMs?: number;
+	skipped?: number;
+	/** Head of the fire's last assistant text. */
+	summary?: string;
 }
 
 /** What `create` answers with, so the caller can report the id and the cadence. */
@@ -141,19 +168,20 @@ export function callLiveRpc<T>(
 }
 
 /**
- * Arm a live loop. `schedule` must be a plain interval (`5m`, `30m`, `1h`,
- * `2d`) — cron and one-shot shapes only exist on the cold backend, and `/loop`
- * refuses them by name rather than rounding them into something else.
+ * Arm a live loop. `schedule` is an interval (`5m`, `30m`, `1h`, `2d`) or a
+ * one-shot (`+10m`, ISO) — cron exists on the cold backend only, and `/loop`
+ * refuses it by name rather than rounding it into something else.
  */
 export async function createLiveLoop(
 	bus: LiveEventBus,
-	input: { schedule: string; prompt: string; maxRuns?: number; until?: string },
+	input: { schedule: string; prompt: string; maxRuns?: number; until?: string; pauseAfterFailures?: number },
 ): Promise<LiveCreateResult> {
 	const data = await callLiveRpc<LiveCreateResult>(bus, LIVE_CREATE, {
 		schedule: input.schedule,
 		prompt: input.prompt,
 		...(input.maxRuns !== undefined ? { maxRuns: input.maxRuns } : {}),
 		...(input.until !== undefined ? { until: input.until } : {}),
+		...(input.pauseAfterFailures !== undefined ? { pauseAfterFailures: input.pauseAfterFailures } : {}),
 	});
 	if (!data?.id) throw new Error("The /loop extension accepted the request but returned no loop id.");
 	return data;
@@ -181,13 +209,16 @@ export interface LiveLoopPatch {
 	maxRuns?: number;
 	/** ISO stop time; an empty string clears it. */
 	until?: string;
+	/** Failed fires in a row before it pauses itself; `0` never pauses. */
+	pauseAfterFailures?: number;
 }
 
 /**
  * Change a live loop in place: cadence, prompt and paused in one call.
  *
- * `/loop` refuses a call that changes nothing, so "did it work?" stays
- * answerable: a success means the field the caller named now differs.
+ * `/loop` refuses a call that names no field. A call whose values the loop
+ * already has succeeds with `changed: []`, so re-asserting a desired state is
+ * safe and "did anything move?" is still answerable from `changed`.
  */
 export async function updateLiveLoop(
 	bus: LiveEventBus,
@@ -200,6 +231,7 @@ export async function updateLiveLoop(
 		...(patch.paused !== undefined ? { paused: patch.paused } : {}),
 		...(patch.maxRuns !== undefined ? { maxRuns: patch.maxRuns } : {}),
 		...(patch.until !== undefined ? { until: patch.until } : {}),
+		...(patch.pauseAfterFailures !== undefined ? { pauseAfterFailures: patch.pauseAfterFailures } : {}),
 	});
 	if (!data?.job) throw new Error(`The /loop extension accepted the update but returned no loop "${patch.jobId}".`);
 	return data;

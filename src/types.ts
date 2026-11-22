@@ -420,6 +420,36 @@ export interface ScheduledSubagent {
   runCount: number;
   /** Who armed it. Absent on rows written before this field existed. */
   origin?: JobOrigin;
+
+  // fire log and failure policy — absent on rows written before they existed
+  /** The last `SCHEDULE_HISTORY_MAX` fires, newest last. */
+  history?: ScheduledFireRecord[];
+  /** Interval slots that passed without a fire (the machine slept), across the job's life. */
+  skipped?: number;
+  /** Failed fires in a row that pause the job; absent = `DEFAULT_PAUSE_AFTER_FAILURES`, `0` = never. */
+  pauseAfterFailures?: number;
+  /** Failed fires since the last good one; reset by a good fire or a resume. */
+  failureStreak?: number;
+  /** Set when the job paused itself (the failure policy), cleared on resume. */
+  pausedReason?: string;
+}
+
+/** One fire of a scheduled job, as `get` reports it. */
+export interface ScheduledFireRecord {
+  /** ISO instant the fire started. */
+  at: string;
+  status: "success" | "error";
+  /** The subagent the fire spawned; absent when it failed before spawning. */
+  agentId?: string;
+  /** A `run` request rather than the timer. */
+  manual?: boolean;
+  /** How long after its slot the timer actually fired. */
+  lateMs?: number;
+  /** Slots that passed unfired before this one. */
+  skipped?: number;
+  error?: string;
+  /** Head of the subagent's final answer. */
+  summary?: string;
 }
 
 export interface ScheduleStoreData {

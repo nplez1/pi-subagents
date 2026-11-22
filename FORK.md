@@ -14,6 +14,9 @@ Current state: upstream **v0.26.1** is fetched as the `upstream` remote
 - `src/ui/*` — FleetView, conversation viewer, workflow dialog/menu/card.
 - `src/workflow/{progress,task,worker-source}.ts`, `src/{settings,model-scope,model-resolver}.ts`.
 - `src/claude-code/` — a whole backend upstream has nothing like.
+- `src/schedule-preview.ts`, `docs/scheduling.md`, and the fire log / failure policy / lateness
+  accounting in `src/schedule.ts` — `manage_schedules`' `preview`, `get` history and
+  `pauseAfterFailures` have no upstream counterpart.
 - Tests live beside their modules (`src/<module>.test.ts`). Upstream moved to a
   `test/` directory after 0.19.0; do not copy that layout in.
 

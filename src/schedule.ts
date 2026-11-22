@@ -24,7 +24,27 @@ import { resolveSpawnType } from "./agent-types.js";
 import { applyAgentDefaults } from "./agent-defaults.js";
 import { resolvePinnedModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
-import type { IsolationMode, JobOrigin, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import type {
+  IsolationMode,
+  JobOrigin,
+  ScheduledFireRecord,
+  ScheduledSubagent,
+  SubagentType,
+  ThinkingLevel,
+} from "./types.js";
+
+/** Fires kept per job: enough to answer "what did it find lately", small enough to rewrite every fire. */
+export const SCHEDULE_HISTORY_MAX = 10;
+/**
+ * Failed fires in a row that pause a job when the caller set no policy; `0`
+ * disables it. Pause, not cancel: the id, prompt and history survive for the
+ * caller to read, and `resume` re-arms it once the cause is fixed.
+ */
+export const DEFAULT_PAUSE_AFTER_FAILURES = 3;
+/** Timer jitter below this is not lateness worth reporting. */
+const LATE_THRESHOLD_MS = 60_000;
+/** A fire's summary is the head of its answer — a pointer to the result, not a copy of it. */
+const SUMMARY_MAX = 280;
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -63,6 +83,8 @@ export interface NewJobInput {
   timezone?: string;
   /** Who armed it, so a listing and a bulk operation can attribute it. */
   origin?: JobOrigin;
+  /** Failed fires in a row before it pauses itself; absent = the default, `0` = never. */
+  pauseAfterFailures?: number;
 }
 
 export class SubagentScheduler {
@@ -80,6 +102,16 @@ export class SubagentScheduler {
    */
   private running = new Set<string>();
   private intervals = new Map<string, NodeJS.Timeout>();
+  /**
+   * Wall-clock instant an interval timer last fired or was armed.
+   *
+   * Node timers run on a monotonic clock that stops while the machine sleeps, so
+   * after a night asleep a 2h `setInterval` fires once, hours late, and carries on
+   * from there — the slots it slept through vanish. Comparing the wall clock
+   * against this phase is how a late fire is noticed and its skipped slots
+   * counted, instead of nobody ever knowing.
+   */
+  private intervalPhase = new Map<string, number>();
   private store: ScheduleStore | undefined;
   private pi: ExtensionAPI | undefined;
   private ctx: ExtensionContext | undefined;
@@ -107,6 +139,7 @@ export class SubagentScheduler {
     this.jobs.clear();
     for (const t of this.intervals.values()) clearTimeout(t);
     this.intervals.clear();
+    this.intervalPhase.clear();
     this.store = undefined;
     this.pi = undefined;
     this.ctx = undefined;
@@ -143,6 +176,7 @@ export class SubagentScheduler {
       maxRuns: SubagentScheduler.validateMaxRuns(input.maxRuns),
       until: SubagentScheduler.validateUntil(input.until),
       timezone: SubagentScheduler.resolveTimezone(detected.type, input.timezone),
+      pauseAfterFailures: SubagentScheduler.validatePauseAfterFailures(input.pauseAfterFailures),
       origin: input.origin,
       subagent_type: input.subagent_type,
       prompt: input.prompt,
@@ -213,6 +247,12 @@ export class SubagentScheduler {
     options: { rearm?: boolean } = {},
   ): ScheduledSubagent | undefined {
     const store = this.requireStore();
+    // A resume is the caller vouching for the job again, so a self-pause's
+    // reason and streak go with it: otherwise the next single error re-trips it.
+    const wasEnabled = store.get(id)?.enabled;
+    if (patch.enabled === true && wasEnabled === false) {
+      patch = { ...patch, failureStreak: 0, pausedReason: undefined };
+    }
     const updated = store.update(id, patch);
     if (!updated) return undefined;
     const timingChanged = "enabled" in patch || "schedule" in patch || "scheduleType" in patch || "timezone" in patch;
@@ -289,7 +329,7 @@ export class SubagentScheduler {
     try {
       // A synchronous fire failure (an unresolvable model, a refused agent type)
       // comes back here rather than being reported as a run that started.
-      const fired = this.executeJob(id);
+      const fired = this.executeJob(id, { manual: true });
       if (!fired.ok) return fired;
       return { ok: true, job };
     } finally {
@@ -305,15 +345,16 @@ export class SubagentScheduler {
     try {
       if (job.scheduleType === "interval" && job.intervalMs) {
         const t = setInterval(() => {
-          this.executeJob(job.id);
+          this.executeJob(job.id, { timer: true });
         }, job.intervalMs);
         this.intervals.set(job.id, t);
+        this.intervalPhase.set(job.id, Date.now());
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
         const delay = target - Date.now();
         if (delay > 0) {
           const t = setTimeout(() => {
-            this.executeJob(job.id);
+            this.executeJob(job.id, { timer: true });
             // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
             const updated = this.persist(job.id, { enabled: false });
             if (updated) this.emit({ type: "updated", job: updated });
@@ -334,7 +375,7 @@ export class SubagentScheduler {
         // time, and omitting the option would let croner read it in whatever zone
         // the machine happens to be in.
         const cron = new Cron(job.schedule, job.timezone ? { timezone: job.timezone } : {}, () => {
-          this.executeJob(job.id);
+          this.executeJob(job.id, { timer: true });
         });
         this.jobs.set(job.id, cron);
       }
@@ -355,6 +396,7 @@ export class SubagentScheduler {
       clearInterval(t);
       this.intervals.delete(id);
     }
+    this.intervalPhase.delete(id);
   }
 
   /**
@@ -362,7 +404,10 @@ export class SubagentScheduler {
    * queue), persist completion. Fire-and-forget: the timer tick returns
    * immediately so other jobs keep firing.
    */
-  private executeJob(id: string): { ok: true; agentId: string } | { ok: false; error: string } {
+  private executeJob(
+    id: string,
+    trigger: { timer?: boolean; manual?: boolean } = {},
+  ): { ok: true; agentId: string } | { ok: false; error: string } {
     const store = this.store;
     const pi = this.pi;
     const ctx = this.ctx;
@@ -375,6 +420,11 @@ export class SubagentScheduler {
     }
     const job = store.get(id);
     if (!job?.enabled) return { ok: false, error: `Job "${id}" is paused.` };
+
+    // Measured before any early return: a timer tick that is skipped below still
+    // advanced the phase, and still stood for a slot.
+    const startedAt = Date.now();
+    const late = trigger.timer ? this.lateness(job, startedAt) : undefined;
 
     // Bounds before anything else: a job that has used up its fires or passed its
     // stop time must not start another one, even with its timer still armed.
@@ -391,6 +441,9 @@ export class SubagentScheduler {
     // fires bypass the concurrency queue by design, so an interval shorter than
     // a run would otherwise put several subagents on the same prompt at once.
     if (this.running.has(id)) {
+      // Counted, not just refused: a slot that passed without a fire is the same
+      // fact whether the machine slept through it or the last run overran it.
+      if (trigger.timer) this.persist(id, { skipped: (job.skipped ?? 0) + 1 });
       return {
         ok: false,
         error: `Job "${id}" is still running from its last fire, so this fire was skipped; it will fire again on its own schedule.`,
@@ -455,7 +508,11 @@ export class SubagentScheduler {
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      this.persist(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      this.settleFire(
+        id,
+        { at: new Date(startedAt).toISOString(), status: "error", error, ...(trigger.manual ? { manual: true } : {}), ...late },
+        { lastRun: new Date().toISOString(), lastStatus: "error" },
+      );
       this.emit({ type: "error", jobId: id, error });
       return { ok: false, error };
     }
@@ -476,13 +533,26 @@ export class SubagentScheduler {
       const pastUntil =
         until !== undefined && (next === undefined || new Date(next).getTime() >= new Date(until).getTime());
       const stopping = exhausted || pastUntil;
-      this.persist(id, {
-        lastRun: new Date().toISOString(),
-        lastStatus: status,
-        runCount,
-        nextRun: next,
-        ...(stopping ? { enabled: false } : {}),
-      });
+      const record = manager.getRecord(agentId);
+      this.settleFire(
+        id,
+        {
+          at: new Date(startedAt).toISOString(),
+          status,
+          agentId,
+          ...(trigger.manual ? { manual: true } : {}),
+          ...late,
+          ...(status === "error" && record?.error ? { error: briefText(String(record.error)) } : {}),
+          ...(typeof record?.result === "string" && record.result.trim() ? { summary: briefText(record.result) } : {}),
+        },
+        {
+          lastRun: new Date().toISOString(),
+          lastStatus: status,
+          runCount,
+          nextRun: next,
+          ...(stopping ? { enabled: false } : {}),
+        },
+      );
       if (stopping) {
         const why = exhausted
           ? `completed its ${current?.maxRuns} run${current?.maxRuns === 1 ? "" : "s"}`
@@ -524,6 +594,58 @@ export class SubagentScheduler {
   private retire(id: string, reason: string): void {
     const updated = this.persist(id, { enabled: false });
     this.emit({ type: "error", jobId: id, error: `Job "${id}" was disabled: ${reason}.` });
+    if (updated) this.emit({ type: "updated", job: updated });
+  }
+
+  /**
+   * How late a timer fire is, and how many slots it stands in for.
+   *
+   * Interval: against the wall-clock phase the timer was armed or last fired at.
+   * One-shot: against its own instant. Cron is left to croner, which schedules
+   * against the wall clock itself, so a slept-through cron slot is simply the
+   * next one — there is no phase of ours to compare against.
+   */
+  private lateness(job: ScheduledSubagent, now: number): { lateMs?: number; skipped?: number } | undefined {
+    let expected: number | undefined;
+    if (job.scheduleType === "interval" && job.intervalMs) {
+      const phase = this.intervalPhase.get(job.id);
+      this.intervalPhase.set(job.id, now);
+      expected = phase === undefined ? undefined : phase + job.intervalMs;
+    } else if (job.scheduleType === "once") {
+      expected = new Date(job.schedule).getTime();
+    }
+    if (expected === undefined || !Number.isFinite(expected) || now - expected < LATE_THRESHOLD_MS) return undefined;
+    const lateMs = now - expected;
+    const skipped = job.scheduleType === "interval" && job.intervalMs ? Math.floor(lateMs / job.intervalMs) : 0;
+    return skipped > 0 ? { lateMs, skipped } : { lateMs };
+  }
+
+  /**
+   * Write a finished fire: its log entry, its bookkeeping, and the failure
+   * policy's verdict, in one store write so a reader never sees half of it.
+   */
+  private settleFire(id: string, record: ScheduledFireRecord, extra: Partial<ScheduledSubagent>): void {
+    const current = this.store?.get(id);
+    if (!current) return;
+    const failed = record.status === "error";
+    const streak = failed ? (current.failureStreak ?? 0) + 1 : 0;
+    const limit = current.pauseAfterFailures ?? DEFAULT_PAUSE_AFTER_FAILURES;
+    const staysEnabled = extra.enabled ?? current.enabled;
+    const tripped = failed && limit > 0 && streak >= limit && staysEnabled;
+    const pausedReason = tripped ? `paused after ${streak} failed fires in a row` : undefined;
+    const updated = this.persist(id, {
+      ...extra,
+      history: [...(current.history ?? []), record].slice(-SCHEDULE_HISTORY_MAX),
+      failureStreak: streak,
+      ...(record.skipped ? { skipped: (current.skipped ?? 0) + record.skipped } : {}),
+      ...(tripped ? { enabled: false, pausedReason } : {}),
+    });
+    if (!tripped) return;
+    this.emit({
+      type: "error",
+      jobId: id,
+      error: `Job "${id}" ${pausedReason}${record.error ? ` (last: ${record.error})` : ""}. Resume it with manage_schedules { action: "resume", id: "${id}" } once the cause is fixed.`,
+    });
     if (updated) this.emit({ type: "updated", job: updated });
   }
 
@@ -645,6 +767,17 @@ export class SubagentScheduler {
     return value;
   }
 
+  /** A failure policy is a whole number of fires; `0` turns it off. */
+  static validatePauseAfterFailures(value: number | undefined): number | undefined {
+    if (value === undefined) return undefined;
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(
+        `pauseAfterFailures must be a whole number — N pauses after N failed fires in a row, 0 never pauses — got ${value}.`,
+      );
+    }
+    return value;
+  }
+
   /** A stop time must be a real, future instant — a past one would never fire. */
   static validateUntil(value: string | undefined): string | undefined {
     if (value === undefined) return undefined;
@@ -670,4 +803,10 @@ export class SubagentScheduler {
     if (!m) return null;
     return parseInt(m[1], 10) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
   }
+}
+
+/** One line, capped: a fire log entry points at a result, it does not hold it. */
+function briefText(text: string): string {
+  const single = text.replace(/\s+/g, " ").trim();
+  return single.length > SUMMARY_MAX ? `${single.slice(0, SUMMARY_MAX - 1)}…` : single;
 }

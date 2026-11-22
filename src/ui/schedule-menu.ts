@@ -65,6 +65,10 @@ function formatDetails(j: ScheduledSubagent, scheduler: SubagentScheduler): stri
     `last run:  ${j.lastRun ?? "—"} (${j.lastStatus ?? "—"})`,
     `next run:  ${next}`,
     `runs:      ${j.runCount}`,
+    // The two facts a healthy-looking run count hides: slots the machine slept
+    // through, and a job that stopped itself after failing.
+    ...(j.skipped ? [`skipped:   ${j.skipped} slot${j.skipped === 1 ? "" : "s"}`] : []),
+    ...(j.pausedReason ? [`paused:    ${j.pausedReason}`] : []),
   ].join("\n");
 }
 

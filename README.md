@@ -81,10 +81,11 @@ command typed by a human:
 
 | action | what it does |
 | --- | --- |
-| `create` | arm a job: `schedule` + `prompt`, plus `backend` (`cold` by default, `live` for a loop that re-enters this conversation) and, for cold, `maxRuns` / `until` / `timezone` |
-| `list` | every job in the session, both homes, with cadence, next run, run count, paused state, bounds, agent and prompt |
-| `get` | one job by id — the same view as a `list` row, without paying for the roster |
-| `update` | change the cadence, the prompt, the name, the agent type, the model, the thinking level, the turn cap, or the bounds (`maxRuns`, `until`, `timezone`) |
+| `create` | arm a job: `schedule` + `prompt`, plus `backend` (`cold` by default, `live` for a loop that re-enters this conversation), the bounds `maxRuns` / `until`, `pauseAfterFailures`, and for cold `timezone` |
+| `preview` | the next fire times a `schedule` would produce in a home, bounds applied — nothing is armed, and anything `create` would refuse is reported instead |
+| `list` | every job in the session, both homes, with cadence, next run (with the local clock time), run count, paused state, bounds, skipped slots, agent and prompt |
+| `get` | one job by id — its `list` row, its failure policy, and its last 10 fires with outcome, lateness and the head of what each one answered |
+| `update` | change the cadence, the prompt, the name, the agent type, the model, the thinking level, the turn cap, the bounds (`maxRuns`, `until`, `timezone`) or `pauseAfterFailures`. Re-sending values the job already has succeeds with nothing changed |
 | `run` | fire it now, leaving its own schedule armed |
 | `pause` | keep the job and its history, but arm nothing |
 | `resume` | let it fire on its own cadence again (use `run` to fire it now) |
@@ -99,6 +100,7 @@ manage_schedules({
   prompt: "Reply exactly: Still alive.",
 })
 
+manage_schedules({ action: "preview", schedule: "0 0 9 * * 1", timezone: "America/Los_Angeles" })
 manage_schedules({ action: "list" })
 manage_schedules({ action: "get", id: "V1StGXR8" })
 manage_schedules({ action: "update", id: "V1StGXR8", schedule: "1h" })
@@ -106,13 +108,17 @@ manage_schedules({ action: "cancel", id: "V1StGXR8" })
 manage_schedules({ action: "cancel_all", backend: "cold" })
 ```
 
-Schedule formats — the interval forms work in both homes, a live loop also takes a one-shot, and
-only cron is cold-only:
+The full contract — grammar per home, when a fire really happens, what survives what, every bound and
+limit — is in [`docs/scheduling.md`](docs/scheduling.md).
+
+Schedule formats — the interval forms work in both homes (a live loop floors them at one minute), a
+live loop also takes a one-shot, and only cron is cold-only:
 
 - **Interval** — `"30s"`, `"5m"`, `"1h"`, `"2d"`. Fires repeatedly at that interval.
 - **Cron** — cold only. 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes. Read in the job's own `timezone`.
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
-- **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
+- **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`. Converted to an instant
+  once, at create; one written without an offset is read in this machine's zone at that moment.
 
 A live loop refuses cron by name rather than rounding it into something else: a wall-clock
 expression spanning days would fire into a transcript nobody is watching, and the cold home already
@@ -169,8 +175,17 @@ Behaviour worth knowing:
   a healthy one in `list` or `get`.
 - A cold switch that is off does not hide its jobs: they stay listed, cancellable, and inert until the
   user turns scheduling back on.
-- A paused job's timer is disarmed and its row and history stay; resuming arms it to fire at the next
-  idle window rather than one interval out.
+- A paused job's timer is disarmed and its row and history stay; resuming re-arms its cadence (the next
+  fire is one interval out) — `run` is the verb for "now", in both homes.
+- **Missed slots are counted, never replayed.** Node timers stop while the machine sleeps, so a 2-hourly
+  job on a laptop asleep overnight fires once, hours late. That fire records how late it was and how
+  many slots it stood in for, and `list` carries the running `skipped` total, so a quiet night is
+  distinguishable from a broken job. A tick skipped because the last fire is still running counts too.
+- **A job that keeps failing pauses itself.** After `pauseAfterFailures` failed fires in a row (default
+  3, `0` never) it is paused with the reason in `list`, rather than spending tokens on every fire. Its
+  history stays for `get`; `resume` resets the count.
+- Each store directory writes its own `.gitignore`, so per-session state never reaches a commit in the
+  repository pi happens to be running in.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
 
 ## UI
@@ -553,14 +568,15 @@ homes.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `action` | string | yes | `create`, `list`, `get`, `update`, `run`, `pause`, `resume`, `cancel`, `pause_all` or `cancel_all` |
+| `action` | string | yes | `create`, `preview`, `list`, `get`, `update`, `run`, `pause`, `resume`, `cancel`, `pause_all` or `cancel_all` |
 | `id` | string | for every single-job verb | The id `create` or `list` returned |
-| `schedule` | string | to create | Interval (`25m`) in both homes; a one-shot (`+10m` / ISO) in both; 6-field cron cold only |
+| `schedule` | string | to create, preview | Interval (`25m`) in both homes; a one-shot (`+10m` / ISO) in both; 6-field cron cold only |
 | `prompt` | string | to create | What each fire is asked to do |
 | `backend` | string | no | `cold` (default) or `live` (a loop that re-enters this conversation); on the bulk verbs it narrows to one home |
 | `maxRuns` | number | no | Stop after this many fires. `0` clears an existing bound |
 | `until` | string | no | ISO instant after which it must not fire. `""` clears an existing stop time |
 | `timezone` | string | no | IANA zone a cron expression is read in, e.g. `America/Los_Angeles`. Defaults to this machine's zone, recorded on the job |
+| `pauseAfterFailures` | number | no | Pause after this many failed fires in a row. Default `3`; `0` never pauses |
 | `name`, `subagent_type`, `model`, `thinking`, `max_turns` | — | no | Cold jobs only: what each fire runs as |
 
 ## Commands

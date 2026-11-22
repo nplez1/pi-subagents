@@ -22,8 +22,8 @@
 
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
-import type { ScheduleChangeEvent } from "./schedule.js";
-import type { ScheduledSubagent, ThinkingLevel } from "./types.js";
+import { DEFAULT_PAUSE_AFTER_FAILURES, type ScheduleChangeEvent, SubagentScheduler } from "./schedule.js";
+import type { ScheduledFireRecord, ScheduledSubagent, ThinkingLevel } from "./types.js";
 
 /**
  * The thinking levels a job may pin — the storable set, which is pi's thinking
@@ -120,6 +120,8 @@ export interface ScheduleCreateInput {
 	until?: string;
 	/** IANA zone a cron expression is read in; refused for other types. */
 	timezone?: string;
+	/** Failed fires in a row before it pauses itself; `0` never pauses. */
+	pauseAfterFailures?: number;
 	/** Who armed it. Stamped by the tool layer, never by a model. */
 	origin?: ScheduledSubagent["origin"];
 }
@@ -152,6 +154,15 @@ export interface ScheduledJobView {
 	timezone?: string;
 	/** Who armed it, so a listing can attribute it. */
 	origin?: ScheduledSubagent["origin"];
+	/** The last few fires, newest last. */
+	history: ScheduledFireRecord[];
+	/** Slots that passed without a fire (the machine slept, or the last run overran). */
+	skipped: number;
+	/** The effective failure policy — the default when the job set none. */
+	pauseAfterFailures: number;
+	failureStreak: number;
+	/** Why it is paused when nobody paused it. */
+	pausedReason?: string;
 }
 
 /** Default agent type for a scheduled job created without one. */
@@ -200,6 +211,11 @@ export function toJobView(
 		until: job.until,
 		timezone: job.timezone,
 		origin: job.origin,
+		history: job.history ?? [],
+		skipped: job.skipped ?? 0,
+		pauseAfterFailures: job.pauseAfterFailures ?? DEFAULT_PAUSE_AFTER_FAILURES,
+		failureStreak: job.failureStreak ?? 0,
+		pausedReason: job.pausedReason,
 	};
 }
 
@@ -257,6 +273,7 @@ export function createSchedule(
 		maxRuns: input.maxRuns,
 		until: input.until,
 		timezone: input.timezone,
+		pauseAfterFailures: input.pauseAfterFailures,
 		origin: input.origin,
 	});
 
@@ -391,10 +408,28 @@ export function updateSchedule(
 		changed.push(`timezone ${patch.timezone}`);
 	}
 
-	if (changed.length === 0) {
+	if (input.pauseAfterFailures !== undefined) {
+		const next = SubagentScheduler.validatePauseAfterFailures(input.pauseAfterFailures);
+		if (next !== (current.pauseAfterFailures ?? DEFAULT_PAUSE_AFTER_FAILURES)) {
+			patch.pauseAfterFailures = next;
+			changed.push(next === 0 ? "never pauses on failure" : `pauses after ${next} failed fires`);
+		}
+	}
+
+	// An empty request is a caller mistake worth naming; a request whose values
+	// the job already has is not. Re-asserting a desired state is how an
+	// idempotent caller works, and `changed: []` already says nothing moved.
+	const { jobId: _jobId, ...fields } = input;
+	const supplied = Object.entries(fields).some(([key, value]) =>
+		typeof value === "string" ? key === "until" || value.trim() !== "" : value !== undefined,
+	);
+	if (!supplied) {
 		throw new Error(
-			`Nothing changed for job "${id}". Pass at least one field that differs from what it already has.`,
+			`Nothing to change for job "${id}": pass at least one field (schedule, prompt, name, agent, model, thinking, max_turns, bounds, timezone, pauseAfterFailures, or paused).`,
 		);
+	}
+	if (changed.length === 0) {
+		return { id, changed, job: toJobView(current, scheduler.getNextRun(id)) };
 	}
 
 	// Only a timing change disarms and re-arms the timer. Re-arming for a prompt
@@ -441,6 +476,8 @@ export interface ScheduleUpdateInput {
 	until?: string;
 	/** IANA zone a cron expression is read in. */
 	timezone?: string;
+	/** Failed fires in a row before it pauses itself; `0` never pauses. */
+	pauseAfterFailures?: number;
 }
 
 /** Re-exported so a consumer can type the event stream it mirrors. */

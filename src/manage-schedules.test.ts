@@ -103,7 +103,11 @@ async function harness(options: { live?: boolean } = {}): Promise<Harness> {
           job.paused = data.paused;
           changed.push(data.paused ? "paused" : "resumed");
         }
-        if (changed.length === 0) return reply({ success: false, error: "Nothing changed." });
+        // `/loop`'s contract: a request naming no field is refused, one whose
+        // values already hold succeeds with `changed: []`.
+        if (typeof data.schedule !== "string" && typeof data.prompt !== "string" && typeof data.paused !== "boolean") {
+          return reply({ success: false, error: "Nothing to change." });
+        }
         return reply({ success: true, data: { job, changed } });
       }
       if (event === LIVE_RUN) {
@@ -222,10 +226,36 @@ describe("cold jobs", () => {
     expect(await open.call("list")).toMatch(/every 45m/);
   });
 
-  it("refuses an update that changes nothing, instead of reporting a change", async () => {
+  it("refuses an empty update, and treats re-asserted values as a no-op rather than an error", async () => {
     open = await harness();
     const id = /Scheduled cold job (\S+):/.exec(await open.call("create", { schedule: "25m", prompt: "tick" }))?.[1] as string;
-    expect(await open.call("update", { id, prompt: "tick" })).toMatch(/Nothing changed/);
+    expect(await open.call("update", { id })).toMatch(/Nothing to change/);
+    // An idempotent caller re-asserts the state it wants; it must be told
+    // "already so" without being told it failed, and without a fake change.
+    expect(await open.call("update", { id, prompt: "tick", schedule: "25m" })).toMatch(
+      /^Cold job \S+ already has those values — nothing changed\./,
+    );
+  });
+
+  it("refuses to move a job to the other home, and says how to get one there", async () => {
+    open = await harness();
+    const id = /Scheduled cold job (\S+):/.exec(await open.call("create", { schedule: "25m", prompt: "tick" }))?.[1] as string;
+    const text = await open.call("update", { id, backend: "live", schedule: "45m" });
+    expect(text).toMatch(/lives in the cold backend/);
+    expect(text).toMatch(/nothing was changed/);
+    expect(await open.call("list")).toMatch(/every 25m/);
+  });
+
+  it("previews a schedule without arming it, and reports what create would refuse", async () => {
+    open = await harness();
+    const preview = await open.call("preview", { schedule: "0 0 9 * * 1", timezone: "America/Los_Angeles", maxRuns: 2 });
+    expect(preview).toMatch(/cron, read in America\/Los_Angeles/);
+    expect(preview).toMatch(/nothing was armed/);
+    expect(preview.split("\n").filter((line) => /^ {2}\d\./.test(line))).toHaveLength(2);
+    expect(await open.call("list")).toMatch(/Nothing is scheduled/);
+    expect(await open.call("preview", { schedule: "0 0 9 * * 1", backend: "live" })).toMatch(
+      /^create would refuse .*cold backend only/,
+    );
   });
 
   it("fires one now without disarming its schedule", async () => {
