@@ -46,6 +46,8 @@ import {
 	resumeClaudeCodeAgent,
 	runClaudeCodeAgent,
 	isClaudeSidecar,
+	CODE_MODE_SETTINGS,
+	codeModeEnabled,
 } from "./runner.js";
 import { ClaudeCodeSession, isClaudeCodeSession } from "./session.js";
 import {
@@ -435,6 +437,68 @@ describe("claude/* model specs", () => {
 });
 
 // ─── Argument construction ───────────────────────────────────────────────────
+
+describe("Code Mode", () => {
+	it("reads the CLI's own switch, and only its on value", () => {
+		expect(codeModeEnabled({ CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" })).toBe(true);
+		expect(codeModeEnabled({ CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: " 1 " })).toBe(true);
+		// The CLI's documented ``off`` value, plus the shapes a lazy shell hands us.
+		expect(codeModeEnabled({ CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "0" })).toBe(false);
+		expect(codeModeEnabled({ CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "true" })).toBe(false);
+		expect(codeModeEnabled({ CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "" })).toBe(false);
+		expect(codeModeEnabled({})).toBe(false);
+	});
+
+	it("re-sends the switch through --settings, the only surface a -p run honours", () => {
+		// `claude -p` ignores the process environment AND ~/.claude/settings.json for
+		// this variable; the env block of --settings is the one place it reads.
+		const argv = buildClaudeArgs({
+			modelSpec: "sonnet",
+			persistSession: false,
+			codeMode: true,
+		});
+		const at = argv.indexOf("--settings");
+		expect(at).toBeGreaterThan(-1);
+		expect(JSON.parse(argv[at + 1])).toEqual({
+			env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" },
+		});
+		expect(JSON.parse(CODE_MODE_SETTINGS)).toEqual(JSON.parse(argv[at + 1]));
+		// Never `--restricted`: it removes built-in tools and cancels Code Mode.
+		expect(argv).not.toContain("--restricted");
+	});
+
+	it("leaves the CLI's settings alone when Code Mode is off", () => {
+		expect(buildClaudeArgs({ modelSpec: "sonnet", persistSession: false })).not.toContain(
+			"--settings",
+		);
+	});
+
+	it("grants REPL to a restricted allowlist, since --tools gates the feature", () => {
+		// A restricted --tools list without REPL makes the CLI start WITHOUT Code
+		// Mode (``this launch's tool options``), so the grant has to travel with the
+		// allowlist rather than be left to the CLI's defaults.
+		const without = claudeToolPolicyFor(["read", "bash", "grep", "find", "ls"]);
+		const withMode = claudeToolPolicyFor(["read", "bash", "grep", "find", "ls"], {
+			codeMode: true,
+		});
+		expect(without).not.toContain("REPL");
+		expect(withMode).toContain("REPL");
+		// The Task grant is unchanged, and nothing else is widened.
+		expect(withMode).toEqual([...(without ?? []), "REPL"]);
+	});
+
+	it("grants nothing to an agent that asked for no built-in tools", () => {
+		// ``tools: none`` is a restriction to an empty set. Handing it REPL would
+		// grant a tool the agent explicitly declined.
+		expect(claudeToolPolicyFor([], { codeMode: true })).toEqual([]);
+	});
+
+	it("does not deny REPL unless the agent named it", () => {
+		expect(claudeToolDenyList(["read", "bash"])).not.toContain("REPL");
+		// ...but an agent that does name it gets the CLI's real name back.
+		expect(claudeToolDenyList(["repl"])).toEqual(["REPL"]);
+	});
+});
 
 describe("buildClaudeArgs", () => {
 	it("always requests stream-json with the flags it depends on", () => {

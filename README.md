@@ -788,6 +788,8 @@ Backend selection rides on the model string, not a new frontmatter key — so ev
 
 **Requirements.** `claude` on `PATH` and authenticated (Claude Code 2.1+; `claude setup-token` for a long-lived token). Override the binary with `PI_SUBAGENTS_CLAUDE_BIN`.
 
+**Code Mode.** Claude Code's experimental Code Mode gives the CLI a single `REPL` tool that runs JavaScript making the other calls in one step — its answer to pi's `codemode`, and the only way a `claude/*` agent gets batching at all. Export `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` before starting pi. A `-p` run honours that variable from exactly one place — the `env` block of `--settings`, not the process environment and not `~/.claude/settings.json` (the CLI says as much when it only finds it in the environment) — so this backend re-sends it as a `--settings` payload, and for a restricted agent adds `REPL` to its `--tools` allowlist, because a restricted list that omits it makes the CLI start without Code Mode entirely. It also needs Claude Code 2.1.323+, an Opus/Sonnet/Haiku 5.5+ or Fable 5.2 model, and an account inside Anthropic's rollout; until all three hold it stays inert and the run uses the ordinary tools. A conversation started in Code Mode can only be resumed with it still on, so leave the variable exported for the life of the session.
+
 ### Turning the backend off
 
 On a machine that cannot run the CLI — no `claude` binary, or a policy that forbids it — the same Claude models are usually still reachable through a provider pi serves (Copilot, Anthropic, Bedrock). Switch the backend off there and it stops being offered *and* stops being accepted:

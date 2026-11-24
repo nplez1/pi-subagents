@@ -98,6 +98,37 @@ export function claudeBinary(): string {
 }
 
 /**
+ * Whether the spawned CLI should run in Code Mode.
+ *
+ * The CLI's own switch, read from the environment and re-sent inside
+ * [`CODE_MODE_SETTINGS`]. Headless Claude Code honours this variable from
+ * exactly one place — the `env` block of `--settings` — and says so when it only
+ * finds it in the process environment:
+ *
+ *   `claude -p and Agent SDK apps get it only when
+ *    CLAUDE_CODE_EXPERIMENTAL_CODE_MODE is in the env block of --settings`
+ *
+ * So a `-p` run reads the variable here and hands it back to the CLI through the
+ * one surface it accepts. `~/.claude/settings.json` covers interactive sessions
+ * and is deliberately NOT read here: it is the user's file, and a `-p` run that
+ * silently consulted it would enable an experimental feature the CLI itself says
+ * applies to interactive sessions only.
+ */
+export function codeModeEnabled(env = process.env): boolean {
+	return env.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE?.trim() === "1";
+}
+
+/**
+ * The `--settings` payload that turns Code Mode on for a headless run.
+ *
+ * `--settings` loads *more* settings on top of the user's, so this adds the env
+ * block without displacing anything in `~/.claude/settings.json`.
+ */
+export const CODE_MODE_SETTINGS = JSON.stringify({
+	env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" },
+});
+
+/**
  * Build the CLI argument vector.
  *
  * `--verbose` is not optional: `--print` with `--output-format stream-json`
@@ -132,6 +163,12 @@ export function buildClaudeArgs(args: {
 	tools?: string[];
 	/** The agent's `disallowed_tools`, translated to Claude Code tool names. */
 	disallowedTools?: string[];
+	/**
+	 * Run in Code Mode. Adds the `--settings` env block the CLI requires of a `-p`
+	 * run; the matching `REPL` grant lives in the tool policy, because a restricted
+	 * `--tools` list without REPL cancels Code Mode entirely.
+	 */
+	codeMode?: boolean;
 }): string[] {
 	const argv = [
 		"--print",
@@ -156,6 +193,11 @@ export function buildClaudeArgs(args: {
 	if (args.tools !== undefined) argv.push("--tools", args.tools.join(","));
 	if (args.disallowedTools?.length)
 		argv.push("--disallowedTools", args.disallowedTools.join(","));
+	// Re-sent on a resume too, and it has to be: the CLI refuses to resume a Code
+	// Mode conversation unless Code Mode is on again. A run whose switch was
+	// turned off mid-conversation therefore fails loudly at resume rather than
+	// resuming in a mode the conversation was never built for.
+	if (args.codeMode) argv.push("--settings", CODE_MODE_SETTINGS);
 	// A resume continues an existing conversation, whose system prompt was fixed
 	// when that session was created; re-sending one would either be ignored or
 	// silently fork the conversation's instructions.
@@ -712,11 +754,13 @@ export async function runClaudeCodeAgent(
 		},
 	});
 
+	const codeMode = codeModeEnabled();
 	// Tool policy, translated once so the session can remember it: a resumed
 	// conversation re-spawns the CLI, and a per-invocation `--tools` that were not
 	// reapplied would silently widen a restricted agent back to the full set.
 	const allowedTools = claudeToolPolicyFor(agentConfig?.builtinToolNames, {
 		wildcard: agentConfig?.toolsWildcard,
+		codeMode,
 	});
 	const disallowedTools = agentConfig?.disallowedTools
 		? claudeToolDenyList(agentConfig.disallowedTools)
@@ -770,6 +814,7 @@ export async function runClaudeCodeAgent(
 		persistSession: runnerCtx.persistSession,
 		tools: allowedTools,
 		disallowedTools,
+		codeMode,
 	});
 
 	// Publish the session before driving the process: the manager wires steering,

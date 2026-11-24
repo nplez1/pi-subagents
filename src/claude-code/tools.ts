@@ -204,6 +204,10 @@ const CLAUDE_TOOL_NAMES: readonly string[] = [
 	"BashOutput",
 	"KillShell",
 	"SlashCommand",
+	// Experimental Code Mode's tool: it runs the JavaScript that makes the other
+	// calls. Listed so an agent that names it keeps it, and so `--disallowedTools`
+	// can withhold it — a Code Mode launch refuses to start with REPL denied.
+	"REPL",
 ];
 
 /** Canonical Claude Code tool name for a case-insensitive spelling, if any. */
@@ -233,6 +237,16 @@ export function isClaudeToolName(name: string): boolean {
 const CLAUDE_TASK_TOOL = "Task";
 
 /**
+ * Claude Code's Code Mode tool.
+ *
+ * Only the CLI grants it, and only when Code Mode is on. A restricted `--tools`
+ * list that omits it makes the CLI start without Code Mode at all — the
+ * documented reason is `this launch's tool options` — so an allowlist built for a
+ * Code Mode run has to name it explicitly.
+ */
+const CLAUDE_REPL_TOOL = "REPL";
+
+/**
  * Translate a pi tool declaration into Claude Code `--tools` names.
  *
  * Each entry is either a pi built-in (mapped) or an already-Claude Code tool
@@ -241,7 +255,10 @@ const CLAUDE_TASK_TOOL = "Task";
  * survives translates to an empty list — the CLI's `tools:` equivalent of "no
  * built-ins", which is also what pi grants for a name it does not know.
  */
-export function claudeToolAllowList(piToolNames: readonly string[]): string[] {
+export function claudeToolAllowList(
+	piToolNames: readonly string[],
+	options: { codeMode?: boolean } = {},
+): string[] {
 	const names = new Set<string>();
 	for (const raw of piToolNames) {
 		const name = raw.trim();
@@ -250,8 +267,12 @@ export function claudeToolAllowList(piToolNames: readonly string[]): string[] {
 			CLAUDE_TOOL_BY_LOWER.get(name.toLowerCase());
 		if (resolved) names.add(resolved);
 	}
+	// An empty result means "no built-in tools" below, so neither grant applies:
+	// an agent that declared only names nothing recognizes wants no tools, and
+	// handing it REPL or Task would contradict that.
 	if (names.size === 0) return [];
 	names.add(CLAUDE_TASK_TOOL);
+	if (options.codeMode) names.add(CLAUDE_REPL_TOOL);
 	return [...names];
 }
 
@@ -271,7 +292,7 @@ export function claudeToolAllowList(piToolNames: readonly string[]): string[] {
  */
 export function claudeToolPolicyFor(
 	declaredToolNames: string[] | undefined,
-	options: { wildcard?: boolean } = {},
+	options: { wildcard?: boolean; codeMode?: boolean } = {},
 ): string[] | undefined {
 	if (!declaredToolNames) return undefined;
 	// The caller's own reading of `tools:` when it has one. Without it, fall back
@@ -281,7 +302,7 @@ export function claudeToolPolicyFor(
 	// (`Read, Glob, LS, …`) would otherwise look exactly like `tools: *` and hand
 	// the CLI its own extra defaults (WebFetch, WebSearch) back.
 	if (options.wildcard ?? namesEveryPiBuiltin(declaredToolNames)) return undefined;
-	return claudeToolAllowList(declaredToolNames);
+	return claudeToolAllowList(declaredToolNames, { codeMode: options.codeMode });
 }
 
 /**

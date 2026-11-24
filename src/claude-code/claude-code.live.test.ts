@@ -14,6 +14,7 @@
  * exactly what this file checks.
  */
 
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +25,12 @@ import type {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RunOptions } from "../agent-runner.js";
 import { createClaudeCodeModel } from "./model.js";
-import { resumeClaudeCodeAgent, runClaudeCodeAgent } from "./runner.js";
+import {
+	CODE_MODE_SETTINGS,
+	claudeBinary,
+	resumeClaudeCodeAgent,
+	runClaudeCodeAgent,
+} from "./runner.js";
 import type { ClaudeCodeSession } from "./session.js";
 
 const live = process.env.PI_SUBAGENTS_CLAUDE_LIVE === "1";
@@ -253,4 +259,74 @@ describe.skipIf(!live)("runClaudeCodeAgent (live CLI)", () => {
 		const { result } = await promise;
 		expect(result.aborted).toBe(true);
 	});
+});
+
+/**
+ * Code Mode capability probe.
+ *
+ * This is deliberately NOT an assertion about our code. The CLI's `system:init`
+ * event lists the tools it actually granted, and `REPL` appears there only when
+ * the account, the model and the version are all in the feature's rollout — none
+ * of which this extension controls. What it does prove is that our flags reach
+ * the CLI intact (the restricted `--tools` list survives, `--settings` is
+ * accepted), and it names the CLI's own failure reason when Code Mode is refused,
+ * so the next reader does not have to re-derive it with `--debug` by hand.
+ */
+describe("Code Mode capability", () => {
+	it("reports whether the installed CLI grants REPL under --settings", async () => {
+		// Mirrors what the runner sends a restricted agent in Code Mode: the env
+		// block via --settings, and REPL named inside the allowlist. The prompt comes
+		// FIRST: `--tools` is variadic and would otherwise swallow it as a tool name.
+		const argv = [
+			"say OK",
+			"--print",
+			"--verbose",
+			"--output-format",
+			"stream-json",
+			"--settings",
+			CODE_MODE_SETTINGS,
+			"--tools",
+			"Read,Bash,REPL",
+		];
+		const { init, stderr } = await new Promise<{
+			init: Record<string, unknown> | undefined;
+			stderr: string;
+		}>((resolve, reject) => {
+			const child = spawn(claudeBinary(), argv, { cwd: workDir });
+			let stdout = "";
+			let stderr = "";
+			child.stdout.on("data", (chunk) => {
+				stdout += String(chunk);
+			});
+			child.stderr.on("data", (chunk) => {
+				stderr += String(chunk);
+			});
+			child.on("error", reject);
+			child.on("close", () => {
+				const init = stdout
+					.split("\n")
+					.map((line) => {
+						try {
+							return JSON.parse(line) as Record<string, unknown>;
+						} catch {
+							return undefined;
+						}
+					})
+					.find((event) => event?.type === "system" && event?.subtype === "init");
+				resolve({ init, stderr });
+			});
+		});
+
+		// Our side of the contract: the allowlist survived the trip, so the CLI is
+		// running under the tool policy we asked for.
+		expect(init?.tools).toEqual(expect.arrayContaining(["Read", "Bash"]));
+
+		const granted = (init?.tools as string[] | undefined) ?? [];
+		if (!granted.includes("REPL")) {
+			// Reported, not failed: a closed rollout is the documented state of an
+			// experimental feature, not a regression in this backend.
+			const reason = stderr.match(/Code Mode[^\n]*/i)?.[0] ?? "no reason reported";
+			console.warn(`Code Mode is not active for this account yet — ${reason}`);
+		}
+	}, 120_000);
 });
