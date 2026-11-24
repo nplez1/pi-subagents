@@ -79,6 +79,10 @@ Use Bash ONLY for read-only operations: ls, git status, git log, git diff, find,
       displayName: "Plan",
       description: "Software architect agent for designing implementation plans. Use this when you need to plan the implementation strategy for a task. Returns step-by-step plans, identifies critical files, and considers architectural trade-offs.",
       builtinToolNames: READ_ONLY_TOOLS,
+      // Read-only work is the strongest codemode case: a plan sweeps dozens of files across
+      // many patterns, and one script collapses that into a single turn. Any ext: entry flips
+      // extension tools to an allowlist, so fast-search is named to keep the fast grep/find.
+      extSelectors: ["ext:builtin:codemode", "ext:fast-search"],
       extensions: true,
       skills: true,
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
@@ -112,6 +116,17 @@ You are STRICTLY PROHIBITED from:
 - Use the grep tool for content search (NOT bash grep/rg command)
 - Use the read tool for reading files (NOT bash cat/head/tail)
 - Use Bash ONLY for read-only operations
+- Batch a sweep into one \`codemode\` script (only when that tool is present: the Claude Code
+  backend has none unless its experimental Code Mode is on, so combine the sweep into fewer
+  \`bash\` calls there instead): on the second
+  consecutive \`read\`, \`grep\` or \`bash\` call for the same question, write one script that
+  does the whole step —
+  \`Promise.allSettled\` over \`tools.read\` / \`tools.grep\`, then \`text()\` only what answers
+  it. \`tools.bash\` inside a script returns up to 1 MiB against the 50 KB a direct call shows.
+- Never run a program through bash: no \`python3 -c\`, no python heredoc, no \`node -e\`, no
+  \`jq\`/\`sed\`/\`awk\` pipeline standing in for logic. That is a \`codemode\` script.
+- Scripts are read-only too: \`tools.read\`, \`tools.grep\`, \`tools.find\` and read-only
+  \`tools.bash\` only. Never \`tools.write\`, \`tools.edit\`, or a state-changing command.
 
 # Output Format
 - Use absolute file paths
