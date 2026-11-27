@@ -50,6 +50,10 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "../memory.js";
 import { buildAgentPrompt, type PromptExtras } from "../prompts.js";
 import { preloadSkills } from "../skill-loader.js";
 import type { SubagentType } from "../types.js";
+import {
+	claudeLoadedInstructionFiles,
+	withoutClaudeLoadedContext,
+} from "./context-files.js";
 import { effortForThinkingLevel } from "./model.js";
 import {
 	type ClaudeResultEvent,
@@ -116,6 +120,30 @@ export function claudeBinary(): string {
  */
 export function codeModeEnabled(env = process.env): boolean {
 	return env.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE?.trim() === "1";
+}
+
+/**
+ * The environment a spawned `claude` runs with: the parent's, plus a 5-minute
+ * prompt-cache TTL unless one is already set.
+ *
+ * Left alone, the CLI picks the TTL itself — "1 hour on a Claude subscription
+ * within its usage limits" — and bills 1-hour cache writes at a higher rate (2x
+ * input against 1.25x for 5 minutes). That buys a cache that survives a long
+ * pause, which a headless child never takes: across 2,447 turns of this
+ * machine's claude-backed runs (2026-11-13 to 11-27) not one came more than five
+ * minutes after the previous turn, so every 1-hour write was paid for and never
+ * used — about a fifth of what those runs cost. A resumed run that comes back
+ * after a pause re-writes its prefix once instead.
+ *
+ * `CLAUDE_CODE_PROMPT_CACHE_TTL` is the CLI's own switch and covers `-p` runs
+ * (probed: unset writes `ephemeral_1h`, `5m` writes `ephemeral_5m`). Setting it in
+ * the parent's environment overrides this default, `1h` included.
+ */
+export function claudeChildEnv(
+	env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	if (env.CLAUDE_CODE_PROMPT_CACHE_TTL?.trim()) return env;
+	return { ...env, CLAUDE_CODE_PROMPT_CACHE_TTL: "5m" };
 }
 
 /**
@@ -374,7 +402,7 @@ async function driveClaudeProcess(opts: {
 			spawn(claudeBinary(), opts.args, {
 				cwd: opts.cwd,
 				stdio: ["pipe", "pipe", "pipe"],
-				env: process.env,
+				env: claudeChildEnv(),
 			}) as ChildProcessWithoutNullStreams,
 	);
 
@@ -636,7 +664,12 @@ export async function runClaudeCodeAgent(
 	if (!model) throw new Error("runClaudeCodeAgent requires a resolved model");
 
 	const env = await detectEnv(options.pi, effectiveCwd);
-	const parentSystemPrompt = ctx.getSystemPrompt();
+	// The CLI loads its own CLAUDE.md chain for `effectiveCwd`; a file it will load
+	// is dropped from the inherited copy rather than sent twice.
+	const parentSystemPrompt = withoutClaudeLoadedContext(
+		ctx.getSystemPrompt(),
+		claudeLoadedInstructionFiles(effectiveCwd),
+	);
 
 	const extras: PromptExtras = {};
 	if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
