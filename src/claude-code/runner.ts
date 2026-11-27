@@ -51,8 +51,10 @@ import { buildAgentPrompt, type PromptExtras } from "../prompts.js";
 import { preloadSkills } from "../skill-loader.js";
 import type { SubagentType } from "../types.js";
 import {
+	CLAUDE_CODE_BRIDGE,
 	claudeLoadedInstructionFiles,
 	withoutClaudeLoadedContext,
+	withoutPiHarnessSections,
 } from "./context-files.js";
 import { effortForThinkingLevel } from "./model.js";
 import {
@@ -665,13 +667,17 @@ export async function runClaudeCodeAgent(
 
 	const env = await detectEnv(options.pi, effectiveCwd);
 	// The CLI loads its own CLAUDE.md chain for `effectiveCwd`; a file it will load
-	// is dropped from the inherited copy rather than sent twice.
-	const parentSystemPrompt = withoutClaudeLoadedContext(
-		ctx.getSystemPrompt(),
-		claudeLoadedInstructionFiles(effectiveCwd),
+	// is dropped from the inherited copy rather than sent twice. pi's description
+	// of itself (its tools, their rules, its docs and skills) goes too: the CLI
+	// brings its own, and the child cannot call pi's.
+	const parentSystemPrompt = withoutPiHarnessSections(
+		withoutClaudeLoadedContext(
+			ctx.getSystemPrompt(),
+			claudeLoadedInstructionFiles(effectiveCwd),
+		),
 	);
 
-	const extras: PromptExtras = {};
+	const extras: PromptExtras = { bridge: CLAUDE_CODE_BRIDGE };
 	if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
 
 	// Same skill preloading the pi path does, so `skills:` means the same thing.

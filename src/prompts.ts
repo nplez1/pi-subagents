@@ -33,6 +33,12 @@ export interface PromptExtras {
    * `get_subagent_result` — so terse raw data would be the wrong answer there.
    */
   workflowChild?: boolean;
+  /**
+   * Replaces the append-mode `<sub_agent_context>` block. Its default names pi's
+   * own tools (`read`, `edit`, `find`, …); a backend whose child has other tools
+   * — the `claude` CLI — passes one in that child's vocabulary instead.
+   */
+  bridge?: string;
 }
 
 /**
@@ -128,7 +134,7 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
   if (config.promptMode === "append") {
     const identity = parentSystemPrompt || genericBase;
 
-    const bridge = `<sub_agent_context>
+    const bridge = extras?.bridge ?? `<sub_agent_context>
 You are operating as a sub-agent invoked to handle a specific task.
 - Use the read tool instead of cat/head/tail
 - Use the edit tool instead of sed/awk

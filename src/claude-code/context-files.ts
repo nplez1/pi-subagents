@@ -28,6 +28,75 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
+/**
+ * The `<sub_agent_context>` a claude-backed child gets in place of pi's, which
+ * tells it to prefer pi tools (`read`, `edit`, `find`, `grep`) the CLI does not
+ * have. What stays is what holds in either harness.
+ */
+export const CLAUDE_CODE_BRIDGE = `<sub_agent_context>
+You are operating as a sub-agent invoked to handle a specific task.
+- Make independent tool calls in parallel: when you already know several files or searches you need, issue them all in one turn
+- Use absolute file paths
+- Do not use emojis
+- Be concise but complete
+</sub_agent_context>`;
+
+/**
+ * The top-level sections of pi's rendered prompt that describe pi itself: its
+ * tool list, the rules for those tools, its own documentation, its skill index,
+ * and its working directory. A claude-backed child has none of those tools —
+ * the CLI brings its own, its own skills, and an environment block — so these
+ * cost tokens on every turn and point it at tools that do not exist
+ * (`codemode`, `todo`, `manage_schedules`). Measured on this machine's reviewer
+ * runs, about 16k characters once the duplicate `AGENTS.md` was gone.
+ */
+const PI_HARNESS_SECTIONS = ["tools", "rules", "docs", "skills", "cwd"];
+
+/** pi's identity paragraph — "You are … inside pi" / "… inside Pi-Bolt" — when it opens the prompt. */
+const PI_IDENTITY =
+	/^You are [^\n]*\binside (?:Pi-Bolt|pi)\b[^\n]*(?:\n(?!\n)[^\n]*)*\n*/;
+
+function withoutSections(text: string): string {
+	let out = text;
+	for (const tag of PI_HARNESS_SECTIONS) {
+		out = out.replace(
+			new RegExp(`(^|\\n)<${tag}>\\n[\\s\\S]*?\\n</${tag}>(?=\\n|$)\\n*`, "g"),
+			"$1",
+		);
+	}
+	return out;
+}
+
+/**
+ * The inherited prompt with pi's harness description removed: its identity
+ * paragraph and its `<tools>`, `<rules>`, `<docs>`, `<skills>` and `<cwd>`
+ * sections. What is left is what the user and the project said — the
+ * `<project_context>` files and anything an extension appended that this does
+ * not recognise, which is kept rather than guessed at.
+ *
+ * Text inside `<project_context>` is never touched, so an `AGENTS.md` that
+ * happens to contain a `<rules>` line keeps it. Returns "" when nothing is
+ * left, which `buildAgentPrompt` answers with its generic base.
+ */
+export function withoutPiHarnessSections(prompt: string): string {
+	const OPEN = "<project_context>";
+	const CLOSE = "</project_context>";
+	let out = "";
+	let at = 0;
+	for (;;) {
+		const start = prompt.indexOf(OPEN, at);
+		const end = start < 0 ? -1 : prompt.indexOf(CLOSE, start);
+		if (start < 0 || end < 0) break;
+		out +=
+			withoutSections(prompt.slice(at, start)) +
+			prompt.slice(start, end + CLOSE.length);
+		at = end + CLOSE.length;
+	}
+	out += withoutSections(prompt.slice(at));
+	out = out.replace(PI_IDENTITY, "");
+	return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /** The CLI follows `@path` imports to this depth, and no further. */
 const MAX_IMPORT_DEPTH = 5;
 

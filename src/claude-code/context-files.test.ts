@@ -8,10 +8,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { buildAgentPrompt } from "../prompts.js";
 import {
+	CLAUDE_CODE_BRIDGE,
 	claudeLoadedInstructionFiles,
 	importsOf,
 	withoutClaudeLoadedContext,
+	withoutPiHarnessSections,
 } from "./context-files.js";
 import { claudeChildEnv } from "./runner.js";
 
@@ -148,6 +151,64 @@ describe("withoutClaudeLoadedContext", () => {
 			withoutClaudeLoadedContext(prompt, new Set(["/elsewhere/CLAUDE.md"])),
 		).toBe(prompt);
 		expect(withoutClaudeLoadedContext(prompt, new Set())).toBe(prompt);
+	});
+});
+
+describe("withoutPiHarnessSections", () => {
+	const piPrompt = [
+		"You are a coding assistant running inside Pi-Bolt, a build of pi (a coding agent harness) compiled ahead of time. Help users inspect files, run commands, and modify code.",
+		"<tools>\n- read: Read file contents\n- codemode: Run JavaScript that calls other tools\n</tools>",
+		"<rules>\n- Use read to examine files instead of cat or sed.\n</rules>",
+		"<docs>\nPi documentation: /x/README.md\n</docs>",
+		'<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path="/r/AGENTS.md">\n# Rules\n<rules>\nkept: this is the project\'s text\n</rules>\n\n</project_instructions>\n</project_context>',
+		"<skills>\nThe following skills…\n<available_skills>\n  <skill><name>s</name></skill>\n</available_skills>\n</skills>",
+		"<cwd>\n/r\n</cwd>",
+	].join("\n\n");
+
+	it("keeps the project's instructions and drops pi's description of itself", () => {
+		const out = withoutPiHarnessSections(piPrompt);
+		expect(out.startsWith("<project_context>")).toBe(true);
+		expect(out.endsWith("</project_context>")).toBe(true);
+		for (const gone of [
+			"Pi-Bolt",
+			"<tools>",
+			"codemode",
+			"<docs>",
+			"<skills>",
+			"<cwd>",
+		])
+			expect(out).not.toContain(gone);
+		// A `<rules>` line inside a project file is the project's, not pi's.
+		expect(out).toContain("kept: this is the project's text");
+	});
+
+	it("keeps text it does not recognise, and returns empty when nothing is left", () => {
+		expect(
+			withoutPiHarnessSections("<tools>\nt\n</tools>\n\nAn extension's note."),
+		).toBe("An extension's note.");
+		expect(
+			withoutPiHarnessSections("<tools>\nt\n</tools>\n\n<cwd>\n/r\n</cwd>"),
+		).toBe("");
+		// Not pi's identity line, so it stays.
+		expect(withoutPiHarnessSections("You are a reviewer.")).toBe(
+			"You are a reviewer.",
+		);
+	});
+
+	it("gives an append-mode child the bridge it is handed instead of pi's", () => {
+		const config = { name: "reviewer", promptMode: "append", systemPrompt: "" };
+		const env = { isGitRepo: false, branch: "", platform: "darwin" };
+		const out = buildAgentPrompt(
+			config as Parameters<typeof buildAgentPrompt>[0],
+			"/r",
+			env as Parameters<typeof buildAgentPrompt>[2],
+			"",
+			{ bridge: CLAUDE_CODE_BRIDGE },
+		);
+		expect(out).toContain(CLAUDE_CODE_BRIDGE);
+		expect(out).not.toContain("Use the read tool");
+		// An empty inherited prompt falls back to the generic base, not to nothing.
+		expect(out).toContain("general-purpose coding agent");
 	});
 });
 
