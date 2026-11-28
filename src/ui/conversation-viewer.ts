@@ -71,6 +71,49 @@ export const RESULT_MAX_CHARS = 16_000;
 /** A message from the child session, as this overlay consumes it. */
 type ViewerMessage = AgentSession["messages"][number];
 
+/**
+ * The wall clock a block was produced at — `11/27 12:53pm`, or `25/11/27 12:53pm`
+ * outside this year. Deliberately static: a conversation read hours after it
+ * settled must not depend on a clock still running to be readable.
+ */
+export function formatChunkTime(timestamp: number, now = Date.now()): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  const hours = date.getHours();
+  const clock = `${hours % 12 === 0 ? 12 : hours % 12}:${`${date.getMinutes()}`.padStart(2, "0")}${hours < 12 ? "am" : "pm"}`;
+  const monthDay = `${date.getMonth() + 1}/${date.getDate()}`;
+  return date.getFullYear() === new Date(now).getFullYear()
+    ? `${monthDay} ${clock}`
+    : `${`${date.getFullYear()}`.slice(-2)}/${monthDay} ${clock}`;
+}
+
+/**
+ * The stamp a message carries, or `""` when it carries no clock at all —
+ * entries persisted before pi recorded message timestamps.
+ */
+function chunkTimeLabel(msg: ViewerMessage): string {
+  const { timestamp } = msg as { timestamp?: number };
+  return typeof timestamp === "number" ? formatChunkTime(timestamp) : "";
+}
+
+/**
+ * One transcript row naming when the block beneath it was produced. Dim and
+ * flush left, so it reads as a margin note rather than as message content; a
+ * terminal has a single type size, so colour is the only quieter cue there is.
+ */
+class ChunkTimeRow implements Component {
+  constructor(
+    private readonly label: string,
+    private readonly theme: Theme,
+  ) {}
+
+  render(): string[] {
+    return [this.theme.fg("dim", this.label)];
+  }
+
+  invalidate(): void {}
+}
+
 /** Anything with pi's collapsed/expanded contract. */
 interface Expandable {
   setExpanded(expanded: boolean): void;
@@ -965,6 +1008,11 @@ export class ConversationViewer implements Component {
       const comps = this.componentsForMessage(messages[i], i === lastIndex);
       if (comps.length === 0) continue;
       if (!first) next.push(new Spacer(1));
+      // Every block, not one per minute: the viewer opens scrolled to the end of
+      // a settled run, so a stamp that is shared with an earlier block is a
+      // stamp the reader never sees.
+      const stamp = chunkTimeLabel(messages[i]);
+      if (stamp) next.push(new ChunkTimeRow(stamp, this.theme));
       next.push(...comps);
       first = false;
     }
@@ -1154,10 +1202,15 @@ export class ConversationViewer implements Component {
 
     let needsSeparator = false;
     for (const msg of messages as any[]) {
+      const stamp = chunkTimeLabel(msg);
+      const pushStamp = () => {
+        if (stamp) lines.push(th.fg("dim", stamp));
+      };
       if (msg.role === "user") {
         const text = typeof msg.content === "string" ? msg.content : extractText(msg.content);
         if (!text.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
+        pushStamp();
         lines.push(th.fg("accent", "[User]"));
         lines.push(...this.rawLines(text.trim(), width, false));
       } else if (msg.role === "assistant") {
@@ -1168,6 +1221,7 @@ export class ConversationViewer implements Component {
           else if (c.type === "toolCall") toolCalls.push(c.name ?? "unknown");
         }
         if (needsSeparator) lines.push(th.fg("dim", "───"));
+        pushStamp();
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
           lines.push(...this.rawLines(textParts.join("\n").trim(), width, false));
@@ -1179,11 +1233,13 @@ export class ConversationViewer implements Component {
         const { text, elided } = capResult(extractText(msg.content).trim());
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
+        pushStamp();
         lines.push(th.fg("dim", "[Result]"));
         lines.push(...this.rawLines(text, width, true));
         if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
       } else if (msg.role === "bashExecution") {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
+        pushStamp();
         lines.push(truncateToWidth(th.fg("muted", `  $ ${msg.command}`), width));
         if (msg.output?.trim()) {
           const { text, elided } = capResult(msg.output.trim());

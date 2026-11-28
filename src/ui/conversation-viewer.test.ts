@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { AgentRecord } from "../types.js";
-import { ConversationViewer, hitTestContent, type ViewerContentEntry } from "./conversation-viewer.js";
+import { ConversationViewer, formatChunkTime, hitTestContent, type ViewerContentEntry } from "./conversation-viewer.js";
 
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
@@ -228,8 +228,7 @@ describe("ConversationViewer focus", () => {
 	});
 });
 
-describe("ConversationViewer nested subagent gutter", () => {
-	/**
+describe("ConversationViewer nested subagent gutter", () => {	/**
 	 * The Claude Code backend tags a delegated child's messages with
 	 * `parentToolUseId` (Claude Code interleaves its own subagents into one
 	 * stream). Those rows must render with a gutter so the child's work does not
@@ -304,5 +303,124 @@ describe("ConversationViewer nested subagent gutter", () => {
 		expect(entries.map((e) => e.component)).toEqual([parent, child]);
 		// Both rows render exactly one line, so the ranges are contiguous.
 		expect(entries.map((e) => e.height)).toEqual([1, 1]);
+	});
+});
+
+describe("formatChunkTime", () => {
+	/** Local-time construction, so the expectations do not depend on the runner's zone. */
+	const at = (y: number, mo: number, d: number, h: number, mi: number) =>
+		new Date(y, mo - 1, d, h, mi).getTime();
+
+	it("states the date and a 12-hour clock, so a stamp stays true once read later", () => {
+		expect(formatChunkTime(at(2026, 11, 27, 12, 53), at(2026, 11, 27, 18, 0))).toBe("11/27 12:53pm");
+	});
+
+	it("pads the minute and reads midnight and noon as 12", () => {
+		const now = at(2026, 11, 27, 18, 0);
+		expect(formatChunkTime(at(2026, 11, 27, 0, 5), now)).toBe("11/27 12:05am");
+		expect(formatChunkTime(at(2026, 11, 27, 12, 0), now)).toBe("11/27 12:00pm");
+		expect(formatChunkTime(at(2026, 11, 27, 9, 7), now)).toBe("11/27 9:07am");
+	});
+
+	it("adds the year only when the stamp is not from this year", () => {
+		expect(formatChunkTime(at(2025, 11, 27, 12, 53), at(2026, 11, 27, 18, 0))).toBe("25/11/27 12:53pm");
+	});
+
+	it("has no stamp for a timestamp it cannot read", () => {
+		expect(formatChunkTime(Number.NaN)).toBe("");
+	});
+});
+
+describe("ConversationViewer chunk timestamps", () => {
+	/**
+	 * `11/27 12:53pm` above each block is the whole point: an agent pane opened
+	 * hours after it settled must say when its work happened. The stamp source is
+	 * the message, so the component graph is stubbed and only the stamping rule
+	 * is under test here.
+	 */
+	function render(messages: { role: string; timestamp?: number }[]) {
+		const tui = { terminal: { rows: 40, columns: 100 }, requestRender: vi.fn() } as unknown as TUI;
+		const session = {
+			messages,
+			subscribe: () => () => {},
+			sessionManager: { getCwd: () => "/tmp" },
+			getToolDefinition: () => undefined,
+		} as unknown as AgentSession;
+		const record = {
+			id: "a1",
+			type: "explore",
+			description: "inspect",
+			status: "completed",
+			startedAt: Date.now(),
+			toolUses: 0,
+			lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+		} as unknown as AgentRecord;
+		const viewer = new ConversationViewer(tui, session, record, undefined, theme, () => {});
+		const v = viewer as unknown as {
+			transcript: { render(width: number): string[] }[];
+			rebuildTranscript(): void;
+			componentsForMessage(msg: unknown, isTail: boolean): unknown[];
+			buildRawLines(width: number): string[];
+		};
+		// One body row per message: the stamp rule is what is being measured.
+		v.componentsForMessage = () => [{ render: () => ["BODY"], invalidate: () => {} }];
+		v.rebuildTranscript();
+		return {
+			body: (): string[] => v.transcript.flatMap((c) => c.render(40)),
+			raw: (): string[] => v.buildRawLines(40),
+		};
+	}
+
+	const minute = (y: number, mo: number, d: number, h: number, mi: number) => new Date(y, mo - 1, d, h, mi).getTime();
+
+	it("stamps every block, so the one the reader lands on is never off-screen", () => {
+		const t = minute(2026, 11, 27, 12, 53);
+		const { body } = render([
+			{ role: "user", timestamp: t },
+			{ role: "assistant", timestamp: t + 4_000 },
+			{ role: "assistant", timestamp: t + 40_000 },
+		]);
+		// A settled run opens scrolled to its end: a stamp collapsed away from the
+		// last blocks would never be seen.
+		expect(body().filter((l) => l !== "")).toEqual([
+			formatChunkTime(t),
+			"BODY",
+			formatChunkTime(t + 4_000),
+			"BODY",
+			formatChunkTime(t + 40_000),
+			"BODY",
+		]);
+	});
+
+	it("stamps across a minute boundary without needing the date to change", () => {
+		const first = minute(2026, 11, 27, 12, 53);
+		const later = minute(2026, 11, 27, 12, 54);
+		const { body } = render([
+			{ role: "user", timestamp: first },
+			{ role: "assistant", timestamp: later },
+		]);
+		// Each stamp sits directly above the block it belongs to (the spacer between
+		// blocks renders blank and is dropped here).
+		expect(body().filter((l) => l !== "")).toEqual([
+			formatChunkTime(first),
+			"BODY",
+			formatChunkTime(later),
+			"BODY",
+		]);
+	});
+
+	it("states nothing for a message with no clock, rather than borrowing the previous stamp", () => {
+		const t = minute(2026, 11, 27, 12, 53);
+		const { body } = render([
+			{ role: "user" },
+			{ role: "assistant", timestamp: t },
+		]);
+		expect(body().filter((l) => l.includes("pm") || l.includes("am"))).toEqual([formatChunkTime(t)]);
+	});
+
+	it("stamps the degraded renderer too, since a failed component build must not lose the time", () => {
+		const t = minute(2026, 11, 27, 12, 53);
+		const { raw } = render([{ role: "user", content: "hi", timestamp: t } as never]);
+		expect(raw()).toContain(formatChunkTime(t));
 	});
 });
